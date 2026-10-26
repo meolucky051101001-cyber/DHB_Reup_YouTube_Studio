@@ -1,0 +1,44 @@
+=====================================================================
+         HƯỚNG DẪN SỬ DỤNG TOOL "DHB REUP YOUTUBE STUDIO"
+=====================================================================
+
+1. CÁCH KHỞI ĐỘNG CÔNG CỤ:
+   - Click đúp vào file: START_DHB_YOUTUBE.bat
+   - Trình duyệt sẽ tự động mở trang quản trị: http://127.0.0.1:8686
+   - Nếu chạy trên máy mới chưa có thư viện: Chạy file CAI_DAT_MOI_TRUONG.bat trước.
+
+2. CÁC TÍNH NĂNG CHÍNH:
+   - QUẢN LÝ ĐA KÊNH & PROFILE CHROME:
+     + Tự động nhận diện toàn bộ Profile Chrome từ DHB Tool (ổ C và D).
+     + Mỗi kênh YouTube gắn liền với một Profile Chrome riêng biệt.
+     + Bấm "Mở Chrome Đăng Nhập" để kiểm tra hoặc đăng nhập Google an toàn.
+   
+   - NẠP NGUỒN VIDEO:
+     + Hỗ trợ dán link video (YouTube, TikTok, Douyin, Facebook).
+     + Hỗ trợ quét hàng loạt video có sẵn trong thư mục máy tính (nhập đường dẫn thư mục ví dụ: D:\VideoGoc).
+
+   - TỐI ƯU HÓA YOUTUBE SHORTS (1-CLICK SHORTS BOOSTER):
+     + Nút màu hồng "⚡ 1-Click Tối Ưu Chuẩn Shorts" trên thanh công cụ.
+     + Tự động ép khung dọc 9:16 (1080x1920 Full HD).
+     + Tự động khống chế thời lượng <= 58.5s (Smart Speedup 1.05x-1.15x nếu video 60-72s để 100% lọt luồng Shorts Feed).
+     + Tăng rực rỡ màu sắc & độ nét tối ưu cho màn hình OLED di động (Visual Pop).
+     + Tự động chèn hashtag #shorts vào tiêu đề.
+     + Bật chế độ giả lập điện thoại di động khi đăng video.
+
+   - AI DỊCH THUẬT & VIẾT LẠI SEO (TAB 2):
+     + Viết lại tiêu đề kích thích click (CTR cao) + Mô tả + Thẻ Tags.
+     + Chế độ "🔥 Viết lại Tiêu Đề Giật Tít Chuẩn Shorts" (< 55 ký tự + Hook Tò Mò).
+     + Tìm kiếm và thay thế từ khóa hàng loạt.
+
+   - RENDER LÁCH BẢN QUYỀN FFMPEG (TAB 3):
+     + Sử dụng trực tiếp FFmpeg từ C:\DHB Reup Facebook\ffmpeg.exe.
+     + Tích hợp kho nhạc nền, video nền, bộ lọc màu, lật gương, pitch shift âm thanh.
+
+   - TỰ ĐỘNG ĐĂNG YOUTUBE STUDIO & BẢO VỆ BẢN QUYỀN (TAB 1):
+     + Quy trình 4 bước chuẩn Studio: Chi tiết -> Thành phần -> Kiểm duyệt -> Khả năng hiển thị.
+     + BỘ CHỐT CHẶN BẢN QUYỀN: Tại bước Kiểm duyệt (Checks), nếu YouTube cảnh báo vi phạm bản quyền thì tool TỰ ĐỘNG HỦY VÀ XÓA BẢN NHÁP VĨNH VIỄN để bảo vệ uy tín kênh, nếu an toàn thì mới đăng.
+     + Hỗ trợ LÊN LỊCH GIÃN CÁCH (nút 📅 Lên Lịch Giãn Cách): Tự động cộng dồn số phút hẹn giờ đăng giữa các video để tránh bị nghi ngờ spam.
+
+=====================================================================
+                    CHÚC BẠN VẬN HÀNH THÀNH CÔNG!
+=====================================================================

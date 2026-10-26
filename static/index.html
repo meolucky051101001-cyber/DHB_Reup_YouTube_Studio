@@ -1,0 +1,1776 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DHB Reup YouTube Studio — Hệ Thống Tự Động Hóa Reup & Đăng YouTube</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <!-- TOP HEADER -->
+  <header class="top-header">
+    <div class="brand">
+      <div class="brand-logo">YT</div>
+      <div class="brand-title">
+        <h1>DHB Reup YouTube Studio</h1>
+        <span>Hệ Thống Quét Nguồn • Lách Bản Quyền FFmpeg • AI SEO • Đăng YouTube Shorts & Video Chuẩn</span>
+      </div>
+    </div>
+    <div class="top-stats">
+      <div class="stat-pill"><span class="dot-online"></span> Engine: <b id="st-dhb">Sẵn sàng</b></div>
+      <div class="stat-pill">📺 Kênh YT: <b id="st-channels">0</b></div>
+      <div class="stat-pill">🎬 Tổng Video: <b id="st-videos">0</b></div>
+      <div class="stat-pill">✅ Đã Đăng: <b id="st-completed">0</b></div>
+      <div class="stat-pill">📡 Monitor 24/7: <b id="st-monitors">0</b></div>
+      <button class="btn btn-outline btn-sm" onclick="syncFromDHB()" title="Đồng bộ API Keys và Profile Chrome">🔄 Nạp Cài Đặt & Profile</button>
+    </div>
+  </header>
+
+  <!-- NAVIGATION TABS -->
+  <nav class="nav-tabs">
+    <button class="nav-tab active" data-tab="tab-workspace" onclick="switchTab('tab-workspace', this)">🎬 1. Bảng Điều Khiển & Dự Án</button>
+    <button class="nav-tab" data-tab="tab-ai" onclick="switchTab('tab-ai', this)">🤖 2. AI Dịch & Viết Lại SEO</button>
+    <button class="nav-tab" data-tab="tab-render" onclick="switchTab('tab-render', this)">🎨 3. Render & Lách Bản Quyền FFmpeg</button>
+    <button class="nav-tab" data-tab="tab-channels" onclick="switchTab('tab-channels', this)">📺 4. Quản Lý Kênh & Profile Chrome</button>
+    <button class="nav-tab" data-tab="tab-monitor" onclick="switchTab('tab-monitor', this)">📡 5. Theo Dõi Kênh Tự Động 24/7</button>
+    <button class="nav-tab" data-tab="tab-settings" onclick="switchTab('tab-settings', this)">⚙️ 6. Cài Đặt & Nhật Ký Hệ Thống</button>
+  </nav>
+
+  <!-- MAIN CONTAINER -->
+  <main class="main-container">
+
+    <!-- ==========================================
+         TAB 1: WORKSPACE & QUẢN LÝ DỰ ÁN YOUTUBE
+         ========================================== -->
+    <section id="tab-workspace" class="tab-pane active">
+      
+      <!-- 1. WORKFLOW STEPPER BAR (Hướng Dẫn Quy Trình Thao Tác Nhanh) -->
+      <div class="workflow-stepper">
+        <div class="step-item" onclick="switchSubTab('scan')" style="cursor:pointer;" title="Bước 1: Quét hoặc dán link video">
+          <div class="step-num">1</div>
+          <div class="step-info">
+            <b>1. Nạp Nguồn Video</b>
+            <span>Dán link MXH hoặc Thư mục máy</span>
+          </div>
+        </div>
+        <div class="step-arrow">➔</div>
+        <div class="step-item" onclick="applyShortsBooster()" style="cursor:pointer;" title="Bước 2: Tối ưu 1-Click chuẩn Shorts <= 58.5s">
+          <div class="step-num" style="background:#ec4899;">2</div>
+          <div class="step-info">
+            <b>2. Tối Ưu Shorts 1-Click</b>
+            <span>Ép &le; 58.5s • Lách âm • OLED Pop</span>
+          </div>
+        </div>
+        <div class="step-arrow">➔</div>
+        <div class="step-item" onclick="promptAutoSchedule()" style="cursor:pointer;" title="Bước 3: Lên lịch giãn cách an toàn chống spam">
+          <div class="step-num" style="background:#f59e0b;">3</div>
+          <div class="step-info">
+            <b>3. Lên Lịch Giãn Cách</b>
+            <span>Cách nhau 60 - 120 phút / video</span>
+          </div>
+        </div>
+        <div class="step-arrow">➔</div>
+        <div class="step-item step-run" onclick="startPipeline(true, true, true)" style="cursor:pointer;" title="Bước 4: Chạy toàn bộ quy trình tự động">
+          <div class="step-num">▶</div>
+          <div class="step-info">
+            <b>4. BẮT ĐẦU CHẠY</b>
+            <span>Tải ➔ Render FFmpeg ➔ Đăng Studio</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="workspace-grid">
+        <!-- Cột Trái: Dự án, Quét Nguồn & Gán Nhanh Dạng Tab -->
+        <div>
+          <!-- Thẻ Dự Án Thu Gọn Hiện Đại -->
+          <div class="card" style="margin-bottom:12px; padding:10px 14px;">
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+              <div style="display:flex; align-items:center; gap:6px; font-weight:700; font-size:13px; color:#fff; white-space:nowrap;">
+                📁 <span>Dự Án:</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:6px; flex:1;">
+                <select id="sel-project" onchange="loadQueue()" style="font-weight:600; padding:5px 8px; font-size:12.5px;"></select>
+                <button class="btn btn-outline btn-sm" onclick="createNewProject()" title="Tạo dự án mới">+ Mới</button>
+                <button class="btn btn-outline btn-sm" onclick="deleteCurrentProject()" title="Xóa dự án này" style="color:#f87171; border-color:rgba(248,113,113,0.3);">🗑️</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Thanh Chuyển Tab Con (Segmented Subtabs) -->
+          <div class="subtabs-bar">
+            <button type="button" class="subtab-btn active" id="btn-subtab-scan" onclick="switchSubTab('scan')">
+              📥 1. Quét Nguồn Video
+            </button>
+            <button type="button" class="subtab-btn" id="btn-subtab-bulk" onclick="switchSubTab('bulk')">
+              ⚡ 2. Gán Cấu Hình Nhanh
+            </button>
+          </div>
+
+          <!-- SUBTAB 1: QUÉT NGUỒN VIDEO -->
+          <div id="subtab-pane-scan" class="subtab-pane active">
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">🔍 Nhập Nguồn Video & Thư Mục Máy</div>
+              </div>
+
+              <!-- KHUNG KÉO THẢ & CHỌN FILE VIDEO TRỰC TIẾP -->
+              <div class="upload-dropzone" id="upload-dropzone" 
+                   ondragover="onDragOverVideo(event)" 
+                   ondragleave="onDragLeaveVideo(event)" 
+                   ondrop="onDropVideo(event)">
+                <div class="dropzone-icon">📤</div>
+                <div class="dropzone-content">
+                  <b>Kéo & Thả Video Vào Đây Hoặc Bấm Để Chọn</b>
+                  <span>Hỗ trợ MP4, MOV, MKV, WebM... (Chọn được nhiều video cùng lúc)</span>
+                </div>
+                <div class="dropzone-actions" onclick="event.stopPropagation()">
+                  <button type="button" class="btn btn-sm btn-accent" onclick="document.getElementById('file-upload-input').click()">
+                    📁 Chọn Tệp Từ Máy
+                  </button>
+                  <button type="button" class="btn btn-sm btn-outline" onclick="browseNativeFiles()" title="Mở cửa sổ File Explorer Windows để chọn trực tiếp file">
+                    🪟 Duyệt File Windows
+                  </button>
+                  <button type="button" class="btn btn-sm btn-outline" onclick="browseNativeFolder()" title="Mở cửa sổ chọn thư mục Windows">
+                    📂 Duyệt Thư Mục
+                  </button>
+                  <button type="button" class="btn btn-sm btn-purple" onclick="openBrowseFolderModal()" title="Duyệt ổ đĩa và thư mục ngay trong tool — lấy video cả thư mục con">
+                    🗂️ Kết Nối Thư Mục
+                  </button>
+                </div>
+                <input type="file" id="file-upload-input" multiple accept="video/mp4,video/quicktime,video/x-matroska,video/webm,video/*" style="display:none;" onchange="handleBrowserFiles(this.files)" />
+              </div>
+
+              <!-- Hộp hiển thị tiến độ đang tải lên -->
+              <div id="upload-status-box" class="upload-progress-box">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                  <span id="upload-status-title" style="font-weight:600; color:#38bdf8; font-size:12px;">Đang nạp video...</span>
+                  <span id="upload-status-pct" style="font-weight:700; font-size:12px; color:#fff;">0%</span>
+                </div>
+                <div class="prog-bar" style="width:100%; height:12px;">
+                  <div id="upload-prog-bar" class="prog-fill prog-dl" style="width:0%;"></div>
+                </div>
+              </div>
+
+              <div style="display:flex; align-items:center; gap:8px; margin:10px 0 8px; color:var(--text-muted); font-size:11px; text-transform:uppercase; letter-spacing:0.4px;">
+                <div style="flex:1; height:1px; background:var(--border);"></div>
+                <span>Hoặc Dán Link Kênh / Video / Thư Mục</span>
+                <div style="flex:1; height:1px; background:var(--border);"></div>
+              </div>
+
+              <div class="form-group">
+                <label>Nhập Link Kênh / Video (TikTok, Douyin, Shorts, FB) hoặc Folder (1 link/dòng):</label>
+                <textarea id="scan-urls" rows="3" placeholder="https://www.tiktok.com/@channel&#10;https://www.youtube.com/@channel/shorts&#10;D:\Str unbox"></textarea>
+              </div>
+
+              <div class="row-inline form-group">
+                <div>
+                  <label>Số video tối đa / nguồn:</label>
+                  <input type="number" id="scan-max" value="20" min="1" max="200" />
+                </div>
+                <div>
+                  <label>Định dạng đăng YouTube:</label>
+                  <select id="scan-upload-to">
+                    <option value="Shorts">YouTube Shorts (Dọc &le; 60s)</option>
+                    <option value="Video">YouTube Video Dài (16:9)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="row-inline form-group">
+                <div>
+                  <label>Chế độ Lách FFmpeg:</label>
+                  <select id="scan-render-mode">
+                    <option value="shorts_9_16">Render Dọc 9:16 Blur (Shorts)</option>
+                    <option value="pip_thu_nho">Lách Thu Nhỏ (Video Nền DHB)</option>
+                    <option value="full_16_9">Lách Full Màn 16:9</option>
+                    <option value="square_1_1">Render Vuông 1:1</option>
+                    <option value="audio_effect">Lách Âm Thanh + Đổi Pitch</option>
+                    <option value="md5_cut">Đổi MD5 & Xóa Tag (Siêu tốc)</option>
+                    <option value="none">Giữ nguyên Video gốc</option>
+                  </select>
+                </div>
+                <div>
+                  <label>Chế độ Đăng YouTube:</label>
+                  <select id="scan-visibility" onchange="toggleScanScheduleFields()">
+                    <option value="public">🚀 Đăng ngay - Công khai (Public)</option>
+                    <option value="unlisted">🔒 Đăng ngay - Không công khai (Unlisted)</option>
+                    <option value="private">🛡️ Đăng ngay - Riêng tư (Private)</option>
+                    <option value="schedule">⏰ Lên lịch phát hành (Schedule)</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- Khung Lên lịch phát hành (Ẩn/Hiện khi chọn Lên lịch) -->
+              <div id="scan-schedule-wrap" style="display:none; background:rgba(56,189,248,0.06); padding:10px 12px; border-radius:8px; border:1px dashed #38bdf8; margin-bottom:12px;">
+                <div class="row-inline form-group" style="margin-bottom:8px;">
+                  <div>
+                    <label>Thời gian bắt đầu phát hành:</label>
+                    <input type="datetime-local" id="scan-sched-time" />
+                  </div>
+                  <div>
+                    <label>Giãn cách giữa các video (phút):</label>
+                    <input type="number" id="scan-sched-interval" value="60" min="30" max="1440" />
+                  </div>
+                </div>
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:13px; color:#f59e0b;">
+                  <input type="checkbox" id="scan-is-premiere" />
+                  🎬 Đặt làm video Công chiếu (Premiere)
+                </label>
+              </div>
+
+              <!-- Nút Mở Rộng / Thu Gọn Tùy Chọn Nâng Cao -->
+              <button type="button" class="adv-toggle-btn" onclick="toggleAdvScan()">
+                <span>⚙️ Cấu Hình Nâng Cao (Độ phân giải, Đối tượng, Bản quyền...)</span>
+                <span id="adv-arrow">▼</span>
+              </button>
+
+              <!-- Panel Tùy Chọn Nâng Cao (Thu Gọn Mặc Định Để Đỡ Rối) -->
+              <div id="adv-scan-panel" class="adv-panel">
+                <div class="row-inline form-group">
+                  <div>
+                    <label>Chất lượng xuất video:</label>
+                    <select id="scan-resolution">
+                      <option value="1080p">Full HD (1080p - Chuẩn nét)</option>
+                      <option value="4k">4K Ultra HD (2160p - Nét đỉnh cao)</option>
+                      <option value="2k">2K QHD (1440p)</option>
+                      <option value="original">Giữ nguyên gốc</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label>Nhóm Kênh Đích:</label>
+                    <select id="scan-group"></select>
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label>Bộ Tùy Chọn Đăng (Affiliate Shopee / Pin Comment / Hashtags):</label>
+                  <select id="scan-option-group">
+                    <option value="">-- Không dùng bộ tùy chọn --</option>
+                  </select>
+                </div>
+                <div class="row-inline form-group">
+                  <div>
+                    <label>View tối thiểu:</label>
+                    <input type="number" id="scan-min-views" value="0" min="0" />
+                  </div>
+                  <div>
+                    <label>Đối tượng người xem:</label>
+                    <select id="scan-made-for-kids">
+                      <option value="0">🚫 Không dành cho trẻ em (Chuẩn)</option>
+                      <option value="1">👶 Có, dành cho trẻ em (Kids)</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="row-inline form-group">
+                  <div>
+                    <label>Comment tối thiểu (chỉ lọc khi nguồn có số liệu):</label>
+                    <input type="number" id="scan-min-comments" value="0" min="0" />
+                  </div>
+                  <div>
+                    <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:18px;">
+                      <input type="checkbox" id="scan-recursive" />
+                      📂 Quét cả THƯ MỤC CON (đệ quy toàn bộ cây thư mục)
+                    </label>
+                  </div>
+                </div>
+                <div class="row-inline form-group">
+                  <div>
+                    <label>Giới hạn độ tuổi:</label>
+                    <select id="scan-age-restriction">
+                      <option value="0">Không giới hạn người xem</option>
+                      <option value="1">🔞 Giới hạn người xem trên 18 tuổi</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label>Nhãn nội dung đã chỉnh sửa / AI:</label>
+                    <select id="scan-altered-content">
+                      <option value="0">Không (Nội dung thực tế)</option>
+                      <option value="1">🤖 Có (Do AI tạo hoặc chỉnh sửa)</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="form-group" style="margin-top:4px;">
+                  <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:600; color:#94a3b8;">
+                    <input type="checkbox" id="scan-mobile" />
+                    📱 Giả lập Điện thoại di động (Khuyên tắt để dùng Native Desktop 100% chống Checkpoint)
+                  </label>
+                </div>
+              </div>
+
+              <button class="btn btn-accent" style="width:100%; font-size:13.5px; padding:9px 16px; font-weight:700;" onclick="scanAndAddVideos()" id="btn-scan">
+                🚀 Quét & Đưa Vào Bảng Dự Án
+              </button>
+            </div>
+          </div>
+
+          <!-- SUBTAB 2: GÁN CẤU HÌNH NHANH HÀNG LOẠT -->
+          <div id="subtab-pane-bulk" class="subtab-pane">
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">⚡ Chuẩn Bị Lô &amp; Gán Cấu Hình Hàng Loạt</div>
+              </div>
+              <div style="background:rgba(16,185,129,0.07); border:1px dashed #10b981; border-radius:8px; padding:10px 12px; margin-bottom:14px; font-size:12.5px; line-height:1.65; color:#cbd5e1;">
+                <b style="color:#34d399;">Quy trình nhanh:</b>
+                ① Tích chọn video cần đăng (không tích = cả dự án)
+                → ② <b>📥 Xuất Excel</b> để đặt tiêu đề / mô tả / lịch riêng từng video
+                → ③ <b>📤 Nhập Excel</b>
+                → ④ Chọn Profile + Kênh bên dưới
+                → ⑤ <b>✔️ Áp Dụng</b>
+                → ⑥ Bấm <b style="color:#f59e0b;">▶️ CHẠY TOÀN TRÌNH TỰ ĐỘNG</b>.
+                <div style="margin-top:8px; display:flex; gap:6px; flex-wrap:wrap;">
+                  <button class="btn btn-outline btn-sm" onclick="exportExcel()" title="Xuất các dòng đang chọn (hoặc cả dự án) ra Excel để sửa tiêu đề/lịch riêng từng video">📥 Xuất Excel</button>
+                  <button class="btn btn-outline btn-sm" onclick="triggerImportExcel()" title="Nhập file Excel đã sửa để cập nhật hàng loạt">📤 Nhập Excel</button>
+                </div>
+              </div>
+              <div class="row-inline form-group">
+                <div>
+                  <label>1. Chọn Profile Chrome:</label>
+                  <select id="bulk-profile" onchange="onBulkProfileChange()">
+                    <option value="">-- Giữ nguyên Profile --</option>
+                  </select>
+                </div>
+                <div>
+                  <label>2. Kênh YouTube Đích:</label>
+                  <select id="bulk-channel">
+                    <option value="">-- Giữ nguyên kênh --</option>
+                  </select>
+                </div>
+              </div>
+              <div class="row-inline form-group">
+                <div>
+                  <label>Hoặc Nhóm Kênh Đích (chia đều — bỏ trống nếu đã chọn kênh):</label>
+                  <select id="bulk-group">
+                    <option value="">-- Giữ nguyên nhóm --</option>
+                  </select>
+                </div>
+                <div>
+                  <label>Bộ Tùy Chọn Đăng (Affiliate/Pin/Hashtag):</label>
+                  <select id="bulk-option-group">
+                    <option value="">-- Giữ nguyên --</option>
+                  </select>
+                </div>
+              </div>
+              <div class="row-inline form-group">
+                <div>
+                  <label>Đổi Độ Phân Giải:</label>
+                  <select id="bulk-res">
+                    <option value="">-- Giữ nguyên --</option>
+                    <option value="1080p">Full HD (1080p)</option>
+                    <option value="4k">4K Ultra HD (2160p)</option>
+                    <option value="2k">2K QHD (1440p)</option>
+                    <option value="original">Gốc</option>
+                  </select>
+                </div>
+                <div>
+                  <label>Đổi Chế Độ Render:</label>
+                  <select id="bulk-render">
+                    <option value="">-- Giữ nguyên --</option>
+                    <option value="shorts_9_16">Render Dọc 9:16 Blur (Shorts)</option>
+                    <option value="pip_thu_nho">Lách Thu Nhỏ (Video Nền DHB)</option>
+                    <option value="full_16_9">Lách Full Màn 16:9</option>
+                    <option value="square_1_1">Render Vuông 1:1</option>
+                    <option value="audio_effect">Lách Âm Thanh</option>
+                    <option value="md5_cut">Đổi MD5 & Xóa Tag</option>
+                    <option value="none">Không Render</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Gán Tiêu Đề Chung (Tùy chọn — dùng Excel nếu mỗi video cần tiêu đề riêng):</label>
+                <input type="text" id="bulk-title" placeholder="VD: Review siêu phẩm này #shorts" />
+              </div>
+              <div class="form-group">
+                <label>Gán Mô Tả Chung (Tùy chọn):</label>
+                <textarea id="bulk-desc" rows="2" placeholder="VD: Video đăng từ điện thoại. Nhớ like và subscribe nhé!"></textarea>
+              </div>
+              <div class="row-inline form-group">
+                <div>
+                  <label>Cắt đầu (HH:MM:SS):</label>
+                  <input type="text" id="bulk-cut-start" placeholder="00:00:03" />
+                </div>
+                <div>
+                  <label>Cắt cuối (HH:MM:SS):</label>
+                  <input type="text" id="bulk-cut-end" placeholder="00:00:03" />
+                </div>
+              </div>
+
+              <!-- Đổi Chế Độ Đăng & Đối Tượng Hàng Loạt -->
+              <div class="row-inline form-group">
+                <div>
+                  <label>Đổi Chế Độ Đăng:</label>
+                  <select id="bulk-visibility" onchange="toggleBulkScheduleFields()">
+                    <option value="">-- Giữ nguyên --</option>
+                    <option value="public">🚀 Đăng ngay - Công khai</option>
+                    <option value="unlisted">🔒 Đăng ngay - Không công khai</option>
+                    <option value="private">🛡️ Đăng ngay - Riêng tư</option>
+                    <option value="schedule">⏰ Lên lịch phát hành</option>
+                  </select>
+                </div>
+                <div>
+                  <label>Đổi Đối Tượng:</label>
+                  <select id="bulk-made-for-kids">
+                    <option value="">-- Giữ nguyên --</option>
+                    <option value="0">🚫 Không dành cho trẻ em</option>
+                    <option value="1">👶 Có, dành cho trẻ em</option>
+                  </select>
+                </div>
+              </div>
+
+              <div id="bulk-schedule-wrap" style="display:none; background:rgba(56,189,248,0.06); padding:8px 10px; border-radius:6px; border:1px dashed #38bdf8; margin-bottom:12px;">
+                <div class="row-inline form-group" style="margin-bottom:6px;">
+                  <div>
+                    <label>Thời gian bắt đầu:</label>
+                    <input type="datetime-local" id="bulk-sched-time" />
+                  </div>
+                  <div>
+                    <label>Giãn cách (phút, tối thiểu 30):</label>
+                    <input type="number" id="bulk-sched-interval" value="60" min="30" max="1440" />
+                  </div>
+                </div>
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:13px; color:#f59e0b;">
+                  <input type="checkbox" id="bulk-is-premiere" />
+                  🎬 Đặt làm video Công chiếu (Premiere)
+                </label>
+              </div>
+
+              <div class="row-inline form-group">
+                <div>
+                  <label>Đổi Giới Hạn 18+:</label>
+                  <select id="bulk-age-restriction">
+                    <option value="">-- Giữ nguyên --</option>
+                    <option value="0">Không giới hạn</option>
+                    <option value="1">🔞 Giới hạn trên 18 tuổi</option>
+                  </select>
+                </div>
+                <div>
+                  <label>Đổi Nhãn AI:</label>
+                  <select id="bulk-altered-content">
+                    <option value="">-- Giữ nguyên --</option>
+                    <option value="0">Không có AI</option>
+                    <option value="1">🤖 Có gắn nhãn AI</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:600; color:#94a3b8;">
+                  <input type="checkbox" id="bulk-mobile" />
+                  📱 Giả lập Điện thoại di động (Bỏ tích để dùng chuẩn Desktop PC)
+                </label>
+              </div>
+              <button class="btn btn-outline" style="width:100%; font-weight:700; padding:8px 14px;" onclick="applyBulkConfig()">
+                ✔️ Áp Dụng Cho Các Video Đã Tích Chọn
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Cột Phải: Bảng Hàng Đợi Video & Điều Khiển Pipeline -->
+        <div>
+          <div class="card">
+            <div id="queue-pending-banner" style="display:none; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin:14px 14px 0; padding:12px 16px; border-radius:10px; border:1px solid rgba(34,197,94,0.55); background:linear-gradient(135deg, rgba(22,101,52,0.35), rgba(15,23,42,0.65));">
+              <div style="font-size:13px; line-height:1.5;">
+                ⏳ <strong style="color:#4ade80;"><span id="queue-pending-count">0</span> video đang chờ</strong> trong dự án này.
+                Tool <strong>không tự chạy khi mở</strong> — chỉ chạy khi bạn bấm nút.
+              </div>
+              <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button type="button" class="btn btn-success btn-sm" onclick="runPendingQueueNow()" title="Chạy toàn trình cho các video đang chờ trong dự án hiện tại">▶️ Chạy Các Video Đang Chờ</button>
+                <button type="button" class="btn btn-outline btn-sm" onclick="hidePendingBanner()" title="Ẩn thông báo cho tới khi đổi dự án hoặc tải lại trang">Ẩn</button>
+              </div>
+            </div>
+            <div class="toolbar-wrap">
+              <!-- Dòng 1: Cụm Nút Bắt Đầu Chính & Điều Khiển -->
+              <div class="toolbar-row">
+                <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                  <button class="btn btn-run-big" onclick="startPipeline(true, true, true)" title="Chạy tự động: Tải nguồn ➔ Render FFmpeg ➔ Đăng YouTube Studio">
+                    ▶️ CHẠY TOÀN TRÌNH TỰ ĐỘNG
+                  </button>
+                  <button class="btn btn-accent btn-sm" onclick="startPipeline(true, false, false)" title="Chỉ tải video về máy">⬇️ Chỉ Tải</button>
+                  <button class="btn btn-purple btn-sm" onclick="startPipeline(false, true, false)" title="Chỉ render lách bản quyền FFmpeg">🎬 Chỉ Render</button>
+                  <button class="btn btn-success btn-sm" onclick="startPipeline(false, false, true)" title="Chỉ đăng lên YouTube">📤 Chỉ Đăng YT</button>
+                  <button class="btn btn-warning btn-sm" onclick="stopPipeline()" title="Dừng toàn bộ luồng xử lý">⏹️ Dừng</button>
+                </div>
+                <div>
+                  <button type="button" class="btn btn-outline btn-sm" id="btn-toggle-sidebar" onclick="toggleSidebar()" title="Ẩn/Hiện cột thiết lập bên trái để mở rộng bảng video tối đa">
+                    ◀ Thu Gọn Cột Trái
+                  </button>
+                </div>
+              </div>
+
+              <!-- Dòng 2: Cụm Tối Ưu Nhanh & Thao Tác Bảng -->
+              <div class="toolbar-row">
+                <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                  <button class="btn btn-sm" style="background:linear-gradient(135deg, #ec4899, #f43f5e); color:#fff; font-weight:700; box-shadow:0 2px 10px rgba(244,63,94,0.4);" onclick="applyShortsBooster()" title="Ép chuẩn thời lượng <= 58.5s + Bộ lọc rực rỡ OLED Visual Pop + 10-Band EQ lách âm thanh">
+                    ⚡ 1-Click Tối Ưu Chuẩn Shorts
+                  </button>
+                  <button class="btn btn-accent btn-sm" onclick="promptAutoSchedule()" title="Tự động giãn cách thời gian phát hành giữa các video">
+                    📅 Lên Lịch Giãn Cách
+                  </button>
+                  <button class="btn btn-outline btn-sm" onclick="toggleSelectAll(true)">Chọn tất cả</button>
+                  <button class="btn btn-outline btn-sm" onclick="toggleSelectAll(false)">Bỏ chọn</button>
+                  <button class="btn btn-outline btn-sm" style="color:#f87171; border-color:rgba(248,113,113,0.3);" onclick="deleteSelectedQueue()" title="Xóa các video đang tích chọn khỏi hàng đợi">
+                    🗑️ Xóa dòng chọn
+                  </button>
+                </div>
+                <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                  <div class="search-input-wrap">
+                    <span class="search-icon">🔍</span>
+                    <input type="text" id="queue-search" placeholder="Tìm kiếm trong bảng..." oninput="filterQueueTable(this.value)" />
+                  </div>
+                  <button class="btn btn-outline btn-sm" style="color:#34d399; border-color:rgba(52,211,153,0.45);" onclick="exportExcel()" title="Xuất Excel các dòng đang chọn (hoặc cả dự án) để sửa tiêu đề/lịch riêng từng video">📥 Xuất Excel</button>
+                  <button class="btn btn-outline btn-sm" style="color:#34d399; border-color:rgba(52,211,153,0.45);" onclick="triggerImportExcel()" title="Nhập Excel để cập nhật hàng loạt tiêu đề, mô tả, lịch, kênh...">📤 Nhập Excel</button>
+                  <button class="btn btn-outline btn-sm" onclick="exportCsv()" title="Xuất danh sách sang file CSV">📥 Xuất CSV</button>
+                  <button class="btn btn-outline btn-sm" onclick="triggerImportCsv()" title="Nhập danh sách từ file CSV">📤 Nhập CSV</button>
+                  <input type="file" id="file-import-excel" accept=".xlsx,.xlsm" style="display:none;" onchange="handleImportExcel(event)" />
+                  <input type="file" id="file-import-csv" accept=".csv" style="display:none;" onchange="handleImportCsv(event)" />
+                </div>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width:32px"><input type="checkbox" id="chk-all" onchange="toggleSelectAll(this.checked)" /></th>
+                    <th style="width:45px">ID</th>
+                    <th style="width:75px">Nguồn</th>
+                    <th>Tiêu Đề & Mô Tả SEO YouTube</th>
+                    <th style="width:95px">Chất lượng</th>
+                    <th style="width:115px">Chế độ Render</th>
+                    <th style="width:130px">Profile & Kênh</th>
+                    <th style="width:75px">Tải về</th>
+                    <th style="width:75px">Render</th>
+                    <th style="width:75px">Upload</th>
+                    <th style="width:115px">Trạng Thái</th>
+                    <th style="width:110px">Thao tác</th>
+                  </tr>
+                </thead>
+                <tbody id="queue-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==========================================
+         TAB 2: AI DỊCH THUẬT, VIẾT LẠI SEO & BIÊN TẬP
+         ========================================== -->
+    <section id="tab-ai" class="tab-pane">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">🤖 AI Dịch Thuật & Viết Lại Tiêu Đề / Mô Tả / Tags Chuẩn SEO YouTube</div>
+          </div>
+          <div class="form-group">
+            <label>Chế Độ Xử Lý AI:</label>
+            <select id="ai-mode">
+              <option value="rewrite_seo">✨ Viết lại Tiêu đề kích thích Click (CTR cao) + Mô tả SEO + Bộ từ khóa Tags</option>
+              <option value="shorts_hook">🔥 Viết lại Tiêu Đề Giật Tít Chuẩn Shorts (&lt; 55 ký tự + Hook Tò Mò + #shorts)</option>
+              <option value="translate">🌐 Dịch nguyên nghĩa Tiêu đề & Mô tả sang ngôn ngữ đích</option>
+            </select>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Nhà Cung Cấp AI (Provider):</label>
+              <select id="ai-provider">
+                <option value="gemini">Google Gemini 2.5 Flash (Kế thừa API từ DHB)</option>
+                <option value="google_translate">Google Translate (Miễn phí - Tốc độ cao)</option>
+                <option value="openai">OpenAI ChatGPT (GPT-4.1)</option>
+                <option value="deepseek">DeepSeek Chat V3</option>
+              </select>
+            </div>
+            <div>
+              <label>Ngôn Ngữ Đích:</label>
+              <select id="ai-lang">
+                <option value="Tiếng Việt">Tiếng Việt</option>
+                <option value="Tiếng Anh">Tiếng Anh (English - US/Global)</option>
+                <option value="Tiếng Nhật">Tiếng Nhật (Japanese)</option>
+                <option value="Tiếng Hàn">Tiếng Hàn (Korean)</option>
+                <option value="Tiếng Trung">Tiếng Trung (Chinese)</option>
+                <option value="Tiếng Tây Ban Nha">Tiếng Tây Ban Nha (Spanish)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Yêu Cầu Prompt Bổ Sung Cho AI (Tùy chọn):</label>
+            <textarea id="ai-prompt" rows="4" placeholder="Ví dụ: Viết tiêu đề gây tò mò cho ngách Unbox / Đồ chơi / Handmade, độ dài dưới 90 ký tự, kèm hashtag #shorts #unbox ở cuối tiêu đề..."></textarea>
+          </div>
+          <button class="btn btn-purple" style="width:100%" onclick="runAIProcess('ai')">
+            🚀 Chạy AI Tối Ưu Hàng Loạt Cho Các Video Đang Chọn (Hoặc Toàn Bộ Dự Án)
+          </button>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">✏️ Công Cụ Biên Tập Văn Bản Hàng Loạt (Batch Text Editor)</div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Trường Cần Sửa:</label>
+              <select id="ed-field">
+                <option value="title">Tiêu đề (Title)</option>
+                <option value="description">Mô tả (Description)</option>
+                <option value="tags">Thẻ từ khóa (Tags)</option>
+              </select>
+            </div>
+            <div>
+              <label>Thao Tác Biên Tập:</label>
+              <select id="ed-op">
+                <option value="append_end">Thêm văn bản vào CUỐI</option>
+                <option value="append_first">Thêm văn bản vào ĐẦU</option>
+                <option value="replace">Tìm và Thay thế chuỗi</option>
+                <option value="strip_hashtags">Xóa sạch toàn bộ #Hashtag cũ</option>
+                <option value="titlecase">Viết Hoa Chữ Cái Đầu Từ</option>
+                <option value="uppercase">VIẾT HOA TOÀN BỘ</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Chuỗi Cần Tìm (Chỉ dùng khi chọn 'Tìm và Thay thế'):</label>
+            <input type="text" id="ed-find" placeholder="Nhập từ/cụm từ muốn xóa hoặc thay thế..." />
+          </div>
+          <div class="form-group">
+            <label>Văn Bản Thêm Vào / Chuỗi Thay Thế:</label>
+            <input type="text" id="ed-replace" placeholder="Ví dụ: #shorts #xuhuong" />
+          </div>
+          <button class="btn btn-accent" style="width:100%" onclick="runAIProcess('batch_edit')">
+            ⚡ Thực Thi Biên Tập Hàng Loạt Ngay
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==========================================
+         TAB 3: CẤU HÌNH RENDER & KHO TÀI NGUYÊN DHB
+         ========================================== -->
+    <section id="tab-render" class="tab-pane">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">🎛️ Thiết Lập Thông Số Render & Lách Bản Quyền FFmpeg</div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Chế Độ Render Áp Dụng:</label>
+              <select id="rc-mode">
+                <option value="shorts_9_16">1. Render Dọc 9:16 (1080x1920) Nền Blur Mờ (Chuẩn Shorts)</option>
+                <option value="pip_thu_nho">2. Lách Thu Nhỏ Đặt Trên Video Nền Chuyển Động</option>
+                <option value="full_16_9">3. Lách Full Màn Hình Ngang 16:9 (1280x720 / 1920x1080)</option>
+                <option value="square_1_1">4. Render Vuông 1:1 (1080x1080)</option>
+                <option value="audio_effect">5. Lách Âm Thanh (Đổi tần số Pitch + Lọc âm)</option>
+                <option value="md5_cut">6. Cắt Đầu/Cuối + Xóa Metadata + Đổi MD5</option>
+                <option value="custom_ffmpeg">7. Chạy Lệnh Custom FFmpeg Trực Tiếp</option>
+              </select>
+            </div>
+            <div>
+              <label>Tốc Độ Video & Âm Thanh (Speed):</label>
+              <input type="number" id="rc-speed" value="1.05" step="0.05" min="0.5" max="2.0" />
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Âm Lượng Gốc (Volume):</label>
+              <input type="number" id="rc-volume" value="1.0" step="0.1" min="0.0" max="3.0" />
+            </div>
+            <div>
+              <label>Độ Sáng (Brightness -0.5 đến 0.5):</label>
+              <input type="number" id="rc-brightness" value="0.02" step="0.02" min="-0.5" max="0.5" />
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Video Nền (Từ C:\DHB Reup Facebook\Data\Render\_Backgroud Video):</label>
+              <select id="rc-bg-video"></select>
+            </div>
+            <div>
+              <label>Nhạc Nền MP3 (Từ C:\DHB Reup Facebook\Data\Render\_Backgroud Music):</label>
+              <select id="rc-bg-music"></select>
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label><input type="checkbox" id="rc-hflip" checked /> Lật ngang gương (Horizontal Flip)</label>
+            </div>
+            <div>
+              <label><input type="checkbox" id="rc-pitch" checked /> Biến đổi tần số âm thanh lách bản quyền (Audio Pitch Shift)</label>
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label><input type="checkbox" id="rc-shorts-enforce" checked /> ⚡ Tự động khống chế thời lượng chuẩn Shorts (&le; 58.5s)</label>
+            </div>
+            <div>
+              <label><input type="checkbox" id="rc-shorts-visual" checked /> ✨ Tối ưu màu sắc &amp; độ nét màn hình OLED di động (Visual Pop)</label>
+            </div>
+          </div>
+
+          <!-- CẮT / XOAY / VIỀN / MOVE CAMERA (trung lập, kế thừa ý tưởng preset DHB) -->
+          <button type="button" class="adv-toggle-btn" onclick="toggleEditPanel()">
+            <span>✂️ Cắt Khung / Xoay / Viền Màu / Move Camera (Zoom Chậm)</span>
+            <span id="edit-arrow">▼</span>
+          </button>
+          <div id="edit-panel" class="adv-panel">
+            <div class="row-inline form-group">
+              <div>
+                <label><input type="checkbox" id="rc-crop-enable" /> Cắt khung hình (Crop)</label>
+              </div>
+              <div>
+                <label style="display:flex; align-items:center; gap:6px; cursor:pointer; margin-top:18px;">
+                  <input type="checkbox" id="rc-crop-center" checked /> Cắt giữa khung
+                </label>
+              </div>
+            </div>
+            <div class="row-inline form-group">
+              <div>
+                <label>Kích thước cắt (W:H):</label>
+                <input type="text" id="rc-crop-size" value="900:506" placeholder="900:506" />
+              </div>
+              <div>
+                <label>Vị trí cắt (X:Y — bỏ qua khi cắt giữa):</label>
+                <input type="text" id="rc-crop-pos" value="0:0" placeholder="0:0" />
+              </div>
+            </div>
+            <div class="row-inline form-group">
+              <div>
+                <label>Xoay video:</label>
+                <select id="rc-rotation">
+                  <option value="0">Không xoay</option>
+                  <option value="90">Xoay 90° sang phải</option>
+                  <option value="180">Xoay 180°</option>
+                  <option value="270">Xoay 90° sang trái</option>
+                </select>
+              </div>
+              <div>
+                <label>Viền màu (Pad):</label>
+                <div style="display:flex; gap:4px;">
+                  <input type="text" id="rc-pad-color" value="FF0000" placeholder="FF0000" title="Mã màu HEX" />
+                  <input type="number" id="rc-pad-size" value="6" min="0" max="300" title="Độ dày viền (px)" />
+                </div>
+                <label style="margin-top:4px;"><input type="checkbox" id="rc-pad-enable" /> Bật viền màu</label>
+              </div>
+            </div>
+            <div class="row-inline form-group">
+              <div>
+                <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+                  <input type="checkbox" id="rc-move-camera" /> 🎥 Move Camera (zoom chậm)
+                </label>
+              </div>
+              <div>
+                <label>Tốc độ zoom (0.1–3.0):</label>
+                <input type="number" id="rc-move-speed" value="1.0" step="0.1" min="0.1" max="3.0" />
+              </div>
+            </div>
+            <div style="font-size:11.5px; color:var(--text-muted);">
+              Áp dụng cho các chế độ render có xử lý video (9:16, 16:9, vuông, PiP, audio_effect). Không áp dụng cho cắt MD5 và Custom FFmpeg.
+            </div>
+          </div>
+
+          <!-- LỚP PHỦ BRANDING NÂNG CAO (kế thừa DHB Reup Facebook) -->
+          <button type="button" class="adv-toggle-btn" onclick="toggleBrandingPanel()">
+            <span>🎨 Lớp Phủ Branding Nâng Cao (Watermark Ảnh / Chữ / Chữ Chạy / Logo Chroma / Intro-Outro / Trộn Âm %)</span>
+            <span id="branding-arrow">▼</span>
+          </button>
+          <div id="branding-panel" class="adv-panel">
+            <div class="row-inline form-group">
+              <div>
+                <label>Watermark Ảnh (kho _Image):</label>
+                <select id="rc-wm-image"></select>
+              </div>
+              <div>
+                <label>Kích thước &amp; Vị trí (W:H và X:Y):</label>
+                <div style="display:flex; gap:4px;">
+                  <input type="text" id="rc-wm-size" value="240:120" placeholder="240:120" />
+                  <input type="text" id="rc-wm-pos" value="10:10" placeholder="10:10" />
+                  <input type="number" id="rc-wm-opacity" value="1.0" step="0.1" min="0" max="1" title="Độ mờ 0-1" />
+                </div>
+              </div>
+            </div>
+            <div class="row-inline form-group">
+              <div>
+                <label>Logo Video Chroma-Key (kho _Video - tự tách nền xanh):</label>
+                <select id="rc-logo"></select>
+              </div>
+              <div>
+                <label>Kích thước, Vị trí, Màu Chroma:</label>
+                <div style="display:flex; gap:4px;">
+                  <input type="text" id="rc-logo-size" value="300:150" placeholder="300:150" />
+                  <input type="text" id="rc-logo-pos" value="10:10" placeholder="10:10" />
+                  <input type="text" id="rc-logo-chroma" value="13FE06" placeholder="13FE06" />
+                </div>
+              </div>
+            </div>
+            <div class="row-inline form-group">
+              <div>
+                <label>Watermark Chữ:</label>
+                <input type="text" id="rc-wm-text" placeholder="VD: @KênhCủaBạn — để trống để tắt" />
+              </div>
+              <div>
+                <label>Cỡ, Vị trí, Màu chữ:</label>
+                <div style="display:flex; gap:4px;">
+                  <input type="number" id="rc-wm-text-size" value="50" min="10" max="200" />
+                  <input type="text" id="rc-wm-text-pos" value="350:80" placeholder="X:Y" />
+                  <input type="text" id="rc-wm-text-color" value="white" placeholder="white" />
+                </div>
+              </div>
+            </div>
+            <div class="row-inline form-group">
+              <div>
+                <label>Chữ Chạy Ngang (Text Scroll - để trống để tắt):</label>
+                <input type="text" id="rc-scroll-text" placeholder="VD: Theo dõi kênh để nhận video mới mỗi ngày!" />
+              </div>
+              <div>
+                <label>Cỡ, Tốc độ, Màu chữ chạy:</label>
+                <div style="display:flex; gap:4px;">
+                  <input type="number" id="rc-scroll-size" value="40" min="10" max="200" />
+                  <input type="number" id="rc-scroll-speed" value="10" min="1" max="200" title="Pixel/giây" />
+                  <input type="text" id="rc-scroll-color" value="yellow" placeholder="yellow" />
+                </div>
+              </div>
+            </div>
+            <div class="row-inline form-group">
+              <div>
+                <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+                  <input type="checkbox" id="rc-intro-enable" /> 🎬 Chèn Intro
+                  <input type="checkbox" id="rc-intro-random" title="Chọn ngẫu nhiên từ kho" /> 🎲
+                </label>
+                <select id="rc-intro" style="margin-top:4px;"></select>
+              </div>
+              <div>
+                <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+                  <input type="checkbox" id="rc-outro-enable" /> 🏁 Chèn Outro
+                  <input type="checkbox" id="rc-outro-random" title="Chọn ngẫu nhiên từ kho" /> 🎲
+                </label>
+                <select id="rc-outro" style="margin-top:4px;"></select>
+              </div>
+            </div>
+            <div class="row-inline form-group">
+              <div>
+                <label>Trộn Âm Thanh (% Nhạc Gốc / % Nhạc Nền khi có nhạc nền):</label>
+                <div style="display:flex; gap:4px; align-items:center;">
+                  <input type="number" id="rc-audio-orig" value="100" min="0" max="100" /> <span>%</span>
+                  <span style="color:var(--text-muted)">/</span>
+                  <input type="number" id="rc-audio-bg" value="25" min="0" max="100" /> <span>%</span>
+                </div>
+              </div>
+              <div>
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:18px;">
+                  <input type="checkbox" id="rc-bg-random" /> 🎲 Chọn video nền NGẪU NHIÊN (chế độ Lách Thu Nhỏ)
+                </label>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Mẫu Lệnh Custom FFmpeg (Kế thừa từ C:\DHB Reup Facebook\Data\Config\Code FFmpeg):</label>
+            <select id="rc-ffmpeg-preset" onchange="onSelectFFmpegPreset(this.value)"></select>
+            <textarea id="rc-custom-cmd" rows="3" style="margin-top:6px" placeholder="ffmpeg -y -i &quot;{input}&quot; ... &quot;{output}&quot;"></textarea>
+          </div>
+          <button class="btn btn-primary" style="width:100%" onclick="applyRenderStudioToSelected()">
+            🎬 Lưu & Áp Dụng Cấu Hình Render Này Cho Các Video Đang Chọn
+          </button>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">📦 Kho Tài Nguyên Kế Thừa Từ C:\DHB Reup Facebook\Data\Render</div>
+          </div>
+          <div id="dhb-resources-summary" style="max-height:460px; overflow-y:auto;"></div>
+        </div>
+      </div>
+
+      <!-- PRESET RENDER CÓ TÊN (học quy trình preset JSON của DHB) -->
+      <div class="card" style="margin-top:12px;">
+        <div class="card-header">
+          <div class="card-title">💾 Preset Render Có Tên — Lưu / Nạp Cấu Hình 1-Click (Kế thừa quy trình DHB)</div>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>Tên Preset Muốn Lưu:</label>
+            <input type="text" id="rp-name" placeholder="VD: Shorts Clay Chuẩn - Logo Xanh + Chữ Chạy" />
+          </div>
+          <div style="display:flex; align-items:flex-end; gap:8px;">
+            <button class="btn btn-success btn-sm" onclick="saveRenderPreset()">💾 Lưu Cấu Hình Hiện Tại Thành Preset</button>
+          </div>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>Preset Đã Lưu:</label>
+            <select id="rp-select" onchange="onSelectRenderPreset()"></select>
+          </div>
+          <div style="display:flex; align-items:flex-end; gap:8px;">
+            <button class="btn btn-accent btn-sm" onclick="loadPresetToForm()">📋 Nạp Vào Form</button>
+            <button class="btn btn-outline btn-sm" style="color:#f87171; border-color:rgba(248,113,113,0.3);" onclick="deleteRenderPreset()">🗑️ Xóa Preset</button>
+          </div>
+        </div>
+        <div style="font-size:11.5px; color:var(--text-muted); margin-top:6px;">
+          💡 Quy trình giống tool DHB gốc: chỉnh mọi thông số ở khung bên trên → đặt tên → Lưu. Lần sau chỉ cần chọn preset → "Nạp Vào Form" → "Áp Dụng Cho Video Đang Chọn".
+        </div>
+      </div>
+    </section>
+
+    <!-- ==========================================
+         TAB 4: QUẢN LÝ KÊNH YOUTUBE & PROFILE CHROME
+         ========================================== -->
+    <section id="tab-channels" class="tab-pane">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">➕ Thêm Kênh YouTube / Profile Chrome Mới</div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Tên Kênh Hiển Thị:</label>
+              <input type="text" id="ch-name" placeholder="Ví dụ: Kênh Shorts Unbox 01" />
+            </div>
+            <div>
+              <label>Handle / ID Kênh (@...):</label>
+              <input type="text" id="ch-handle" placeholder="@unboxchannel01" />
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Nhóm Kênh (Group):</label>
+              <select id="ch-group"></select>
+            </div>
+            <div>
+              <label>Phương Thức Đăng Video:</label>
+              <select id="ch-mode">
+                <option value="playwright">🌐 Trình duyệt tự động Playwright (YouTube Studio)</option>
+                <option value="youtube_api">🔑 YouTube Data API v3 (OAuth2 Resumable Upload)</option>
+              </select>
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>1. Chọn Profile Chrome Có Sẵn (7 Profile DHB):</label>
+              <select id="ch-prof-select" onchange="onSelectExistingProfile(this.value)">
+                <option value="">-- Tự nhập tên profile mới --</option>
+              </select>
+            </div>
+            <div>
+              <label>Tên Thư Mục Profile Chrome:</label>
+              <input type="text" id="ch-prof-name" placeholder="Ví dụ: Công chính" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Đường Dẫn Profile Thư Mục (Tùy chọn):</label>
+            <input type="text" id="ch-prof-path" placeholder="Để trống sẽ tự động lấy từ C:\DHB Reup Facebook\Data\Profile Chrome" />
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Proxy (IP:PORT hoặc IP:PORT:USER:PASS):</label>
+              <input type="text" id="ch-proxy" placeholder="Để trống nếu dùng mạng trực tiếp" />
+            </div>
+            <div>
+              <label>Danh Mục YouTube Mặc Định:</label>
+              <select id="ch-cat">
+                <option value="22">22 - People & Blogs (Mọi người & Blog)</option>
+                <option value="24">24 - Entertainment (Giải trí)</option>
+                <option value="26">26 - Howto & Style (Hướng dẫn & Phong cách)</option>
+                <option value="20">20 - Gaming (Trò chơi)</option>
+                <option value="1">1 - Film & Animation (Phim & Hoạt hình)</option>
+                <option value="10">10 - Music (Âm nhạc)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>OAuth2 Token JSON / Access Token (Chỉ cần nếu chọn chế độ YouTube Data API v3):</label>
+            <textarea id="ch-oauth" rows="2" placeholder='{"client_id":"...","client_secret":"...","refresh_token":"..."}'></textarea>
+          </div>
+          <div class="form-group">
+            <label><input type="checkbox" id="ch-hidden" /> Chạy trình duyệt ở chế độ Ẩn cửa sổ (Offscreen / Hidden Desktop)</label>
+          </div>
+          <button class="btn btn-success" style="width:100%" onclick="addChannel()">
+            ➕ Lưu Kênh YouTube Vào Hệ Thống
+          </button>
+
+          <hr style="border:none; border-top:1px solid var(--border); margin:14px 0;" />
+          <div class="row-inline">
+            <input type="text" id="grp-new-name" placeholder="Nhập tên nhóm kênh mới (VD: Shorts Mỹ, Clay, Unbox)..." />
+            <button class="btn btn-outline" style="flex:0" onclick="addGroup()">+ Tạo Nhóm Kênh</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+            <div class="card-title">📺 Danh Sách Kênh YouTube & Profile Chrome (Đã đồng bộ từ DHB)</div>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <label style="margin:0; font-size:12px; font-weight:600; color:#38bdf8;">Lọc theo Profile:</label>
+              <select id="filter-channel-profile" onchange="filterChannelsByProfile(this.value)" style="width:auto; padding:4px 10px; font-size:12px; border-radius:6px; background:#0f172a; color:#fff; border:1px solid var(--border);">
+                <option value="">-- Tất cả Profile --</option>
+              </select>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Tên Kênh</th>
+                  <th>Nhóm</th>
+                  <th>Phương Thức</th>
+                  <th>Profile Chrome</th>
+                  <th style="width:110px">Trạng Thái</th>
+                  <th>Thao Tác</th>
+                </tr>
+              </thead>
+              <tbody id="channels-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- QUẢN LÝ BỘ TÙY CHỌN ĐĂNG (AFFILIATE / PIN COMMENT / HASHTAGS) -->
+      <div class="card" style="margin-top:12px;">
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+          <div class="card-title">🎛️ Bộ Tùy Chọn Đăng (Affiliate Shopee / Pin Comment / Hashtags)</div>
+          <button class="btn btn-outline btn-sm" onclick="resetOptionForm()">➕ Tạo Bộ Mới</button>
+        </div>
+        <div class="grid-2">
+          <div>
+            <input type="hidden" id="opt-id" />
+            <div class="form-group">
+              <label>Tên Bộ Tùy Chọn:</label>
+              <input type="text" id="opt-name" placeholder="VD: Shopee Unbox + Pin Comment" />
+            </div>
+            <div class="form-group">
+              <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                <input type="checkbox" id="opt-affiliate-enabled" />
+                Bật Affiliate Shopee (tự chèn link vào mô tả video)
+              </label>
+            </div>
+            <div class="form-group">
+              <label>Link Affiliate Shopee:</label>
+              <input type="text" id="opt-affiliate-url" placeholder="https://shopee.vn/..." />
+            </div>
+            <div class="form-group">
+              <label>Câu Mời (CTA) Trước Link:</label>
+              <input type="text" id="opt-affiliate-cta" value="👉 Mua ngay sản phẩm chính hãng tại đây:" />
+            </div>
+            <div class="form-group">
+              <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                <input type="checkbox" id="opt-pin-enabled" />
+                Ghim bình luận đầu tiên
+              </label>
+            </div>
+            <div class="form-group">
+              <label>Nội Dung Bình Luận Ghim:</label>
+              <textarea id="opt-pin-text" rows="2" placeholder="VD: Nhớ bấm Like & Subscribe để nhận video mới mỗi ngày!"></textarea>
+            </div>
+            <div class="row-inline form-group">
+              <div>
+                <label>Hashtag Tự Chèn Vào Tiêu Đề:</label>
+                <input type="text" id="opt-hashtags" value="#shorts #trending #viral" />
+              </div>
+              <div>
+                <label>Tags Mặc Định (cách nhau dấu phẩy):</label>
+                <input type="text" id="opt-default-tags" placeholder="review, unbox" />
+              </div>
+            </div>
+            <div class="row-inline form-group">
+              <div>
+                <label>Danh Mục YouTube:</label>
+                <select id="opt-category">
+                  <option value="22">22 - People &amp; Blogs</option>
+                  <option value="24">24 - Entertainment</option>
+                  <option value="26">26 - Howto &amp; Style</option>
+                  <option value="20">20 - Gaming</option>
+                  <option value="1">1 - Film &amp; Animation</option>
+                  <option value="10">10 - Music</option>
+                </select>
+              </div>
+              <div>
+                <label>Đối Tượng Mặc Định:</label>
+                <select id="opt-made-for-kids">
+                  <option value="0">🚫 Không dành cho trẻ em</option>
+                  <option value="1">👶 Dành cho trẻ em</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                <input type="checkbox" id="opt-ai-label" />
+                🤖 Gắn nhãn nội dung AI mặc định
+              </label>
+            </div>
+            <button class="btn btn-success" style="width:100%" onclick="saveOptionGroup()">💾 Lưu Bộ Tùy Chọn</button>
+          </div>
+          <div class="table-wrap" style="max-height:420px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Tên Bộ Tùy Chọn</th>
+                  <th>Affiliate</th>
+                  <th>Pin Comment</th>
+                  <th>Hashtags</th>
+                  <th>Thao Tác</th>
+                </tr>
+              </thead>
+              <tbody id="options-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div style="font-size:11.5px; color:var(--text-muted); margin-top:8px; line-height:1.55;">
+          💡 Bộ tùy chọn được gán cho video ở khung quét nguồn, cấu hình hàng loạt hoặc luồng Auto Monitor. Khi đăng, tool tự chèn hashtag vào tiêu đề, link Shopee vào mô tả và ghim bình luận (nếu bật).
+        </div>
+      </div>
+
+      <!-- QUẢN LÝ PROFILE CHROME & TRẠNG THÁI ĐĂNG NHẬP GOOGLE -->
+      <div class="card" style="margin-top:12px;">
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+          <div class="card-title">👤 Quản Lý Profile Chrome & Trạng Thái Đăng Nhập Google</div>
+          <button class="btn btn-outline btn-sm" onclick="loadProfiles()">🔄 Làm Mới Danh Sách</button>
+        </div>
+        <div class="table-wrap" style="max-height:340px;">
+          <table>
+            <thead>
+              <tr>
+                <th>Profile Chrome</th>
+                <th style="width:70px">Nguồn</th>
+                <th>Proxy</th>
+                <th style="width:60px">Số Kênh</th>
+                <th style="width:150px">Trạng Thái Đăng Nhập</th>
+                <th style="width:420px">Thao Tác</th>
+              </tr>
+            </thead>
+            <tbody id="profiles-tbody"></tbody>
+          </table>
+        </div>
+        <div style="font-size:11.5px; color:var(--text-muted); margin-top:8px; line-height:1.55;">
+          💡 <b>🔍 Kiểm Tra</b>: Chrome mở ở vị trí khuất, tự kiểm tra phiên đăng nhập Google và xem trước danh sách kênh YouTube thật trong Profile (~10–20 giây).
+          <b>🔄 Quét Kênh</b>: cập nhật danh sách kênh YouTube thật vào hệ thống để chọn đích đăng.
+          <b>🌐 Mở Đăng Nhập</b>: mở Chrome để bạn đăng nhập Google thủ công (đóng Chrome sau khi xong).
+          Hệ thống luôn chạy định danh Windows Desktop nguyên bản — không bao giờ ép User-Agent di động vào Profile Windows (chống Checkpoint).
+        </div>
+      </div>
+    </section>
+
+    <!-- ==========================================
+         TAB 5: AUTO MONITOR 24/7 (QUÉT & REUP TỰ ĐỘNG)
+         ========================================== -->
+    <section id="tab-monitor" class="tab-pane">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">📡 Thiết Lập Luồng Theo Dõi Kênh Nguồn Tự Động 24/7 (Auto Monitor)</div>
+          </div>
+          <div class="form-group">
+            <label>Tên Luồng Theo Dõi:</label>
+            <input type="text" id="mon-name" placeholder="Ví dụ: Theo dõi kênh Douyin Clay -> Đăng Shorts Clay" />
+          </div>
+          <div class="form-group">
+            <label>Danh Sách Link Kênh Nguồn Theo Dõi (TikTok, Douyin, YouTube, FB, IG - mỗi dòng 1 kênh):</label>
+            <textarea id="mon-urls" rows="4" placeholder="https://www.tiktok.com/@source_channel_1&#10;https://www.youtube.com/@source_channel_2/shorts"></textarea>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Kênh YouTube Đích:</label>
+              <select id="mon-channel"></select>
+            </div>
+            <div>
+              <label>Hoặc Nhóm Kênh Đích:</label>
+              <select id="mon-group"></select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Bộ Tùy Chọn Đăng (Affiliate Shopee / Pin Comment / Hashtags):</label>
+            <select id="mon-option-group">
+              <option value="">-- Không dùng bộ tùy chọn --</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Chế Độ Render Lách Bản Quyền:</label>
+            <select id="mon-render">
+              <option value="shorts_9_16">Render Dọc 9:16 Blur (Shorts)</option>
+              <option value="pip_thu_nho">Lách Thu Nhỏ (Video Nền DHB)</option>
+              <option value="full_16_9">Lách Full Màn 16:9</option>
+              <option value="audio_effect">Lách Âm Thanh</option>
+              <option value="md5_cut">Đổi MD5 & Xóa Tag</option>
+            </select>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Tự Động AI Dịch / Viết Lại:</label>
+              <select id="mon-ai-action">
+                <option value="rewrite_seo">AI Viết lại chuẩn SEO YouTube</option>
+                <option value="translate">AI Dịch sang ngôn ngữ đích</option>
+                <option value="none">Giữ nguyên tiêu đề gốc</option>
+              </select>
+            </div>
+            <div>
+              <label>Ngôn Ngữ Đích:</label>
+              <input type="text" id="mon-ai-lang" value="Tiếng Việt" />
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Chu Kỳ Quét Lặp Lại (Phút):</label>
+              <input type="number" id="mon-interval" value="30" min="5" />
+            </div>
+            <div>
+              <label>Số Video Mới Tối Đa / Lần Quét:</label>
+              <input type="number" id="mon-max" value="3" min="1" max="20" />
+            </div>
+          </div>
+          <button class="btn btn-success" style="width:100%" onclick="addMonitor()">
+            ➕ Tạo Luồng Auto Monitor 24/7
+          </button>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">⚡ Danh Sách Các Luồng Auto Monitor Đang Quản Lý</div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Tên Luồng</th>
+                  <th>Đích Đăng</th>
+                  <th>Chu Kỳ</th>
+                  <th>Trạng Thái Hiện Tại</th>
+                  <th>Điều Khiển</th>
+                </tr>
+              </thead>
+              <tbody id="monitors-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==========================================
+         TAB 7: CÀI ĐẶT HỆ THỐNG & NHẬT KÝ (LOGS)
+         ========================================== -->
+    <section id="tab-settings" class="tab-pane">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">⚙️ Cài Đặt Hệ Thống & API Keys (Đồng bộ từ setting.json)</div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Google Gemini API Key:</label>
+              <input type="text" id="set-gemini-key" />
+            </div>
+            <div>
+              <label>Gemini Model:</label>
+              <input type="text" id="set-gemini-model" value="gemini-2.5-flash" />
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>OpenAI API Key:</label>
+              <input type="password" id="set-openai-key" />
+            </div>
+            <div>
+              <label>DeepSeek API Key:</label>
+              <input type="password" id="set-deepseek-key" />
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Số Luồng Chạy Song Song Tối Đa:</label>
+              <input type="number" id="set-threads" value="2" min="1" max="10" />
+            </div>
+            <div>
+              <label>Thời Gian Nghỉ Giữa 2 Lần Đăng (Giây):</label>
+              <input type="number" id="set-delay" value="10" min="0" />
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Số Render Song Song Tối Đa (khuyến nghị 1–2):</label>
+              <input type="number" id="set-render-threads" value="2" min="1" max="8" />
+            </div>
+            <div></div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Chờ Kiểm Duyệt Content ID Tối Đa (Giây):</label>
+              <input type="number" id="set-checks-timeout" value="120" min="30" max="600" />
+            </div>
+            <div>
+              <label>Giãn Cách Đăng Giữa Các Video Của Auto Monitor (Phút):</label>
+              <input type="number" id="set-monitor-gap" value="30" min="0" max="1440" />
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Giới Hạn Số Video Đăng Mỗi Phiên Chạy (0 = Không giới hạn):</label>
+              <input type="number" id="set-max-uploads" value="0" min="0" max="100" />
+            </div>
+            <div>
+              <label>Nguồn Ảnh Thumbnail:</label>
+              <select id="set-thumb-source">
+                <option value="reup">📥 Dùng ảnh gốc của nguồn (nếu có)</option>
+                <option value="generate">📸 Luôn tự chụp từ video render</option>
+              </select>
+            </div>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Độ Phân Giải Tải Riêng Cho TikTok/Douyin:</label>
+              <select id="set-tiktok-res">
+                <option value="720p">720p HD (mặc định — đúng chuẩn DHB)</option>
+                <option value="1080p">1080p Full HD</option>
+                <option value="540p">540p (nhẹ nhất)</option>
+              </select>
+            </div>
+            <div></div>
+          </div>
+          <div class="form-group">
+            <label><input type="checkbox" id="set-hide-browser" /> Ẩn cửa sổ trình duyệt khi tự động đăng YouTube Studio</label>
+          </div>
+          <div class="form-group">
+            <label><input type="checkbox" id="set-del-temp" checked /> Tự động xóa file tạm sau khi đăng thành công</label>
+          </div>
+          <div class="row-inline form-group">
+            <div>
+              <label>Thư Mục Export CSV Định Kỳ (để trống = tắt):</label>
+              <input type="text" id="set-external-backup-dir" placeholder="VD: D:\Backup\DHB_Youtube" />
+            </div>
+            <div>
+              <label>Số Bản Export Giữ Lại:</label>
+              <input type="number" id="set-external-backup-keep" value="10" min="1" max="100" />
+            </div>
+          </div>
+          <div class="form-group" style="display:flex; gap:10px; align-items:center;">
+            <button type="button" class="btn btn-outline" onclick="exportBackupNow()">📤 Export CSV Ngay</button>
+            <span style="font-size:11.5px; color:var(--text-muted);">Tự động mỗi 6 giờ. Bản export KHÔNG chứa OAuth token/API key/cookie — sao lưu thư mục data\ để giữ secret.</span>
+          </div>
+          <button class="btn btn-primary" style="width:100%" onclick="saveAppSettings()">
+            💾 Lưu Toàn Bộ Cài Đặt
+          </button>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">📜 Nhật Ký Hoạt Động Hệ Thống (Live System Logs)</div>
+            <button class="btn btn-outline btn-sm" onclick="clearLogs()">Xóa Log</button>
+          </div>
+          <div class="row-inline form-group" style="margin-bottom:10px;">
+            <div>
+              <label>Phân Hệ:</label>
+              <select id="log-filter-module" onchange="loadLogs()">
+                <option value="">Tất cả phân hệ</option>
+              </select>
+            </div>
+            <div>
+              <label>Trạng Thái:</label>
+              <select id="log-filter-status" onchange="loadLogs()">
+                <option value="">Tất cả</option>
+                <option value="INFO">INFO</option>
+                <option value="SUCCESS">SUCCESS</option>
+                <option value="WARNING">WARNING</option>
+                <option value="ERROR">ERROR</option>
+              </select>
+            </div>
+            <div>
+              <label>Tìm Kiếm:</label>
+              <input type="text" id="log-filter-q" placeholder="Nội dung / kênh / tiêu đề..." oninput="scheduleLogsReload()" />
+            </div>
+          </div>
+          <div style="display:flex; justify-content:flex-end; margin-bottom:8px;">
+            <button class="btn btn-outline btn-sm" onclick="exportLogs()">⬇️ Xuất CSV Log Đang Lọc</button>
+          </div>
+          <div class="table-wrap" style="max-height:420px;">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:135px">Thời Gian</th>
+                  <th style="width:85px">Phân Hệ</th>
+                  <th style="width:80px">Trạng Thái</th>
+                  <th>Nội Dung Chi Tiết</th>
+                </tr>
+              </thead>
+              <tbody id="logs-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ==========================================
+       MODAL: CHỈNH SỬA CHI TIẾT VIDEO, PROFILE & ĐỘ PHÂN GIẢI
+       ========================================== -->
+  <div id="modal-edit-video" class="modal-overlay" style="display:none;">
+    <div class="modal-content" style="max-width:680px;">
+      <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+        <div class="card-title">✏️ Chỉnh Sửa Chi Tiết Video #<span id="ed-vid-id"></span></div>
+        <button class="btn btn-outline btn-sm" onclick="closeEditModal()">✖</button>
+      </div>
+      <div class="modal-body" style="padding:16px 0;">
+        <input type="hidden" id="ed-vid-id-val" />
+        <div class="form-group">
+          <label>Tiêu Đề Video YouTube:</label>
+          <input type="text" id="ed-vid-title" placeholder="Nhập tiêu đề video..." />
+        </div>
+        <div class="form-group">
+          <label>Mô Tả Video (SEO Description):</label>
+          <textarea id="ed-vid-desc" rows="4" placeholder="Mô tả video, hashtag, liên hệ..."></textarea>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>1. Chọn Profile Chrome:</label>
+            <select id="ed-vid-profile" onchange="onModalProfileChange()">
+              <option value="">-- Mặc định (Tự chọn) --</option>
+            </select>
+          </div>
+          <div>
+            <label>2. Kênh YouTube Đích:</label>
+            <select id="ed-vid-channel">
+              <option value="">-- Theo nhóm mặc định --</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Bộ Tùy Chọn Đăng (Affiliate Shopee / Pin Comment / Hashtags):</label>
+          <select id="ed-vid-option-group">
+            <option value="">-- Không dùng bộ tùy chọn --</option>
+          </select>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>Độ Phân Giải (Full HD - 4K):</label>
+            <select id="ed-vid-res">
+              <option value="1080p">Full HD (1080p - 1080x1920)</option>
+              <option value="4k">4K Ultra HD (2160p - 2160x3840)</option>
+              <option value="2k">2K QHD (1440p - 1440x2560)</option>
+              <option value="original">Nguyên bản gốc</option>
+            </select>
+          </div>
+          <div>
+            <label>Chế Độ Render Lách Bản Quyền:</label>
+            <select id="ed-vid-render">
+              <option value="shorts_9_16">Render Dọc 9:16 Blur (Shorts)</option>
+              <option value="pip_thu_nho">Lách Thu Nhỏ (Video Nền DHB)</option>
+              <option value="full_16_9">Lách Full Màn 16:9</option>
+              <option value="square_1_1">Render Vuông 1:1</option>
+              <option value="audio_effect">Lách Âm Thanh</option>
+              <option value="md5_cut">Đổi MD5 & Xóa Tag</option>
+              <option value="none">Không Render</option>
+            </select>
+          </div>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>Cắt đầu video (HH:MM:SS):</label>
+            <input type="text" id="ed-vid-cut-start" placeholder="00:00:00" />
+          </div>
+          <div>
+            <label>Cắt cuối video (HH:MM:SS):</label>
+            <input type="text" id="ed-vid-cut-end" placeholder="00:00:00" />
+          </div>
+        </div>
+        <!-- Chế độ Đăng YouTube & Đối tượng người xem -->
+        <div class="row-inline form-group">
+          <div>
+            <label>Chế độ Đăng YouTube:</label>
+            <select id="ed-vid-visibility" onchange="toggleModalScheduleFields()">
+              <option value="public">🚀 Đăng ngay - Công khai (Public)</option>
+              <option value="unlisted">🔒 Đăng ngay - Không công khai (Unlisted)</option>
+              <option value="private">🛡️ Đăng ngay - Riêng tư (Private)</option>
+              <option value="schedule">⏰ Lên lịch phát hành (Schedule)</option>
+            </select>
+          </div>
+          <div>
+            <label>Đối tượng người xem:</label>
+            <select id="ed-vid-made-for-kids">
+              <option value="0">🚫 Không dành cho trẻ em (Chuẩn)</option>
+              <option value="1">👶 Có, dành cho trẻ em (Kids)</option>
+            </select>
+          </div>
+        </div>
+        <!-- Khung Lên lịch phát hành cho Modal (Ẩn/Hiện) -->
+        <div id="ed-vid-schedule-wrap" style="display:none; background:rgba(56,189,248,0.06); padding:10px 12px; border-radius:8px; border:1px dashed #38bdf8; margin-bottom:12px;">
+          <div class="form-group" style="margin-bottom:8px;">
+            <label>Thời gian hẹn giờ phát hành (Ngày & Giờ):</label>
+            <input type="datetime-local" id="ed-vid-schedule-time" />
+          </div>
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:13px; color:#f59e0b;">
+            <input type="checkbox" id="ed-vid-is-premiere" />
+            🎬 Đặt làm video Công chiếu (Premiere)
+          </label>
+        </div>
+        <!-- Giới hạn độ tuổi 18+ và Nhãn AI -->
+        <div class="row-inline form-group">
+          <div>
+            <label>Giới hạn độ tuổi:</label>
+            <select id="ed-vid-age-restriction">
+              <option value="0">Không giới hạn</option>
+              <option value="1">🔞 Giới hạn trên 18 tuổi</option>
+            </select>
+          </div>
+          <div>
+            <label>Nhãn nội dung do AI tạo / chỉnh sửa:</label>
+            <select id="ed-vid-altered-content">
+              <option value="0">Không (Nội dung thực tế)</option>
+              <option value="1">🤖 Có gắn nhãn AI</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:600; color:#94a3b8;">
+            <input type="checkbox" id="ed-vid-mobile" />
+            📱 Giả lập Điện thoại di động (Bỏ chọn để đăng Desktop PC nhất quán)
+          </label>
+        </div>
+      </div>
+      <div class="modal-footer" style="display:flex; justify-content:flex-end; gap:8px;">
+        <button class="btn btn-outline" onclick="closeEditModal()">Đóng</button>
+        <button class="btn btn-primary" onclick="saveEditModal()">💾 Lưu Thay Đổi</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       MODAL: XEM THỬ VIDEO TRỰC TIẾP (LIVE VIDEO PREVIEW)
+       ========================================== -->
+  <div id="modal-preview-video" class="modal-overlay" style="display:none;">
+    <div class="modal-content" style="max-width:760px;">
+      <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+        <div class="card-title">▶️ Xem Thử Video #<span id="pv-vid-id"></span>: <span id="pv-vid-title" style="color:#38bdf8;"></span></div>
+        <button class="btn btn-outline btn-sm" onclick="closePreviewModal()">✖</button>
+      </div>
+      <div class="modal-body" style="padding:16px 0; text-align:center;">
+        <video id="pv-video-player" controls style="max-width:100%; max-height:480px; border-radius:8px; background:#000; box-shadow:0 4px 14px rgba(0,0,0,0.6);"></video>
+        <div id="pv-video-info" style="font-size:12px; color:var(--text-muted); margin-top:10px;"></div>
+      </div>
+      <div class="modal-footer" style="display:flex; justify-content:flex-end;">
+        <button class="btn btn-outline" onclick="closePreviewModal()">Đóng Trình Phát</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       MODAL: KẾT NỐI THƯ MỤC MÁY TÍNH (DUYỆT TRONG TOOL)
+       ========================================== -->
+  <div id="modal-browse-folder" class="modal-overlay" style="display:none;">
+    <div class="modal-content" style="max-width:760px;">
+      <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+        <div class="card-title">🗂️ Kết Nối Thư Mục Máy Tính — Lấy Video Vào Tool</div>
+        <button class="btn btn-outline btn-sm" onclick="closeBrowseFolderModal()">✖</button>
+      </div>
+      <div class="modal-body" style="padding:14px 0;">
+        <div class="row-inline form-group">
+          <div style="flex:0 0 130px;">
+            <label>Ổ đĩa:</label>
+            <select id="bf-drive" onchange="bfNavigate(this.value)"></select>
+          </div>
+          <div style="flex:1;">
+            <label>Đường dẫn hiện tại:</label>
+            <div style="display:flex; gap:6px;">
+              <input type="text" id="bf-path" placeholder="C:\Users\admin\Videos" onkeydown="if(event.key==='Enter')bfNavigate(this.value)" />
+              <button class="btn btn-accent btn-sm" style="flex:0" onclick="bfNavigate(document.getElementById('bf-path').value)">Đi ➔</button>
+            </div>
+          </div>
+        </div>
+        <div id="bf-list" class="table-wrap" style="max-height:300px; overflow-y:auto; border:1px solid var(--border); border-radius:8px;">
+          <table style="width:100%;">
+            <tbody id="bf-tbody"></tbody>
+          </table>
+        </div>
+        <div id="bf-summary" style="background:rgba(56,189,248,0.07); border:1px dashed #38bdf8; border-radius:8px; padding:8px 12px; font-size:12px; margin-top:10px; color:#e2e8f0; line-height:1.6;"></div>
+        <div style="font-size:11.5px; color:var(--text-muted); margin-top:6px; line-height:1.5;">
+          💡 Bấm vào thư mục để đi vào. Nút <b>➕</b> cạnh thư mục con = lấy video của riêng thư mục đó. Video nạp vào sẽ dùng cấu hình ở khung bên trái (Shorts/Video, chế độ Render, Chế độ đăng).
+        </div>
+      </div>
+      <div class="modal-footer" style="display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-success btn-sm" onclick="bfAddCurrent(false)">➕ Thêm Video Trong Thư Mục Này</button>
+          <button class="btn btn-purple btn-sm" onclick="bfAddCurrent(true)">🌳 Thêm Cả Thư Mục Con (Đệ Quy)</button>
+        </div>
+        <button class="btn btn-outline btn-sm" onclick="closeBrowseFolderModal()">Đóng</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       MODAL: LÊN LỊCH GIÃN CÁCH SỐ LƯỢNG LỚN (50+ VIDEO)
+       ========================================== -->
+  <div id="modal-auto-schedule" class="modal-overlay" style="display:none;">
+    <div class="modal-content" style="max-width:540px;">
+      <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+        <div class="card-title">📅 Lên Lịch Giãn Cách Số Lượng Lớn</div>
+        <button class="btn btn-outline btn-sm" onclick="closeAutoScheduleModal()">✖</button>
+      </div>
+      <div class="modal-body" style="padding:14px 0;">
+        <div class="form-group">
+          <label>Thời gian phát hành VIDEO ĐẦU TIÊN (để trống = sau 60 phút nữa):</label>
+          <input type="datetime-local" id="as-start-time" onchange="updateAutoScheduleSummary()" />
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>Giãn cách giữa các video (phút — tối thiểu 30):</label>
+            <input type="number" id="as-interval" value="60" min="30" max="1440" oninput="updateAutoScheduleSummary()" />
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <label style="display:flex; align-items:center; gap:8px; cursor:pointer; white-space:nowrap;">
+              <input type="checkbox" id="as-premiere" /> 🎬 Đặt làm Công chiếu
+            </label>
+          </div>
+        </div>
+        <div id="as-summary" style="background:rgba(56,189,248,0.07); border:1px dashed #38bdf8; border-radius:8px; padding:10px 12px; font-size:12.5px; line-height:1.7; color:#e2e8f0;"></div>
+        <div style="font-size:11.5px; color:var(--text-muted); margin-top:8px; line-height:1.55;">
+          🛡️ An toàn tài khoản: hệ thống ép giãn cách <b>tối thiểu 30 phút/video</b> (chống spam). Mặc định bắt đầu sau 60 phút để kịp upload trước giờ phát hành.
+          Đối tượng tuổi (trên/dưới 18, trẻ em), nhãn AI và chất lượng HD đặt ở khung "⚡ Gán Cấu Hình Nhanh" trước khi lên lịch.
+        </div>
+      </div>
+      <div class="modal-footer" style="display:flex; justify-content:flex-end; gap:8px;">
+        <button class="btn btn-outline" onclick="closeAutoScheduleModal()">Đóng</button>
+        <button class="btn btn-primary" onclick="applyAutoSchedule()">📅 Lên Lịch Cho Toàn Bộ Video Đã Chọn</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       MODAL: SỬA CHI TIẾT KÊNH YOUTUBE & KIỂM TRA OAUTH TOKEN
+       ========================================== -->
+  <div id="modal-edit-channel" class="modal-overlay" style="display:none;">
+    <div class="modal-content" style="max-width:760px;">
+      <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+        <div class="card-title">✏️ Sửa Kênh YouTube #<span id="ec-id"></span></div>
+        <button class="btn btn-outline btn-sm" onclick="closeChannelEdit()">✖</button>
+      </div>
+      <div class="modal-body" style="padding:16px 0; max-height:72vh; overflow-y:auto;">
+        <input type="hidden" id="ec-id-val" />
+        <div class="row-inline form-group">
+          <div>
+            <label>Tên Kênh Hiển Thị:</label>
+            <input type="text" id="ec-name" />
+          </div>
+          <div>
+            <label>Handle (@...):</label>
+            <input type="text" id="ec-handle" />
+          </div>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>Channel ID (UC... — dùng để xác minh kênh):</label>
+            <input type="text" id="ec-channel-id" placeholder="UCxxxxxxxxxxxxxxxxxxxxxx" />
+          </div>
+          <div>
+            <label>Email Google:</label>
+            <input type="text" id="ec-email" />
+          </div>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>Nhóm Kênh:</label>
+            <select id="ec-group"></select>
+          </div>
+          <div>
+            <label>Phương Thức Đăng:</label>
+            <select id="ec-mode">
+              <option value="playwright">🌐 Playwright (YouTube Studio)</option>
+              <option value="youtube_api">🔑 YouTube Data API v3 (OAuth2)</option>
+            </select>
+          </div>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>Profile Chrome:</label>
+            <input type="text" id="ec-profile-name" list="ec-profile-list" placeholder="Tên Profile Chrome" />
+            <datalist id="ec-profile-list"></datalist>
+          </div>
+          <div>
+            <label>Đường Dẫn Profile (tự đồng bộ nếu để trống):</label>
+            <input type="text" id="ec-profile-path" />
+          </div>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>Proxy:</label>
+            <input type="text" id="ec-proxy" placeholder="IP:PORT hoặc IP:PORT:USER:PASS" />
+          </div>
+          <div>
+            <label>Danh Mục Mặc Định:</label>
+            <select id="ec-category">
+              <option value="22">22 - People &amp; Blogs</option>
+              <option value="24">24 - Entertainment</option>
+              <option value="26">26 - Howto &amp; Style</option>
+              <option value="20">20 - Gaming</option>
+              <option value="1">1 - Film &amp; Animation</option>
+              <option value="10">10 - Music</option>
+            </select>
+          </div>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>Chế Độ Hiển Thị Mặc Định:</label>
+            <select id="ec-privacy">
+              <option value="public">🚀 Công khai</option>
+              <option value="unlisted">🔒 Không công khai</option>
+              <option value="private">🛡️ Riêng tư</option>
+            </select>
+          </div>
+          <div>
+            <label>Ghi Chú:</label>
+            <input type="text" id="ec-note" />
+          </div>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label>Đối Tượng Mặc Định:</label>
+            <select id="ec-made-for-kids">
+              <option value="0">🚫 Không dành cho trẻ em</option>
+              <option value="1">👶 Dành cho trẻ em</option>
+            </select>
+          </div>
+          <div>
+            <label>Nhãn Nội Dung AI Mặc Định:</label>
+            <select id="ec-altered-content">
+              <option value="0">Không (nội dung thực tế)</option>
+              <option value="1">🤖 Có (do AI tạo/chỉnh sửa)</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Tuỳ Chọn Trình Duyệt:</label>
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:6px;">
+            <input type="checkbox" id="ec-emulate-mobile" />
+            📱 Giả lập Mobile (KHÔNG khuyến nghị — nguy cơ Checkpoint)
+          </label>
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:4px;">
+            <input type="checkbox" id="ec-hidden" />
+            🫥 Ẩn cửa sổ Chrome (Offscreen)
+          </label>
+        </div>
+        <div class="form-group">
+          <label>OAuth2 Token JSON (chỉ dùng cho chế độ YouTube Data API v3):</label>
+          <textarea id="ec-oauth" rows="3" placeholder='{"client_id":"...","client_secret":"...","refresh_token":"..."}'></textarea>
+          <div id="ec-oauth-status" style="font-size:11.5px; color:#94a3b8; margin-top:6px; line-height:1.6;"></div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
+            <button class="btn btn-accent btn-sm" onclick="checkChannelOauth(parseInt(document.getElementById('ec-id-val').value, 10))">🔑 Kiểm Tra Token &amp; Xác Minh Kênh</button>
+            <button class="btn btn-outline btn-sm" onclick="loadChannelOauthStatus(parseInt(document.getElementById('ec-id-val').value, 10))">🔄 Đọc Lại Trạng Thái</button>
+          </div>
+          <details style="margin-top:10px; font-size:11.5px; color:var(--text-muted); line-height:1.65;">
+            <summary style="cursor:pointer; color:#38bdf8; font-weight:600;">📘 Hướng dẫn lấy refresh_token (Google Cloud + OAuth Playground)</summary>
+            <ol style="margin:8px 0 0 18px; padding:0;">
+              <li>Tạo project tại <a href="https://console.cloud.google.com/" target="_blank" rel="noopener" style="color:#38bdf8;">Google Cloud Console</a> → bật <b>YouTube Data API v3</b>.</li>
+              <li>Cấu hình <b>OAuth consent screen</b> (External, thêm tài khoản Google của bạn vào Test users).</li>
+              <li>Tạo <b>OAuth Client ID</b> loại <b>Desktop app</b> → lấy <code>client_id</code> và <code>client_secret</code>.</li>
+              <li>Mở <a href="https://developers.google.com/oauthplayground" target="_blank" rel="noopener" style="color:#38bdf8;">OAuth 2.0 Playground</a> → ⚙️ → tick <i>Use your own OAuth credentials</i> → dán client_id/secret.</li>
+              <li>Scope: <code>https://www.googleapis.com/auth/youtube.upload</code> và <code>https://www.googleapis.com/auth/youtube.readonly</code> → Authorize.</li>
+              <li>Bấm <b>Exchange authorization code for tokens</b> → copy <code>refresh_token</code>.</li>
+              <li>Dán JSON <code>{"client_id":"...","client_secret":"...","refresh_token":"..."}</code> vào ô trên → Lưu → bấm 🔑 Kiểm Tra Token để xác minh đúng kênh.</li>
+            </ol>
+            <div style="margin-top:6px;">⚠️ Mỗi refresh_token chỉ đại diện <b>một kênh</b> (kênh đang chọn khi cấp quyền). Token dùng chung hoặc đã thu hồi sẽ bị tool chặn để tránh đăng nhầm kênh.</div>
+          </details>
+        </div>
+      </div>
+      <div class="modal-footer" style="display:flex; justify-content:flex-end; gap:8px;">
+        <button class="btn btn-outline" onclick="closeChannelEdit()">Đóng</button>
+        <button class="btn btn-success" onclick="saveChannelEdit()">💾 Lưu Thông Tin Kênh</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=18"></script>
+</body>
+</html>

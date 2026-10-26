@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Dữ liệu chạy máy: chứa OAuth token, DB, video tạm, bản backup
+data.db
+data/*.sqlite
+data/*.sqlite-*
+data/backups/
+data/profiles_youtube/
+temp/
+output/
+exports/
+logs/
+*.log
+
+# Bản backup code theo phiên
+_backup_*/
