@@ -1,5 +1,9 @@
 # CHANGELOG — DHB Reup YouTube Studio
 
+## 2026-11-01 — CI: nâng GitHub Actions
+
+- `actions/checkout` v4 → v7 và `actions/setup-python` v5 → v7 (dùng Node 24), loại bỏ cảnh báo Node.js 20 của runner. Cấu hình job giữ nguyên, `cache: pip` vẫn hoạt động.
+
 ## 2026-11-01 — Gia cố kết nối Antidetect
 
 - Kết nối CDP trong `AntidetectBrowserLease` có retry 3 lần, backoff tăng dần (0.8s → 1.6s); Chrome vừa được Antidetect khởi chạy nhưng CDP chưa mở kịp không còn làm hỏng lượt upload ngay lần đầu. Khi cạn lượt, lỗi báo rõ cổng CDP đã thử.
