@@ -1,5 +1,12 @@
 # CHANGELOG — DHB Reup YouTube Studio
 
+## 2026-11-01 — Gia cố kết nối Antidetect
+
+- Kết nối CDP trong `AntidetectBrowserLease` có retry 3 lần, backoff tăng dần (0.8s → 1.6s); Chrome vừa được Antidetect khởi chạy nhưng CDP chưa mở kịp không còn làm hỏng lượt upload ngay lần đầu. Khi cạn lượt, lỗi báo rõ cổng CDP đã thử.
+- Lease xác định quyền sở hữu phiên bằng dữ liệu cấu trúc (`already_running`, `pid`, `ws_endpoint`) thay vì so khớp câu chữ `"Profile đang chạy"`; API cũ không trả các trường này thì fallback về trạng thái profile đọc trước khi start. Thiếu căn cứ thì KHÔNG tự dừng profile (ưu tiên không đóng phiên người dùng đang mở).
+- `resolve_base_url()` health-check lại URL đã cache trước mỗi thao tác; cache chết hoặc máy chủ đổi cổng được xóa và dò lại từ `server.pid` rồi cổng 8000. Lỗi kết nối trong `_request` cũng xóa cache để thao tác sau tự dò lại.
+- Thêm 11 test trong `tests/test_antidetect_integration.py` (fresh launch/already-running, retry CDP, health-check + rediscovery, xóa cache khi mất kết nối). Tổng bộ test: **107/107 PASS**; `py_compile` và `node --check static/app.js` sạch. Không chạy upload thật.
+
 ## 2026-11-01 — Sửa 3 lỗi P0 render/pipeline
 
 - Ghép Intro/Outro: xác định đúng vị trí video chính thay vì giả định `i == 1`; trước đây khi chỉ bật Outro, segment Outro không được scale/pad về cùng khung nên concat có thể lỗi "Error linking filters" hoặc ra video sai kích thước.

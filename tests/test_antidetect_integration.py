@@ -8,6 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -28,6 +30,14 @@ class _Handler(BaseHTTPRequestHandler):
     expected_auth = "Bearer test-key"
     auth_seen = []
     start_calls = []
+    healthy = True
+    start_response = {
+        "success": True,
+        "message": "Profile đã khởi chạy",
+        "port": 9222,
+        "pid": 4321,
+        "ws_endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+    }
 
     def log_message(self, *args):
         pass
@@ -42,7 +52,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._json(200, {"application": "antidetect-python", "instance_id": "test"})
+            if type(self).healthy:
+                self._json(200, {"application": "antidetect-python", "instance_id": "test"})
+            else:
+                self._json(503, {"detail": "starting"})
             return
         auth = self.headers.get("Authorization", "")
         type(self).auth_seen.append(auth)
@@ -62,11 +75,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/api/profiles/p-1/start"):
             type(self).start_calls.append(self.path)
-            self._json(200, {
-                "success": True,
-                "message": "Profile đang chạy",
-                "port": 9222,
-            })
+            self._json(200, dict(type(self).start_response))
             return
         self._json(404, {"detail": "not found"})
 
@@ -87,6 +96,14 @@ class AntidetectClientHTTPTests(unittest.TestCase):
     def setUp(self):
         _Handler.auth_seen.clear()
         _Handler.start_calls.clear()
+        _Handler.healthy = True
+        _Handler.start_response = {
+            "success": True,
+            "message": "Profile đã khởi chạy",
+            "port": 9222,
+            "pid": 4321,
+            "ws_endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+        }
 
     def _client(self, key="test-key"):
         cfg = ac.AntidetectConfig(
@@ -141,6 +158,205 @@ class AntidetectClientHTTPTests(unittest.TestCase):
             client = ac.AntidetectClient(cfg)
             self.assertEqual(client.resolve_base_url(), self.base_url)
             self.assertTrue(client.status()["connected"])
+
+    def test_cached_base_is_health_checked_before_each_operation(self):
+        client = self._client()
+        self.assertTrue(client.status()["connected"])
+        self.assertEqual(client.base_url, self.base_url)
+
+        _Handler.healthy = False
+        status = client.status()
+        self.assertFalse(status["connected"])
+        self.assertIn("không phản hồi", status["error"].lower())
+        self.assertEqual(client.base_url, "")
+
+        _Handler.healthy = True
+        self.assertTrue(client.status()["connected"])
+
+    def test_dead_cached_base_is_rediscovered_from_server_pid(self):
+        port = self.server.server_address[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "server.pid").write_text(
+                json.dumps({"pid": 123, "port": port, "instance_id": "test"}),
+                encoding="utf-8",
+            )
+            cfg = ac.AntidetectConfig(
+                home=Path(tmp),
+                data_dir=Path(tmp),
+                base_url="",
+                access_key="test-key",
+            )
+            client = ac.AntidetectClient(cfg)
+            client.base_url = "http://127.0.0.1:1"
+            self.assertEqual(client.resolve_base_url(), self.base_url)
+
+    def test_connection_failure_clears_cached_base(self):
+        client = self._client()
+        self.assertEqual(client.resolve_base_url(), self.base_url)
+        healthy = {"application": "antidetect-python", "instance_id": "test"}
+        with mock.patch.object(ac, "_probe_health", return_value=healthy), \
+                mock.patch.object(ac, "_session") as session_factory:
+            session = session_factory.return_value.__enter__.return_value
+            session.request.side_effect = requests.ConnectionError("boom")
+            with self.assertRaises(ac.AntidetectError):
+                client.list_profiles()
+        self.assertEqual(client.base_url, "")
+
+
+class _FakePage:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+    def is_closed(self):
+        return self.closed
+
+
+class _FakeContext:
+    def __init__(self):
+        self.pages = []
+
+    def new_page(self):
+        page = _FakePage()
+        self.pages.append(page)
+        return page
+
+
+class _FakeBrowser:
+    def __init__(self, context):
+        self.contexts = [context]
+
+
+class _FakeChromium:
+    def __init__(self, context, failures=0):
+        self._context = context
+        self.failures = failures
+        self.calls = []
+
+    def connect_over_cdp(self, url, timeout=None):
+        self.calls.append((url, timeout))
+        if len(self.calls) <= self.failures:
+            raise RuntimeError("CDP chưa sẵn sàng")
+        return _FakeBrowser(self._context)
+
+
+class _FakePlaywright:
+    def __init__(self, context, failures=0):
+        self.chromium = _FakeChromium(context, failures)
+        self.stopped = False
+
+    def start(self):
+        return self
+
+    def stop(self):
+        self.stopped = True
+
+
+class _FakeClient:
+    def __init__(self, start_result, state=None):
+        self.start_result = dict(start_result)
+        self.state = state
+        self.stop_calls = []
+
+    def get_profile_state(self, profile_id):
+        return self.state
+
+    def start_profile(self, profile_id, url=None):
+        return dict(self.start_result)
+
+    def stop_profile(self, profile_id):
+        self.stop_calls.append(profile_id)
+        return {"success": True}
+
+
+class AntidetectLeaseTests(unittest.TestCase):
+    def _lease(self, start_result, state=None, failures=0):
+        context = _FakeContext()
+        fake_pw = _FakePlaywright(context, failures)
+        client = _FakeClient(start_result, state)
+        lease = ac.AntidetectBrowserLease("ad-1", client=client)
+        return lease, fake_pw, client, context
+
+    def test_fresh_launch_lease_stops_profile_on_exit(self):
+        start = {
+            "success": True,
+            "message": "Profile đã khởi chạy",
+            "port": 9222,
+            "pid": 4321,
+            "ws_endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+        }
+        lease, fake_pw, client, context = self._lease(
+            start, state={"id": "ad-1", "status": "stopped"}
+        )
+        with mock.patch("playwright.sync_api.sync_playwright", return_value=fake_pw):
+            with lease:
+                self.assertIsNotNone(lease.page)
+        self.assertEqual(client.stop_calls, ["ad-1"])
+        self.assertTrue(all(page.closed for page in context.pages))
+        self.assertTrue(fake_pw.stopped)
+
+    def test_already_running_lease_keeps_profile_open(self):
+        start = {
+            "success": True,
+            "message": "Bất kỳ câu chữ nào",
+            "port": 9222,
+            "already_running": True,
+        }
+        lease, fake_pw, client, _ = self._lease(
+            start, state={"id": "ad-1", "status": "stopped"}
+        )
+        with mock.patch("playwright.sync_api.sync_playwright", return_value=fake_pw):
+            with lease:
+                pass
+        self.assertEqual(client.stop_calls, [])
+
+    def test_lease_without_state_or_structured_fields_is_not_stopped(self):
+        start = {"success": True, "message": "Profile đang chạy", "port": 9222}
+        lease, fake_pw, client, _ = self._lease(start, state=None)
+        with mock.patch("playwright.sync_api.sync_playwright", return_value=fake_pw):
+            with lease:
+                pass
+        self.assertEqual(client.stop_calls, [])
+
+    def test_cdp_connect_retries_then_succeeds(self):
+        lease, fake_pw, _, _ = self._lease({}, failures=2)
+        lease._playwright = fake_pw
+        lease.port = 9222
+        with mock.patch.object(ac.time, "sleep") as sleep:
+            browser = lease._connect_cdp()
+        self.assertIsInstance(browser, _FakeBrowser)
+        self.assertEqual(len(fake_pw.chromium.calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_cdp_connect_reports_port_after_all_attempts_fail(self):
+        lease, fake_pw, _, _ = self._lease({}, failures=99)
+        lease._playwright = fake_pw
+        lease.port = 9333
+        with mock.patch.object(ac.time, "sleep"):
+            with self.assertRaises(ac.AntidetectError) as ctx:
+                lease._connect_cdp()
+        message = str(ctx.exception)
+        self.assertIn("9333", message)
+        self.assertIn("sau 3 lần thử", message)
+        self.assertEqual(len(fake_pw.chromium.calls), 3)
+
+
+class LeaseOwnershipTests(unittest.TestCase):
+    def test_fresh_launch_fields_win_over_message_wording(self):
+        self.assertTrue(
+            ac._lease_started_by_us({"pid": 1, "message": "Profile đang chạy"}, True, True)
+        )
+
+    def test_already_running_flag_wins_over_pid(self):
+        self.assertFalse(ac._lease_started_by_us({"already_running": True, "pid": 1}, True, False))
+
+    def test_legacy_response_uses_pre_start_state_not_message(self):
+        legacy = {"success": True, "message": "profile đang chạy", "port": 9222}
+        self.assertFalse(ac._lease_started_by_us(legacy, True, True))
+        self.assertTrue(ac._lease_started_by_us(legacy, True, False))
+        self.assertFalse(ac._lease_started_by_us(legacy, False, False))
 
 
 class AntidetectConfigTests(unittest.TestCase):

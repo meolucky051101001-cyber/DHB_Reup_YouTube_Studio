@@ -7,6 +7,7 @@ Chrome bằng user_data_dir của Antidetect.
 import ctypes
 import json
 import os
+import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +24,8 @@ HEALTH_APPLICATION = "antidetect-python"
 _HTTP_TIMEOUT = 15.0
 _START_TIMEOUT = 180.0
 _CDP_CONNECT_TIMEOUT_MS = 30000
+_CDP_CONNECT_ATTEMPTS = 3
+_CDP_RETRY_BASE_DELAY_SEC = 0.8
 
 
 class AntidetectError(RuntimeError):
@@ -180,8 +183,10 @@ class AntidetectClient:
         )
 
     def resolve_base_url(self) -> str:
-        if self.base_url:
+        if self.base_url and _probe_health(self.base_url):
             return self.base_url
+        # Cache cũ đã chết hoặc máy chủ đổi cổng: bỏ và dò lại trước khi dùng.
+        self.base_url = ""
 
         explicit = self.config.base_url
         if explicit:
@@ -230,6 +235,7 @@ class AntidetectClient:
             with _session() as s:
                 resp = s.request(method, f"{base}{path}", params=params, headers=headers, timeout=timeout)
         except requests.RequestException as exc:
+            self.base_url = ""
             raise AntidetectError(
                 f"Không kết nối được máy chủ Antidetect tại {base}: {exc}"
             ) from exc
@@ -340,6 +346,22 @@ class _TrackedContext:
         return getattr(self._context, name)
 
 
+def _lease_started_by_us(
+    start_result: Dict[str, Any], state_known: bool, was_running: bool
+) -> bool:
+    """Lease có tự khởi chạy profile không, chỉ dựa vào dữ liệu cấu trúc.
+
+    API mới trả ``pid``/``ws_endpoint`` khi khởi chạy mới và ``already_running``
+    khi dùng lại phiên có sẵn; không phụ thuộc câu chữ ``message``. Với API cũ
+    không có các trường này, dùng trạng thái profile đọc trước khi start.
+    """
+    if start_result.get("already_running") is True:
+        return False
+    if start_result.get("pid") or start_result.get("ws_endpoint"):
+        return True
+    return bool(state_known and not was_running)
+
+
 class AntidetectBrowserLease:
     """Mượn trình duyệt của một profile Antidetect qua CDP.
 
@@ -381,15 +403,11 @@ class AntidetectBrowserLease:
         try:
             res = self.client.start_profile(self.profile_id)
             self.port = int(res["port"])
-            already_running_msg = str(res.get("message") or "").strip().lower() == "profile đang chạy"
-            self._started_by_us = bool(state_known and not was_running and not already_running_msg)
+            self._started_by_us = _lease_started_by_us(res, state_known, was_running)
 
             from playwright.sync_api import sync_playwright
             self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.connect_over_cdp(
-                f"http://127.0.0.1:{self.port}",
-                timeout=_CDP_CONNECT_TIMEOUT_MS,
-            )
+            self._browser = self._connect_cdp()
             contexts = self._browser.contexts
             if not contexts:
                 raise AntidetectError("Không tìm thấy context trình duyệt của profile Antidetect.")
@@ -400,6 +418,23 @@ class AntidetectBrowserLease:
         except Exception:
             self._cleanup()
             raise
+
+    def _connect_cdp(self):
+        last_error: Optional[Exception] = None
+        for attempt in range(1, _CDP_CONNECT_ATTEMPTS + 1):
+            try:
+                return self._playwright.chromium.connect_over_cdp(
+                    f"http://127.0.0.1:{self.port}",
+                    timeout=_CDP_CONNECT_TIMEOUT_MS,
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt < _CDP_CONNECT_ATTEMPTS:
+                    time.sleep(_CDP_RETRY_BASE_DELAY_SEC * attempt)
+        raise AntidetectError(
+            f"Không kết nối được CDP tới profile Antidetect (cổng {self.port}) "
+            f"sau {_CDP_CONNECT_ATTEMPTS} lần thử: {last_error}"
+        )
 
     def new_page(self):
         if self.tracked_context is None:
