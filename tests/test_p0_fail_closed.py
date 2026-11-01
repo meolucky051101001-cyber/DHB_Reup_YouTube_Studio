@@ -183,8 +183,10 @@ class StopSemanticsTests(unittest.TestCase):
 
         with mock.patch.object(pm, "get_conn", return_value=fake_conn), \
                 mock.patch.object(pm, "add_log"), \
-                mock.patch("render_engine.kill_all_render_processes", lambda: None):
+                mock.patch("render_engine.kill_all_render_processes") as kill_mock:
             manager.stop_all()
+
+        kill_mock.assert_called_once_with(owner="batch")
 
         self.assertTrue(manager._is_running)
         self.assertTrue(manager._stop_event.is_set())

@@ -269,10 +269,11 @@ class PipelineManager:
     def stop_all(self):
         self._stop_event.set()
 
-        # 1. Hủy diệt tức thì toàn bộ tiến trình FFmpeg đang chạy trên máy
+        # 1. Chỉ hủy FFmpeg của làn batch — render của Monitor đang chạy phải sống tiếp,
+        # chỉ dừng theo stop_event riêng của từng monitor.
         try:
             from render_engine import kill_all_render_processes
-            kill_all_render_processes()
+            kill_all_render_processes(owner="batch")
         except Exception:
             pass
 
@@ -434,12 +435,13 @@ class PipelineManager:
         force_reupload: bool = False,
         stop_event: Optional[threading.Event] = None,
         upload_counter: Optional[Dict[str, int]] = None,
+        owner: str = "batch",
     ):
         try:
             self.process_single_item(
                 item_id, row_idx, do_download, do_render, do_upload,
                 claim_token=batch_token, force_reupload=force_reupload,
-                stop_event=stop_event, upload_counter=upload_counter,
+                stop_event=stop_event, upload_counter=upload_counter, owner=owner,
             )
         finally:
             release_item_claim(item_id, batch_token)
@@ -456,6 +458,7 @@ class PipelineManager:
         force_reupload: bool = False,
         stop_event: Optional[threading.Event] = None,
         upload_counter: Optional[Dict[str, int]] = None,
+        owner: str = "batch",
     ):
         conn = get_conn()
         row = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
@@ -590,6 +593,7 @@ class PipelineManager:
                         cut_end=item.get("cut_end") or "00:00:00",
                         progress_callback=_make_progress_cb("render_progress"),
                         stop_event=se,
+                        owner=owner,
                     ).result()
                 except InterruptedError:
                     _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
@@ -1255,6 +1259,7 @@ class PipelineManager:
                                 claim_token=monitor_token,
                                 stop_event=stop_ev,
                                 upload_counter=self._monitor_upload_counts.setdefault(monitor_id, {"n": 0}),
+                                owner="monitor",
                             )
                         finally:
                             release_item_claim(queue_id, monitor_token)

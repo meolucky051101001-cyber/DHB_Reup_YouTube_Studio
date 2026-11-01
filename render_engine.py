@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional, Tuple
 
 from config import (
     APP_OUTPUT_DIR,
@@ -19,9 +19,10 @@ from scanner_downloader import probe_video_info
 
 TIME_REGEX = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 
-# Quản lý toàn bộ tiến trình FFmpeg đang chạy để có thể dừng ngay lập tức khi người dùng bấm '⏹️ Dừng'
+# Quản lý toàn bộ tiến trình FFmpeg đang chạy để có thể dừng ngay lập tức khi người dùng bấm '⏹️ Dừng'.
+# Mỗi PID gắn owner ('batch' / 'monitor') để Dừng batch không giết render của Monitor.
 _ACTIVE_FFMPEG_LOCK = threading.Lock()
-_ACTIVE_FFMPEG_PROCS: Dict[int, subprocess.Popen] = {}
+_ACTIVE_FFMPEG_PROCS: Dict[int, Tuple[subprocess.Popen, str]] = {}
 
 
 def _kill_stray_tool_ffmpeg():
@@ -64,20 +65,42 @@ def _kill_stray_tool_ffmpeg():
         pass
 
 
-def kill_all_render_processes():
-    """Hủy diệt tức thì toàn bộ tiến trình FFmpeg do tool khởi chạy đang render."""
+def _terminate_ffmpeg_proc(proc: subprocess.Popen, timeout: float = 5.0):
+    """Kill và reap tiến trình FFmpeg còn sống — tránh tiến trình mồ côi giữ file output."""
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=timeout)
+    except Exception:
+        pass
+
+
+def kill_all_render_processes(owner: Optional[str] = None):
+    """Hủy các tiến trình FFmpeg do tool khởi chạy.
+
+    owner=None  → dừng tất cả (kể cả dọn tiến trình rơi rớt).
+    owner='batch' / 'monitor' → chỉ dừng đúng làn đó, không đụng làn còn lại.
+    """
     with _ACTIVE_FFMPEG_LOCK:
-        procs = list(_ACTIVE_FFMPEG_PROCS.values())
-        _ACTIVE_FFMPEG_PROCS.clear()
+        if owner is None:
+            procs = [proc for proc, _ in _ACTIVE_FFMPEG_PROCS.values()]
+            _ACTIVE_FFMPEG_PROCS.clear()
+        else:
+            procs = []
+            for pid, (proc, proc_owner) in list(_ACTIVE_FFMPEG_PROCS.items()):
+                if proc_owner == owner:
+                    procs.append(proc)
+                    _ACTIVE_FFMPEG_PROCS.pop(pid, None)
 
     for proc in procs:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        _terminate_ffmpeg_proc(proc)
 
-    # Dọn các tiến trình rơi rớt (mất PID theo dõi) nhưng CHỈ trong phạm vi thư mục của tool
-    if os.name == "nt":
+    # Dọn các tiến trình rơi rớt (mất PID theo dõi) nhưng CHỈ trong phạm vi thư mục của tool.
+    # Khi dừng theo làn thì không quét rơi rớt vì không xác định được chúng thuộc làn nào.
+    if owner is None and os.name == "nt":
         _kill_stray_tool_ffmpeg()
 
 
@@ -222,7 +245,7 @@ def _build_branding(cfg, base_label: str, input_count: int, extra_inputs: list, 
 
 
 def _apply_intro_outro(main_path: str, cfg, target_w: int, target_h: int, fps: int,
-                       progress_callback=None, stop_event=None) -> str:
+                       progress_callback=None, stop_event=None, owner: str = "") -> str:
     """
     Ghép Intro / Outro từ kho tài nguyên (_Intro / _Outro) vào đầu / cuối video đã render,
     hỗ trợ chọn ngẫu nhiên (intro_random / outro_random) — kế thừa preset Render của DHB.
@@ -247,10 +270,13 @@ def _apply_intro_outro(main_path: str, cfg, target_w: int, target_h: int, fps: i
 
     parts, vids, auds = [], [], []
     f = int(fps or 30)
+    # Main nằm ngay sau intro khi có intro, nếu không thì đứng đầu — KHÔNG giả định i == 1,
+    # vì khi chỉ có outro thì main là i=0 và outro mới là segment cần chuẩn hóa khung hình.
+    main_index = 1 if intro else 0
     for i, m in enumerate(media):
         # Concat filter yêu cầu các segment cùng timebase/pix_fmt/sample_rate/channel_layout —
         # chuẩn hóa triệt để (settb=AVTB + aformat) để tránh "Error linking filters"
-        if i == 1:
+        if i == main_index:
             parts.append(f"[{i}:v]fps={f},setsar=1,format=yuv420p,settb=AVTB[p{i}]")
         else:
             parts.append(
@@ -285,7 +311,7 @@ def _apply_intro_outro(main_path: str, cfg, target_w: int, target_h: int, fps: i
     )
     _run_ffmpeg_with_progress(
         cmd, max(1.0, main_probe.get("seconds") or 10.0),
-        progress_callback, stop_event=stop_event, partial_output=out_path,
+        progress_callback, stop_event=stop_event, partial_output=out_path, owner=owner,
     )
     try:
         if out_path != main_path and os.path.exists(main_path):
@@ -456,6 +482,7 @@ def render_video(
     cut_end: str = "00:00:00",
     progress_callback: Optional[Callable[[int, str], None]] = None,
     stop_event: Optional[threading.Event] = None,
+    owner: str = "",
 ) -> str:
     """
     Thực thi Render & Lách bản quyền video bằng FFmpeg kế thừa tài nguyên từ C:\\DHB Reup Facebook\\Data\\Render.
@@ -572,13 +599,13 @@ def render_video(
             + _clear_metadata_args()
             + [output_path]
         )
-        _run_ffmpeg_with_progress(cmd, effective_dur, progress_callback, stop_event=stop_event, partial_output=output_path)
+        _run_ffmpeg_with_progress(cmd, effective_dur, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
         return output_path
 
     # Chế độ 7: Custom FFmpeg Command
     if render_mode == "custom_ffmpeg" and cfg.get("custom_command"):
         cmd = _build_custom_ffmpeg_args(str(cfg["custom_command"]), input_path, output_path)
-        _run_ffmpeg_with_progress(cmd, effective_dur, progress_callback, stop_event=stop_event, partial_output=output_path)
+        _run_ffmpeg_with_progress(cmd, effective_dur, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
         return output_path
 
     # Xây dựng bộ lọc cơ bản (speed, flip, brightness, audio tempo/volume)
@@ -685,7 +712,7 @@ def render_video(
                 + _clear_metadata_args()
                 + [output_path]
             )
-        _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path)
+        _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
         out_w, out_h = w_shorts, h_shorts
         rendered = True
 
@@ -734,7 +761,7 @@ def render_video(
                 + _clear_metadata_args()
                 + [output_path]
             )
-            _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path)
+            _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
             out_w, out_h = 1280, 720
             rendered = True
 
@@ -771,7 +798,7 @@ def render_video(
             + _clear_metadata_args()
             + [output_path]
         )
-        _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path)
+        _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
         out_w, out_h = 1080, 1080
         rendered = True
 
@@ -850,7 +877,7 @@ def render_video(
                 + [output_path]
             )
 
-        _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path)
+        _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
         out_w, out_h = w_res, h_res
         rendered = True
 
@@ -858,7 +885,7 @@ def render_video(
     if rendered and (cfg.get("intro_enabled") or cfg.get("outro_enabled")):
         output_path = _apply_intro_outro(
             output_path, cfg, out_w, out_h, fps,
-            progress_callback=progress_callback, stop_event=stop_event,
+            progress_callback=progress_callback, stop_event=stop_event, owner=owner,
         )
     return output_path
 
@@ -879,6 +906,7 @@ def _run_ffmpeg_with_progress(
     progress_callback: Optional[Callable[[int, str], None]],
     stop_event: Optional[threading.Event] = None,
     partial_output: Optional[str] = None,
+    owner: str = "",
 ):
     if progress_callback:
         progress_callback(5, "Khởi chạy FFmpeg render...")
@@ -887,7 +915,8 @@ def _run_ffmpeg_with_progress(
 
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        # FFmpeg chỉ ghi progress ra stderr; stdout để DEVNULL tránh pipe đầy làm treo render.
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
@@ -896,17 +925,14 @@ def _run_ffmpeg_with_progress(
     )
 
     with _ACTIVE_FFMPEG_LOCK:
-        _ACTIVE_FFMPEG_PROCS[proc.pid] = proc
+        _ACTIVE_FFMPEG_PROCS[proc.pid] = (proc, owner)
 
     stderr_lines = []
     try:
         if proc.stderr:
             while True:
                 if stop_event and stop_event.is_set():
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                    _terminate_ffmpeg_proc(proc)
                     raise InterruptedError("Người dùng đã bấm Dừng Render.")
 
                 line = proc.stderr.readline()
@@ -920,10 +946,7 @@ def _run_ffmpeg_with_progress(
                 m = TIME_REGEX.search(line)
                 if m and progress_callback and expected_duration > 0:
                     if stop_event and stop_event.is_set():
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
+                        _terminate_ffmpeg_proc(proc)
                         raise InterruptedError("Người dùng đã bấm Dừng Render.")
                     cur_sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
                     pct = min(99, max(5, int(cur_sec * 100 / expected_duration)))
@@ -931,20 +954,26 @@ def _run_ffmpeg_with_progress(
 
         proc.wait()
         if stop_event and stop_event.is_set():
-            _cleanup_partial_output(partial_output)
             raise InterruptedError("Người dùng đã bấm Dừng Render.")
         if proc.returncode != 0:
             err_tail = "".join(stderr_lines[-10:])
-            _cleanup_partial_output(partial_output)
             raise RuntimeError(f"FFmpeg render thất bại (code {proc.returncode}): {err_tail}")
         if progress_callback:
             progress_callback(100, "Render hoàn tất")
     except BaseException:
+        # Mọi lỗi (callback, dừng, FFmpeg fail) phải kill + reap TRƯỚC khi xóa file,
+        # nếu không FFmpeg sẽ mồ côi và tiếp tục giữ/ghi đè file output.
+        _terminate_ffmpeg_proc(proc)
         _cleanup_partial_output(partial_output)
         raise
     finally:
         with _ACTIVE_FFMPEG_LOCK:
             _ACTIVE_FFMPEG_PROCS.pop(proc.pid, None)
+        try:
+            if proc.stderr:
+                proc.stderr.close()
+        except Exception:
+            pass
 
 
 def generate_thumbnail_from_video(video_path: str, output_path: Optional[str] = None) -> Optional[str]:

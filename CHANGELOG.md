@@ -1,5 +1,19 @@
 # CHANGELOG — DHB Reup YouTube Studio
 
+## 2026-11-01 — Sửa 3 lỗi P0 render/pipeline
+
+- Ghép Intro/Outro: xác định đúng vị trí video chính thay vì giả định `i == 1`; trước đây khi chỉ bật Outro, segment Outro không được scale/pad về cùng khung nên concat có thể lỗi "Error linking filters" hoặc ra video sai kích thước.
+- `_run_ffmpeg_with_progress`: mọi nhánh lỗi/dừng (callback progress lỗi, DB lỗi, người dùng bấm Dừng, FFmpeg exit khác 0) đều kill + reap tiến trình trước khi xóa file dở dang — không còn FFmpeg mồ côi giữ/ghi đè file output. stdout chuyển DEVNULL để tránh pipe đầy làm treo render.
+- Phân làn FFmpeg theo owner (`batch` / `monitor`); `stop_all()` chỉ hủy render của làn batch, render Monitor đang chạy không bị giết và chỉ dừng theo stop-event riêng của monitor. Dừng toàn cục (owner=None) vẫn giữ hành vi cũ.
+- Thêm `tests/test_render_pipeline_p0.py` (9 test). Tổng bộ test: **96/96 PASS**; `py_compile` toàn bộ module và `node --check static/app.js` sạch. Không chạy upload thật.
+
+## 2026-10-29 — Antidetect (working tree): v19
+
+- Tích hợp Antidetect Browser Manager qua CDP lease (`antidetect_client.py`): đồng bộ profile không kéo mật khẩu proxy; kênh Antidetect chỉ đăng bằng Playwright, chặn YouTube Data API; không ép mobile/UA/proxy/stealth lên trình duyệt Antidetect.
+- Thêm cột `chrome_profiles.antidetect_profile_id` + index unique partial; migration đã áp trên DB thật ngày 2026-10-29.
+- Sửa: `app.js?v=19`; fail-closed khi mở Profile `antidetect://` thiếu ID liên kết thay vì rơi xuống nhánh Chrome cục bộ.
+- Xác minh `/api/antidetect/status`: 401 khi thiếu token, 200 khi có token. Chưa chạy upload thật.
+
 ## 2026-10-26 — v18: fail-closed upload + gia cố P1/P2
 
 ### Upload an toàn (P0)
