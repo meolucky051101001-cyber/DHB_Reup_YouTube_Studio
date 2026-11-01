@@ -1,5 +1,9 @@
 # CHANGELOG — DHB Reup YouTube Studio
 
+## 2026-11-01 — Tài liệu: thêm README
+
+- `README.md` mô tả tổng quan tool, yêu cầu môi trường, cài đặt/khởi động, biến cấu hình Antidetect, cấu trúc module + bảng DB, cách chạy test và liên kết tới các tài liệu vận hành sẵn có.
+
 ## 2026-11-01 — CI: nâng GitHub Actions
 
 - `actions/checkout` v4 → v7 và `actions/setup-python` v5 → v7 (dùng Node 24), loại bỏ cảnh báo Node.js 20 của runner. Cấu hình job giữ nguyên, `cache: pip` vẫn hoạt động.
