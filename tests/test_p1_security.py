@@ -143,7 +143,9 @@ class RenderSafetyTests(unittest.TestCase):
         self.assertIn(r"C:\videos\in.mp4", args)
         self.assertIn(r"D:\out\out.mp4", args)
         self.assertIn("scale=1080:1920", args)
-        self.assertNotIn("ffmpeg", args)
+        # args[0] có thể là "ffmpeg" khi máy không có bản FFmpeg kế thừa; token thô ở đầu
+        # command gốc phải bị bóc, không được lặp lại trong phần tham số.
+        self.assertNotIn("ffmpeg", args[1:])
 
     def test_custom_ffmpeg_injection_stays_literal_argument(self):
         args = render_engine._build_custom_ffmpeg_args(
