@@ -15,6 +15,11 @@ from config import (
     BROWSER_HOST_EXE,
 )
 from database import add_log, get_settings
+from antidetect_client import (
+    AntidetectBrowserLease,
+    AntidetectClient,
+    resolve_antidetect_profile_id,
+)
 
 CHUNK_SIZE = 8 * 1024 * 1024  # 8MB giống SliceBytes của DHB jFbxQL
 
@@ -22,13 +27,28 @@ _PROFILE_LOCKS_GUARD = threading.Lock()
 _PROFILE_LOCKS: Dict[str, threading.Lock] = {}
 
 
+def _get_named_lock(key: str) -> threading.Lock:
+    with _PROFILE_LOCKS_GUARD:
+        if key not in _PROFILE_LOCKS:
+            _PROFILE_LOCKS[key] = threading.Lock()
+        return _PROFILE_LOCKS[key]
+
+
 def _get_profile_lock(prof_path: str) -> threading.Lock:
     """Đảm bảo tại một thời điểm chỉ có 1 tiến trình Playwright mở cùng 1 thư mục Chrome Profile."""
     norm_path = os.path.normcase(os.path.abspath(prof_path))
-    with _PROFILE_LOCKS_GUARD:
-        if norm_path not in _PROFILE_LOCKS:
-            _PROFILE_LOCKS[norm_path] = threading.Lock()
-        return _PROFILE_LOCKS[norm_path]
+    return _get_named_lock(f"path:{norm_path}")
+
+
+def _get_antidetect_lock(profile_id: str) -> threading.Lock:
+    return _get_named_lock(f"antidetect:{str(profile_id).strip()}")
+
+
+def _channel_antidetect_id(channel: Dict[str, Any]) -> str:
+    try:
+        return resolve_antidetect_profile_id(channel)
+    except Exception:
+        return ""
 
 
 def _log_optional_step_failure(step: str, err: Exception, channel: Dict[str, Any], metadata: Dict[str, Any]):
@@ -194,8 +214,44 @@ def build_final_metadata(
 def open_profile_for_login(channel: Dict[str, Any]) -> Dict[str, Any]:
     """
     Mở trình duyệt Chrome với Profile của kênh để người dùng đăng nhập YouTube Studio / Google.
+    Profile Antidetect được mở qua API Antidetect và dùng chung phiên với tool đăng bài.
     """
     prof_name = channel.get("profile_name") or f"channel_{channel.get('id', 'default')}"
+    ad_id = _channel_antidetect_id(channel)
+    if ad_id:
+        try:
+            res = AntidetectClient().open_login(ad_id)
+        except Exception as e:
+            add_log(
+                "Browser",
+                f"Không mở được Profile Antidetect '{prof_name}': {e}",
+                "ERROR",
+                channel_name=channel.get("name", ""),
+            )
+            raise RuntimeError(f"Không mở được Profile Antidetect: {e}") from e
+        add_log(
+            "Browser",
+            f"Đã mở Profile Antidetect '{prof_name}' tại studio.youtube.com (dùng chung phiên với tool).",
+            "INFO",
+            channel_name=channel.get("name", ""),
+        )
+        return {
+            "ok": True,
+            "antidetect": True,
+            "profile_path": f"antidetect://{ad_id}",
+            "port": res.get("port"),
+            "message": (
+                f"Đã mở Profile Antidetect: {prof_name}. Hãy đăng nhập Google/YouTube trên cửa sổ vừa mở. "
+                "Không cần đóng trình duyệt — tool sẽ dùng chung đúng phiên này khi kiểm tra và đăng bài."
+            ),
+        }
+
+    if str(channel.get("profile_path") or "").startswith("antidetect://"):
+        raise RuntimeError(
+            f"Profile '{prof_name}' được đánh dấu thuộc Antidetect nhưng chưa có ID liên kết. "
+            "Hãy bấm 'Đồng Bộ Antidetect' trong tab Quản Lý Kênh rồi thử lại."
+        )
+
     prof_path = channel.get("profile_path") or str(APP_PROFILES_DIR / prof_name)
     Path(prof_path).mkdir(parents=True, exist_ok=True)
 
@@ -679,12 +735,114 @@ def select_studio_channel(
     return page, verified
 
 
-def probe_profile_login(prof_path: str, proxy: str = "", grab_channels: bool = True) -> Dict[str, Any]:
+def _collect_studio_channels(page) -> tuple:
+    """Quét kênh trong hộp chuyển tài khoản Studio; trả về (active, danh sách kênh)."""
+    active = _read_active_studio_account(page)
+    entries = []
+    if _open_studio_account_menu(page):
+        active = _read_active_studio_account(page)
+        if _open_studio_switch_account_list(page):
+            entries = _list_studio_accounts(page)
+
+    current_email = active.get("email", "")
+    channels = [
+        {
+            "name": entry["name"],
+            "handle": entry["handle"],
+            "channel_id": entry.get("channel_id", ""),
+            "email": current_email,
+        }
+        for entry in entries
+        if entry["name"] or entry["handle"] or entry.get("channel_id")
+    ][:50]
+    if not channels and (active.get("name") or active.get("handle")):
+        channels = [{
+            "name": active.get("name", ""),
+            "handle": active.get("handle", ""),
+            "channel_id": active.get("channel_id", ""),
+            "email": current_email,
+        }]
+    return active, channels
+
+
+def _probe_antidetect_login(profile_id: str, grab_channels: bool = True) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "logged_in": False,
+        "email": "",
+        "channel_name": "",
+        "channels": [],
+        "message": "",
+        "antidetect": True,
+    }
+    try:
+        with AntidetectBrowserLease(profile_id, stop_if_started=True) as lease:
+            page = lease.page
+            page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(3500)
+
+            try:
+                cont_btn = page.locator(
+                    "a:has-text('Continue to Studio'), button:has-text('Continue to Studio'), "
+                    "a:has-text('Tiếp tục tới Studio'), button:has-text('Tiếp tục tới Studio'), "
+                    "[aria-label*='Continue to Studio' i]"
+                ).first
+                if cont_btn.count() > 0 and cont_btn.is_visible():
+                    cont_btn.click()
+                    page.wait_for_timeout(2500)
+            except Exception as cont_err:
+                _log_optional_step_failure("bấm Continue to Studio khi kiểm tra đăng nhập Antidetect", cont_err, {}, {})
+
+            if "accounts.google.com" in page.url or "signin" in page.url.lower():
+                result["message"] = "Profile Antidetect này chưa đăng nhập tài khoản Google/YouTube."
+                return result
+
+            result["logged_in"] = True
+            result["message"] = "Profile Antidetect đã đăng nhập Google."
+            if not grab_channels:
+                return result
+
+            try:
+                active, channels = _collect_studio_channels(page)
+                result["channels"] = channels
+                result["email"] = active.get("email", "")
+                result["channel_id"] = active.get("channel_id", "")
+                if channels:
+                    result["message"] = (
+                        "Profile Antidetect đã đăng nhập Google"
+                        + (f" ({result['email']})" if result["email"] else "")
+                        + f", phát hiện {len(channels)} kênh YouTube."
+                    )
+                else:
+                    result["message"] = (
+                        "Profile Antidetect đã đăng nhập Google nhưng không đọc được "
+                        "danh sách kênh trong hộp chuyển tài khoản."
+                    )
+            except Exception as parse_err:
+                result["message"] = (
+                    f"Profile Antidetect đã đăng nhập Google nhưng không quét được danh sách kênh: {parse_err}"
+                )
+    except Exception as e:
+        raise RuntimeError(f"Không kiểm tra được Profile Antidetect {profile_id}: {e}") from e
+    return result
+
+
+def probe_profile_login(
+    prof_path: str,
+    proxy: str = "",
+    grab_channels: bool = True,
+    antidetect_profile_id: str = "",
+) -> Dict[str, Any]:
     """
     Mở Chrome Profile ở vị trí cửa sổ khuất để KIỂM TRA trạng thái đăng nhập Google/YouTube,
     đồng thời quét danh sách kênh YouTube thật trong Profile qua hộp chuyển tài khoản của Studio.
     Luôn chạy định danh Windows Desktop nguyên bản (không ép Mobile UA) để đồng nhất fingerprint.
+    Profile Antidetect được kiểm tra qua CDP trên chính trình duyệt do Antidetect quản lý.
     """
+    if not antidetect_profile_id and str(prof_path or "").startswith("antidetect://"):
+        antidetect_profile_id = str(prof_path).split("antidetect://", 1)[1].split("/", 1)[0].strip()
+    if antidetect_profile_id:
+        return _probe_antidetect_login(antidetect_profile_id, grab_channels=grab_channels)
+
     from playwright.sync_api import sync_playwright
 
     chrome_exe = find_system_chrome_exe()
@@ -759,31 +917,9 @@ def probe_profile_login(prof_path: str, proxy: str = "", grab_channels: bool = T
 
                 # Mở hộp chuyển tài khoản (Account Switcher) đã kiểm chứng DOM thật để liệt kê chính xác từng kênh
                 try:
-                    active = _read_active_studio_account(page)
-                    entries = []
-                    if _open_studio_account_menu(page):
-                        active = _read_active_studio_account(page)
-                        if _open_studio_switch_account_list(page):
-                            entries = _list_studio_accounts(page)
-
+                    active, channels = _collect_studio_channels(page)
                     current_email = active.get("email", "")
-                    result["channels"] = [
-                        {
-                            "name": entry["name"],
-                            "handle": entry["handle"],
-                            "channel_id": entry.get("channel_id", ""),
-                            "email": current_email,
-                        }
-                        for entry in entries
-                        if entry["name"] or entry["handle"] or entry.get("channel_id")
-                    ][:50]
-                    if not result["channels"] and (active.get("name") or active.get("handle")):
-                        result["channels"] = [{
-                            "name": active.get("name", ""),
-                            "handle": active.get("handle", ""),
-                            "channel_id": active.get("channel_id", ""),
-                            "email": current_email,
-                        }]
+                    result["channels"] = channels
                     result["email"] = current_email
                     result["channel_id"] = active.get("channel_id", "")
                     if result["channels"]:
@@ -1687,6 +1823,156 @@ def discard_and_cancel_upload(page, channel_name: str = "", video_title: str = "
         )
 
 
+class _StudioBrowserSession:
+    """Mở trình duyệt Studio theo 2 chế độ: Chrome cục bộ hoặc profile Antidetect qua CDP.
+
+    Chế độ Antidetect không đổi UA/viewport/mobile/proxy và không nạp stealth script;
+    Antidetect đã làm việc đó cho toàn bộ tab mới. Chỉ các tab do session tạo mới bị đóng.
+    """
+
+    def __init__(
+        self,
+        *,
+        channel: Dict[str, Any],
+        prof_name: str,
+        prof_path: str,
+        chrome_exe: Optional[str],
+        is_mobile_mode: bool,
+        hide_browser: bool,
+        antidetect_profile_id: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        self.channel = channel
+        self.prof_name = prof_name
+        self.prof_path = prof_path
+        self.chrome_exe = chrome_exe
+        self.is_mobile_mode = is_mobile_mode
+        self.hide_browser = hide_browser
+        self.antidetect_profile_id = antidetect_profile_id
+        self.metadata = metadata or {}
+        self.context = None
+        self.page = None
+        self.init_scripts: list = []
+        self._pw = None
+        self._lease = None
+        self._closed = False
+
+    def __enter__(self):
+        if self.antidetect_profile_id:
+            if self.is_mobile_mode:
+                add_log(
+                    "Upload",
+                    "Đã bỏ qua chế độ giả lập Mobile: Profile Antidetect tự quản lý fingerprint/viewport.",
+                    "WARNING",
+                    channel_name=self.channel.get("name", ""),
+                    video_title=self.metadata.get("title", ""),
+                )
+            self.is_mobile_mode = False
+            self._lease = AntidetectBrowserLease(self.antidetect_profile_id, stop_if_started=True)
+            self._lease.__enter__()
+            self.context = self._lease.tracked_context
+            self.page = self._lease.page
+            self.init_scripts = []
+            return self
+
+        from playwright.sync_api import sync_playwright
+        Path(self.prof_path).mkdir(parents=True, exist_ok=True)
+
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-infobars",
+            "--mute-audio",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ]
+        if self.hide_browser:
+            launch_args.append("--window-position=-3200,-3200")
+
+        ctx_kwargs: Dict[str, Any] = {
+            "user_data_dir": self.prof_path,
+            "headless": False,
+            "args": launch_args,
+            "ignore_default_args": ["--enable-automation"],
+        }
+        if self.is_mobile_mode:
+            mobile_ua = (
+                "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0.0.0 Mobile Safari/537.36"
+            )
+            ctx_kwargs.update({
+                "user_agent": mobile_ua,
+                "viewport": {"width": 412, "height": 915},
+                "is_mobile": True,
+                "has_touch": True,
+                "device_scale_factor": 2.625,
+                "extra_http_headers": {
+                    "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+                    "sec-ch-ua-mobile": "?1",
+                    "sec-ch-ua-platform": '"Android"',
+                },
+            })
+        else:
+            # Chế độ Desktop nguyên bản (Khuyên dùng): Giữ nguyên 100% Fingerprint thật của máy tính
+            ctx_kwargs.update({
+                "viewport": {"width": 1366, "height": 768},
+                "is_mobile": False,
+                "has_touch": False,
+                "device_scale_factor": 1.0,
+            })
+
+        proxy_val = (self.channel.get("proxy") or "").strip()
+        if proxy_val:
+            p_parts = proxy_val.split(":")
+            if len(p_parts) == 2:
+                ctx_kwargs["proxy"] = {"server": f"http://{p_parts[0]}:{p_parts[1]}"}
+            elif len(p_parts) >= 4:
+                ctx_kwargs["proxy"] = {
+                    "server": f"http://{p_parts[0]}:{p_parts[1]}",
+                    "username": p_parts[2],
+                    "password": p_parts[3],
+                }
+
+        if self.chrome_exe:
+            ctx_kwargs["executable_path"] = self.chrome_exe
+
+        self._pw = sync_playwright().start()
+        try:
+            self.context = _launch_persistent_context_guarded(self._pw, ctx_kwargs, self.prof_name)
+            self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+            self.init_scripts = [STEALTH_JS] + ([MOBILE_PATCH_JS] if self.is_mobile_mode else [])
+            for script in self.init_scripts:
+                self.page.add_init_script(script)
+            return self
+        except Exception:
+            self.close()
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._lease is not None:
+            self._lease.__exit__(None, None, None)
+            self._lease = None
+            return
+        if self.context is not None:
+            try:
+                self.context.close()
+            except Exception as close_err:
+                _log_optional_step_failure("đóng Chrome sau khi upload", close_err, self.channel, self.metadata)
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
+
+
 def upload_via_playwright_studio(
     video_path: str,
     metadata: Dict[str, Any],
@@ -1697,97 +1983,51 @@ def upload_via_playwright_studio(
     """
     Tự động điều khiển trình duyệt (Playwright) đăng bài lên YouTube Studio (https://studio.youtube.com).
     Tích hợp khóa đồng bộ Profile Chrome, Anti-Checkpoint Stealth Shield & Copyright Check Guardian.
+    Với Profile Antidetect: dùng chung trình duyệt qua CDP, không tự mở Chrome/user_data_dir.
     """
-    from playwright.sync_api import sync_playwright
-
     settings = get_settings()
     hide_browser = bool(channel.get("use_hidden_desktop") or settings.get("hide_browser", False))
     prof_name = channel.get("profile_name") or f"channel_{channel.get('id', 'default')}"
     prof_path = channel.get("profile_path") or str(APP_PROFILES_DIR / prof_name)
-    Path(prof_path).mkdir(parents=True, exist_ok=True)
+    ad_id = _channel_antidetect_id(channel)
+    if not ad_id and str(prof_path).startswith("antidetect://"):
+        raise RuntimeError(
+            f"Profile '{prof_name}' được đánh dấu thuộc Antidetect nhưng chưa có ID liên kết. "
+            "Hãy bấm 'Đồng Bộ Antidetect' trong tab Quản Lý Kênh rồi thử lại."
+        )
+    if not ad_id:
+        Path(prof_path).mkdir(parents=True, exist_ok=True)
 
-    chrome_exe = find_system_chrome_exe()
-    launch_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-infobars",
-        "--mute-audio",
-        "--disable-features=IsolateOrigins,site-per-process",
-    ]
-    if hide_browser:
-        launch_args.append("--window-position=-3200,-3200")
-
-    is_mobile_mode = bool(metadata.get("emulate_mobile", False))
-    prof_lock = _get_profile_lock(prof_path)
+    is_mobile_mode = bool(metadata.get("emulate_mobile", False)) and not ad_id
+    prof_lock = _get_antidetect_lock(ad_id) if ad_id else _get_profile_lock(prof_path)
+    chrome_exe = None if ad_id else find_system_chrome_exe()
 
     if progress_callback:
         progress_callback(8, f"Đang chờ phiên Chrome Profile '{prof_name}' sẵn sàng...")
 
     with prof_lock:
         if progress_callback:
-            progress_callback(10, f"Khởi động trình duyệt Profile '{prof_name}' (Chống Checkpoint)...")
-
-        with sync_playwright() as p:
-            ctx_kwargs: Dict[str, Any] = {
-                "user_data_dir": prof_path,
-                "headless": False,
-                "args": launch_args,
-                "ignore_default_args": ["--enable-automation"],
-            }
-
-            if is_mobile_mode:
-                mobile_ua = (
-                    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/128.0.0.0 Mobile Safari/537.36"
-                )
-                ctx_kwargs.update({
-                    "user_agent": mobile_ua,
-                    "viewport": {"width": 412, "height": 915},
-                    "is_mobile": True,
-                    "has_touch": True,
-                    "device_scale_factor": 2.625,
-                    "extra_http_headers": {
-                        "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-                        "sec-ch-ua-mobile": "?1",
-                        "sec-ch-ua-platform": '"Android"',
-                    },
-                })
+            if ad_id:
+                progress_callback(10, f"Đang mở/kết nối Profile Antidetect '{prof_name}'...")
             else:
-                # Chế độ Desktop nguyên bản (Khuyên dùng): Giữ nguyên 100% Fingerprint thật của máy tính
-                ctx_kwargs.update({
-                    "viewport": {"width": 1366, "height": 768},
-                    "is_mobile": False,
-                    "has_touch": False,
-                    "device_scale_factor": 1.0,
-                })
+                progress_callback(10, f"Khởi động trình duyệt Profile '{prof_name}' (Chống Checkpoint)...")
 
-            proxy_val = (channel.get("proxy") or "").strip()
-            if proxy_val:
-                p_parts = proxy_val.split(":")
-                if len(p_parts) == 2:
-                    ctx_kwargs["proxy"] = {"server": f"http://{p_parts[0]}:{p_parts[1]}"}
-                elif len(p_parts) >= 4:
-                    ctx_kwargs["proxy"] = {
-                        "server": f"http://{p_parts[0]}:{p_parts[1]}",
-                        "username": p_parts[2],
-                        "password": p_parts[3],
-                    }
-
-            if chrome_exe:
-                ctx_kwargs["executable_path"] = chrome_exe
-
-            context = _launch_persistent_context_guarded(p, ctx_kwargs, prof_name)
+        with _StudioBrowserSession(
+            channel=channel,
+            prof_name=prof_name,
+            prof_path=prof_path,
+            chrome_exe=chrome_exe,
+            is_mobile_mode=is_mobile_mode,
+            hide_browser=hide_browser,
+            antidetect_profile_id=ad_id,
+            metadata=metadata,
+        ) as browser_session:
+            context = browser_session.context
+            page = browser_session.page
+            init_scripts = browser_session.init_scripts
             draft_created = False
             publish_clicked = False
-            page = None
             try:
-                page = context.pages[0] if context.pages else context.new_page()
-                page.add_init_script(STEALTH_JS)
-                if is_mobile_mode:
-                    page.add_init_script(MOBILE_PATCH_JS)
-
                 if progress_callback:
                     progress_callback(20, f"Đang mở YouTube Studio ({'📱 Giả lập Điện thoại' if is_mobile_mode else '💻 Máy tính'})...")
 
@@ -1817,7 +2057,7 @@ def upload_via_playwright_studio(
                     page,
                     channel,
                     context=context,
-                    init_scripts=[STEALTH_JS] + ([MOBILE_PATCH_JS] if is_mobile_mode else []),
+                    init_scripts=init_scripts,
                     progress_callback=progress_callback,
                 )
                 add_log(
@@ -2355,11 +2595,6 @@ def upload_via_playwright_studio(
                             video_title=metadata.get("title", ""),
                         )
                 raise
-            finally:
-                try:
-                    context.close()
-                except Exception as close_err:
-                    _log_optional_step_failure("đóng Chrome sau khi upload", close_err, channel, metadata)
 
 
 def upload_video_to_youtube(
@@ -2383,6 +2618,13 @@ def upload_video_to_youtube(
             f"Kênh '{channel.get('name') or channel.get('handle') or '?'}' chưa có Channel ID. "
             "Không thể xác minh chính xác kênh nhận video — hãy bấm 'Refresh Kênh' hoặc nhập Channel ID "
             "trong tab Quản Lý Kênh trước khi đăng."
+        )
+
+    if _channel_antidetect_id(channel) and mode == "youtube_api":
+        raise RuntimeError(
+            f"Kênh '{channel.get('name') or channel.get('handle') or '?'}' dùng Profile Antidetect nên "
+            "không thể đăng bằng YouTube Data API (sẽ đi sai proxy/fingerprint). "
+            "Hãy chuyển kênh sang chế độ đăng 'playwright' (YouTube Studio)."
         )
 
     if mode == "youtube_api":

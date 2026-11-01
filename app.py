@@ -45,6 +45,8 @@ from database import (
     add_log,
     get_all_profiles,
     get_channels_by_profile,
+    get_profile_binding,
+    sync_antidetect_profiles,
     run_housekeeping,
     export_all_tables_csv,
     collect_secret_values,
@@ -53,6 +55,7 @@ from database import (
     public_settings,
     redact_secrets,
 )
+from antidetect_client import AntidetectClient, AntidetectError
 from scanner_downloader import scan_social_urls, probe_video_info, probe_video_infos, VIDEO_EXTENSIONS
 from ai_engine import ai_optimize_youtube_metadata, apply_batch_text_edit
 from youtube_uploader import (
@@ -1951,6 +1954,30 @@ def api_stop_pipeline():
 # ==========================================================
 # QUẢN LÝ PROFILES CHROME & KÊNH YOUTUBE PHÂN CẤP
 # ==========================================================
+@app.get("/api/antidetect/status")
+def api_antidetect_status():
+    return AntidetectClient().status()
+
+
+@app.post("/api/antidetect/sync")
+def api_antidetect_sync():
+    """Kéo danh sách Profile từ Antidetect về chrome_profiles (không lấy mật khẩu proxy)."""
+    client = AntidetectClient()
+    try:
+        remote = client.list_profiles()
+    except AntidetectError as e:
+        add_log("Antidetect", f"Không đồng bộ được Profile: {e}", "ERROR")
+        raise HTTPException(503, str(e))
+    result = sync_antidetect_profiles(remote)
+    add_log(
+        "Antidetect",
+        f"Đồng bộ Profile Antidetect: thêm {result['added']}, cập nhật {result['updated']}, "
+        f"bỏ qua {result['skipped']}.",
+        "SUCCESS",
+    )
+    return result
+
+
 @app.get("/api/profiles")
 def api_list_profiles():
     return get_all_profiles()
@@ -1966,6 +1993,23 @@ def api_create_profile(data: Dict[str, Any] = Body(...)):
     name = (data.get("name") or "").strip()
     if not name:
         raise HTTPException(400, "Tên Profile không được để trống.")
+
+    check_conn = get_conn()
+    existing = check_conn.execute(
+        "SELECT source, antidetect_profile_id FROM chrome_profiles WHERE name = ?",
+        (name,),
+    ).fetchone()
+    check_conn.close()
+    if existing and (
+        str(existing["source"] or "") == "Antidetect"
+        or str(existing["antidetect_profile_id"] or "").strip()
+    ):
+        raise HTTPException(
+            409,
+            "Tên này đang thuộc Profile đồng bộ từ Antidetect. "
+            "Không thể ghi đè bằng Profile Chrome cục bộ — hãy chọn tên khác.",
+        )
+
     from config import APP_PROFILES_DIR
     p_path = str(APP_PROFILES_DIR / name)
     Path(p_path).mkdir(parents=True, exist_ok=True)
@@ -1974,7 +2018,11 @@ def api_create_profile(data: Dict[str, Any] = Body(...)):
 
     conn = get_conn()
     conn.execute(
-        "INSERT OR REPLACE INTO chrome_profiles (name, path, proxy, source, note) VALUES (?, ?, ?, 'Local', ?)",
+        """
+        INSERT OR REPLACE INTO chrome_profiles
+            (name, path, proxy, source, note, antidetect_profile_id)
+        VALUES (?, ?, ?, 'Local', ?, '')
+        """,
         (name, p_path, proxy, note),
     )
     chk = conn.execute("SELECT id FROM youtube_channels WHERE profile_name = ?", (name,)).fetchone()
@@ -1994,10 +2042,23 @@ def api_create_profile(data: Dict[str, Any] = Body(...)):
 @app.put("/api/profiles/{profile_name}")
 def api_update_profile(profile_name: str, data: Dict[str, Any] = Body(...)):
     conn = get_conn()
-    row = conn.execute("SELECT name FROM chrome_profiles WHERE name = ?", (profile_name,)).fetchone()
+    row = conn.execute(
+        "SELECT name, source, antidetect_profile_id FROM chrome_profiles WHERE name = ?",
+        (profile_name,),
+    ).fetchone()
     if not row:
         conn.close()
         raise HTTPException(404, "Không tìm thấy Profile Chrome này.")
+    is_antidetect = (
+        str(row["source"] or "") == "Antidetect"
+        or bool(str(row["antidetect_profile_id"] or "").strip())
+    )
+    if "proxy" in data and is_antidetect:
+        conn.close()
+        raise HTTPException(
+            400,
+            "Proxy của Profile Antidetect do Antidetect quản lý — hãy sửa trong Antidetect.",
+        )
     if "proxy" in data:
         proxy = (data.get("proxy") or "").strip()
         conn.execute("UPDATE chrome_profiles SET proxy = ? WHERE name = ?", (proxy, profile_name))
@@ -2032,9 +2093,7 @@ def api_delete_profile(profile_name: str):
 
 @app.post("/api/profiles/{profile_name}/open-browser")
 def api_open_profile_browser(profile_name: str):
-    conn = get_conn()
-    prof = conn.execute("SELECT * FROM chrome_profiles WHERE name = ?", (profile_name,)).fetchone()
-    conn.close()
+    prof = get_profile_binding(profile_name)
     if not prof:
         raise HTTPException(404, "Không tìm thấy Profile Chrome này.")
     ch_like = {
@@ -2043,20 +2102,29 @@ def api_open_profile_browser(profile_name: str):
         "profile_name": profile_name,
         "profile_path": prof["path"],
         "proxy": prof["proxy"] or "",
+        "source": prof.get("source") or "",
+        "antidetect_profile_id": prof.get("antidetect_profile_id") or "",
     }
-    return open_profile_for_login(ch_like)
+    try:
+        return open_profile_for_login(ch_like)
+    except Exception as e:
+        add_log("Profile", f"Lỗi mở Profile '{profile_name}': {e}", "ERROR")
+        raise HTTPException(500, f"Lỗi khi mở Profile: {e}")
 
 
 @app.post("/api/profiles/{profile_name}/check-login")
 def api_check_profile_login(profile_name: str):
     """Mở Chrome Profile ở vị trí khuất để kiểm tra phiên đăng nhập Google (kèm Proxy nếu có)."""
-    conn = get_conn()
-    prof = conn.execute("SELECT * FROM chrome_profiles WHERE name = ?", (profile_name,)).fetchone()
-    conn.close()
+    prof = get_profile_binding(profile_name)
     if not prof:
         raise HTTPException(404, "Không tìm thấy Profile Chrome này.")
     try:
-        probe = probe_profile_login(prof["path"], prof["proxy"] or "", grab_channels=True)
+        probe = probe_profile_login(
+            prof["path"],
+            prof["proxy"] or "",
+            grab_channels=True,
+            antidetect_profile_id=prof.get("antidetect_profile_id") or "",
+        )
     except Exception as e:
         add_log("Profile", f"Lỗi kiểm tra đăng nhập Profile '{profile_name}': {e}", "ERROR")
         raise HTTPException(500, f"Lỗi khi mở Profile để kiểm tra: {e}")
@@ -2081,13 +2149,16 @@ def api_check_profile_login(profile_name: str):
 @app.post("/api/profiles/{profile_name}/refresh-channels")
 def api_refresh_profile_channels(profile_name: str):
     """Quét danh sách kênh YouTube thật trong Chrome Profile và cập nhật vào bảng youtube_channels."""
-    conn = get_conn()
-    prof = conn.execute("SELECT * FROM chrome_profiles WHERE name = ?", (profile_name,)).fetchone()
-    conn.close()
+    prof = get_profile_binding(profile_name)
     if not prof:
         raise HTTPException(404, "Không tìm thấy Profile Chrome này.")
     try:
-        probe = probe_profile_login(prof["path"], prof["proxy"] or "", grab_channels=True)
+        probe = probe_profile_login(
+            prof["path"],
+            prof["proxy"] or "",
+            grab_channels=True,
+            antidetect_profile_id=prof.get("antidetect_profile_id") or "",
+        )
     except Exception as e:
         add_log("Profile", f"Lỗi quét kênh Profile '{profile_name}': {e}", "ERROR")
         raise HTTPException(500, f"Lỗi khi mở Profile để quét kênh: {e}")
@@ -2191,6 +2262,30 @@ def api_create_channel(data: Dict[str, Any] = Body(...)):
         raise HTTPException(400, "Tên kênh không được để trống.")
     prof_name = (data.get("profile_name") or name).strip()
     prof_path = (data.get("profile_path") or "").strip()
+
+    binding = get_profile_binding(prof_name) if prof_name else None
+    is_antidetect = bool(
+        binding
+        and (
+            str(binding.get("source") or "") == "Antidetect"
+            or str(binding.get("antidetect_profile_id") or "").strip()
+        )
+    )
+    upload_mode = (data.get("upload_mode") or "playwright").strip()
+    if is_antidetect:
+        if not str(binding.get("antidetect_profile_id") or "").strip():
+            raise HTTPException(
+                400,
+                "Profile Antidetect này thiếu ID liên kết. Hãy bấm 'Đồng Bộ Antidetect' rồi thử lại.",
+            )
+        if upload_mode == "youtube_api":
+            raise HTTPException(
+                400,
+                "Kênh dùng Profile Antidetect chỉ hỗ trợ đăng qua trình duyệt Playwright "
+                "(YouTube Data API sẽ đi sai proxy/fingerprint của Antidetect).",
+            )
+        prof_path = binding.get("path") or f"antidetect://{binding['antidetect_profile_id']}"
+
     if not prof_path:
         from config import DHB_PROFILE_CHROME_DIR, APP_PROFILES_DIR
         candidate = DHB_PROFILE_CHROME_DIR / prof_name
@@ -2210,12 +2305,12 @@ def api_create_channel(data: Dict[str, Any] = Body(...)):
             data.get("channel_id") or "",
             data.get("handle") or "",
             data.get("group_name") or "Mặc định",
-            data.get("upload_mode") or "playwright",
+            "playwright" if is_antidetect else upload_mode,
             prof_name,
             prof_path,
-            1 if data.get("emulate_mobile", False) else 0,
+            0 if is_antidetect else (1 if data.get("emulate_mobile", False) else 0),
             1 if data.get("use_hidden_desktop") else 0,
-            data.get("proxy") or "",
+            "" if is_antidetect else (data.get("proxy") or ""),
             data.get("oauth_token_json") or "",
             data.get("default_category_id") or "22",
             data.get("default_privacy") or "public",
@@ -2277,6 +2372,33 @@ def api_update_channel(channel_id: int, data: Dict[str, Any] = Body(...)):
         if prof_row and prof_row["path"]:
             updates["profile_path"] = prof_row["path"]
 
+    # Kênh gắn Profile Antidetect: path là định danh do Antidetect quản lý, proxy/mobile do Antidetect quyết định.
+    final_prof_name = updates.get("profile_name", row["profile_name"] or "")
+    prof_binding = conn.execute(
+        "SELECT * FROM chrome_profiles WHERE name = ?", (final_prof_name,)
+    ).fetchone() if final_prof_name else None
+    if prof_binding and (
+        str(prof_binding["source"] or "") == "Antidetect"
+        or str(prof_binding["antidetect_profile_id"] or "").strip()
+    ):
+        ad_binding_id = str(prof_binding["antidetect_profile_id"] or "").strip()
+        if not ad_binding_id:
+            conn.close()
+            raise HTTPException(
+                400,
+                "Profile Antidetect này thiếu ID liên kết. Hãy bấm 'Đồng Bộ Antidetect' rồi thử lại.",
+            )
+        if updates.get("upload_mode") == "youtube_api":
+            conn.close()
+            raise HTTPException(
+                400,
+                "Kênh dùng Profile Antidetect chỉ hỗ trợ đăng qua trình duyệt Playwright "
+                "(YouTube Data API sẽ đi sai proxy/fingerprint của Antidetect).",
+            )
+        updates["profile_path"] = prof_binding["path"] or f"antidetect://{ad_binding_id}"
+        updates["proxy"] = ""
+        updates["emulate_mobile"] = 0
+
     cols = ", ".join(f"{k} = ?" for k in updates.keys())
     conn.execute(f"UPDATE youtube_channels SET {cols} WHERE id = ?", list(updates.values()) + [channel_id])
     conn.commit()
@@ -2301,7 +2423,18 @@ def api_open_channel_browser(channel_id: int):
     conn.close()
     if not ch:
         raise HTTPException(404, "Không tìm thấy kênh.")
-    return open_profile_for_login(dict(ch))
+    channel_data = dict(ch)
+    prof = get_profile_binding(channel_data.get("profile_name") or "")
+    if prof:
+        channel_data["source"] = prof.get("source") or ""
+        channel_data["antidetect_profile_id"] = prof.get("antidetect_profile_id") or ""
+        if str(prof.get("source") or "") == "Antidetect":
+            channel_data["profile_path"] = prof.get("path") or ""
+    try:
+        return open_profile_for_login(channel_data)
+    except Exception as e:
+        add_log("Channel", f"Lỗi mở Profile cho kênh #{channel_id}: {e}", "ERROR", channel_name=ch["name"])
+        raise HTTPException(500, f"Lỗi khi mở Profile: {e}")
 
 
 @app.get("/api/channels/{channel_id}/oauth-status")

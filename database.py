@@ -332,7 +332,17 @@ def init_db():
     _add_col_if_missing("video_queue", "claim_token", "TEXT DEFAULT ''")
     _add_col_if_missing("chrome_profiles", "login_status", "TEXT DEFAULT ''")
     _add_col_if_missing("chrome_profiles", "last_login_check", "TEXT DEFAULT ''")
+    _add_col_if_missing("chrome_profiles", "antidetect_profile_id", "TEXT DEFAULT ''")
     _add_col_if_missing("monitors", "last_heartbeat_at", "TEXT DEFAULT ''")
+
+    try:
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_chrome_profiles_antidetect "
+            "ON chrome_profiles(antidetect_profile_id) "
+            "WHERE antidetect_profile_id IS NOT NULL AND antidetect_profile_id != ''"
+        )
+    except Exception:
+        pass
 
     # Sửa default legacy 1 -> 0 (Monitor và mọi INSERT thiếu cột phải chạy Desktop)
     emulate_default_fixed = _fix_video_queue_emulate_default(conn, cur)
@@ -752,6 +762,127 @@ def get_all_profiles() -> List[Dict[str, Any]]:
         res.append(pdict)
     conn.close()
     return res
+
+
+def get_profile_binding(profile_name: str) -> Optional[Dict[str, Any]]:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM chrome_profiles WHERE name = ?", (profile_name,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_antidetect_profile_id(profile_name: str) -> str:
+    if not profile_name:
+        return ""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT antidetect_profile_id FROM chrome_profiles WHERE name = ?",
+        (profile_name,),
+    ).fetchone()
+    conn.close()
+    return str(row["antidetect_profile_id"] or "").strip() if row else ""
+
+
+def _antidetect_proxy_display(proxy: Any) -> str:
+    if not isinstance(proxy, dict) or not proxy.get("enabled"):
+        return ""
+    host = str(proxy.get("host") or "").strip()
+    port = proxy.get("port")
+    if not host or not port:
+        return ""
+    return f"{host}:{port}"
+
+
+def sync_antidetect_profiles(remote_profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Đồng bộ profile từ Antidetect vào chrome_profiles, giữ nguyên kênh đang gắn.
+
+    Không ghi proxy credentials (API Antidetect đã che mật khẩu) và không đụng
+    tới thư mục Chrome cục bộ. Profile trùng tên với profile local được đặt
+    tên riêng để không ghi đè dữ liệu cũ.
+    """
+    conn = get_conn()
+    added = 0
+    updated = 0
+    skipped = 0
+    synced: List[Dict[str, Any]] = []
+    remote_ids = set()
+    try:
+        rows = conn.execute("SELECT name, antidetect_profile_id FROM chrome_profiles").fetchall()
+        existing_by_ad = {
+            str(r["antidetect_profile_id"]).strip(): r["name"]
+            for r in rows
+            if str(r["antidetect_profile_id"] or "").strip()
+        }
+        used_names = {r["name"] for r in rows}
+
+        for item in remote_profiles or []:
+            if not isinstance(item, dict):
+                skipped += 1
+                continue
+            ad_id = str(item.get("id") or "").strip()
+            if not ad_id:
+                skipped += 1
+                continue
+            remote_ids.add(ad_id)
+            remote_name = str(item.get("name") or "").strip() or f"Antidetect {ad_id[:8]}"
+            proxy_display = _antidetect_proxy_display(item.get("proxy"))
+            path = f"antidetect://{ad_id}"
+
+            if ad_id in existing_by_ad:
+                local_name = existing_by_ad[ad_id]
+                conn.execute(
+                    "UPDATE chrome_profiles SET source = 'Antidetect', path = ?, proxy = ? "
+                    "WHERE antidetect_profile_id = ?",
+                    (path, proxy_display, ad_id),
+                )
+                updated += 1
+            else:
+                local_name = remote_name
+                suffix = 2
+                while local_name in used_names:
+                    local_name = f"{remote_name} (Antidetect {suffix})"
+                    suffix += 1
+                conn.execute(
+                    """
+                    INSERT INTO chrome_profiles
+                        (name, path, proxy, source, note, antidetect_profile_id)
+                    VALUES (?, ?, ?, 'Antidetect', ?, ?)
+                    """,
+                    (
+                        local_name,
+                        path,
+                        proxy_display,
+                        "Đồng bộ từ Antidetect — trình duyệt, proxy và fingerprint do Antidetect quản lý.",
+                        ad_id,
+                    ),
+                )
+                used_names.add(local_name)
+                existing_by_ad[ad_id] = local_name
+                added += 1
+
+            synced.append({
+                "name": local_name,
+                "antidetect_profile_id": ad_id,
+                "status": item.get("status") or "",
+                "proxy": proxy_display,
+            })
+
+        missing = sorted(
+            existing_by_ad[ad_id] for ad_id in existing_by_ad if ad_id not in remote_ids
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "added": added,
+        "updated": updated,
+        "skipped": skipped,
+        "total": len(remote_profiles or []),
+        "missing": missing,
+        "profiles": synced,
+    }
 
 
 def get_channels_by_profile(profile_name: str) -> List[Dict[str, Any]]:

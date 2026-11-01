@@ -1,5 +1,7 @@
-# PROMPT BÀN GIAO TOÀN DIỆN — DHB REUP YOUTUBE STUDIO (BẢN CẬP NHẬT 2026-10-24)
-*(Trao cho kỹ sư tiếp nhận vai trò Senior Fullstack & Automation Engineer bảo trì tiếp dự án)*
+# PROMPT BÀN GIAO TOÀN DIỆN — DHB REUP YOUTUBE STUDIO (CẬP NHẬT 2026-10-26, UI v18)
+*(Trao cho kỹ sư/AI tiếp nhận vai trò Senior Fullstack & Automation Engineer bảo trì tiếp dự án)*
+
+**Cách dùng:** đọc toàn bộ file này trước, sau đó kiểm tra trạng thái thật bằng `git log`, `git status`, DB và code hiện tại. Các con số/trạng thái bên dưới là snapshot ngày 2026-10-26, không thay thế việc đọc code. Không hỏi lại những rule đã chốt ở mục 3 và 3A.
 
 ---
 
@@ -14,13 +16,15 @@ Tiếp nhận bảo trì và nâng cấp tool "DHB Reup YouTube Studio" trên m�
 - **Thư mục chính:** `D:\DHB_Reup_YouTube_Studio\` — mọi chỉnh sửa ở đây.
 - **Khởi chạy:** `START_DHB_YOUTUBE.bat` → web UI tại `http://127.0.0.1:8686` (server chạy bằng lệnh thô `python app.py`, KHÔNG dùng venv). Sau khi sửa frontend, nâng version `app.js?v=N` trong `index.html` (hiện tại **v18**) và yêu cầu tôi Ctrl+F5.
 - **Stack:** Python 3.10 + FastAPI + Uvicorn + SQLite WAL (`database.py:get_conn` — timeout 30s, journal_mode=WAL, synchronous=NORMAL); frontend SPA vanilla JS (polling 2.5s); Playwright điều khiển Chrome thật theo Profile; FFmpeg/ffprobe/youtube-dl kế thừa từ `C:\DHB Reup Facebook\`.
-- **Cấu trúc file:** `app.py` (REST API ~35 endpoints), `config.py` (đường dẫn + kho tài nguyên DHB), `database.py` (schema + migration + backup + housekeeping), `pipeline_manager.py` (đa luồng Semaphore + stop_event + Auto Monitor 24/7), `render_engine.py` (7 chế độ render FFmpeg + PID trap + branding overlays), `youtube_uploader.py` (Playwright Studio 4 bước + YouTube Data API v3 + probe đăng nhập + quét kênh), `scanner_downloader.py` (yt-dlp quét/tải + quét thư mục đệ quy), `ai_engine.py` (Gemini/OpenAI/DeepSeek/Google Translate), `static/` (index.html + app.js + styles.css), `data/dhb_youtube.sqlite` (DB chính), `data/backups/` (backup tự động, giữ 5 bản).
+- **Cấu trúc file:** `app.py` (REST API ~35 endpoints), `config.py` (đường dẫn + kho tài nguyên DHB), `database.py` (schema + migration + backup + housekeeping), `pipeline_manager.py` (đa luồng Semaphore + stop_event + Auto Monitor 24/7), `render_engine.py` (7 chế độ render FFmpeg + PID trap + branding overlays), `youtube_uploader.py` (Playwright Studio 4 bước + YouTube Data API v3 + probe đăng nhập + quét kênh), `antidetect_client.py` (cầu nối Antidetect API/DPAPI/CDP lease — đang ở working tree, chưa commit), `scanner_downloader.py` (yt-dlp quét/tải + quét thư mục đệ quy), `ai_engine.py` (Gemini/OpenAI/DeepSeek/Google Translate), `static/` (index.html + app.js + styles.css), `data/dhb_youtube.sqlite` (DB chính), `data/backups/` (backup tự động, giữ 5 bản).
+- **Git/GitHub:** repo local đã khởi tạo, nhánh `main`; baseline đầu tiên `0d32cd5` (`chore: khởi tạo repo và chốt bản v18`). Remote private: `https://github.com/meolucky051101001-cyber/DHB_Reup_YouTube_Studio`. Kiểm tra `git log`/`git status` trước khi nhận định hiện trạng; không tự commit/push nếu chủ tool chưa yêu cầu.
+- **Tài liệu:** file này là prompt bàn giao chính; `CHANGELOG.md` ghi các thay đổi P0/P1/P2 ngày 2026-10-26; `HUONG_DAN_SU_DUNG.txt` là tài liệu hướng dẫn sử dụng; `.github/workflows/tests.yml` chạy test Windows khi push/PR.
 
 ---
 
 ## 2. TÌNH TRẠNG SAU 6 ĐỢT NÂNG CẤP + 4 ĐỢT P0/P1/P2 (đã làm gì)
 
-**Tổng quan: 73 bài test tự động PASS ở lần chạy cuối (2026-10-26).** Bộ test nằm NGAY TRONG REPO tại `tests/` và chạy bằng `python -m unittest discover -s tests -v` (không còn file tạm ở `%TEMP%`). CI: `.github/workflows/tests.yml`.
+**Tổng quan: 86/86 test PASS trên working tree ngày 2026-10-26** (73 test ở baseline đã commit + 13 test tích hợp Antidetect chưa commit). Bộ test nằm NGAY TRONG REPO tại `tests/` và chạy bằng `python -m unittest discover -s tests -v` (không còn file tạm ở `%TEMP%`). CI: `.github/workflows/tests.yml`.
 
 ### Đợt 7–10 (2026-10-25/26) — Sửa lỗi P0/P1/P2 có kiểm thử:
 - **P0 fail-closed (mới nhất):** xác minh Channel ID tuyệt đối trước upload (`_verify_studio_channel_id` bắt buộc cả ID đích lẫn ID thực tế); Publish chỉ Completed khi đọc được **URL video thật** từ hộp thoại chia sẻ (`published_uncertain=True` nếu không đọc được, pipeline báo Error và không move/xóa file nguồn); Checks phải thấy chữ "No issues found"/tương đương mới được bấm Next (timeout → dừng, không đăng); giới hạn 18+ fail-closed và chặn ở chế độ YouTube API; nút Dừng chờ upload hiện tại hoàn tất thay vì giết giữa chừng.
@@ -28,7 +32,15 @@ Tiếp nhận bảo trì và nâng cấp tool "DHB Reup YouTube Studio" trên m�
 - **P1:** chặn SQL injection metadata hàng loạt; che secret khỏi API/log/CSV; bearer token cục bộ + chặn Host/Origin (`api_security.py`); bỏ endpoint purge; bỏ `shell=True`; proxy cho YouTube API; tên file render không trùng.
 - **P2:** dedupe monitor theo kênh; bổ sung field 18+/Kids/AI/mobile cho upload kéo-thả; bỏ `innerHTML` khỏi toast; TLS verification; siết lỗi bị nuốt; tạm dừng polling khi tab ẩn.
 - **P1/P2 còn lại (2026-10-26):** nhóm kênh chia vòng theo **ID video** (không theo thứ tự batch) và bỏ fallback ngầm `Default → Mặc định` (DB tự chuẩn hóa dữ liệu cũ); frontend tự lấy lại API token khi gặp 401 sau restart (không cần Ctrl+F5); lỗi đọc trạng thái Checks được đưa vào thông báo dừng thay vì nuốt im lặng; các bước Playwright không bắt buộc (đọc kênh, mở menu, thumbnail/bình luận API, đóng Chrome) đều ghi log WARNING.
-- **Quy trình:** `requirements.txt` pin phiên bản; `.gitignore` chặn DB/OAuth khỏi Git; test đặt trong `tests/`.
+- **Quy trình:** `requirements.txt` pin phiên bản; `.gitignore` chặn DB/OAuth/profile/log/backup khỏi Git; test đặt trong `tests/`; repo Git + GitHub private + CI đã hoạt động.
+
+### Thay đổi CHƯA COMMIT trong working tree (cần review trước khi chốt)
+- **Tích hợp Antidetect Browser Manager:** thêm `antidetect_client.py` và `tests/test_antidetect_integration.py`; sửa `app.py`, `database.py`, `youtube_uploader.py`, `static/app.js`, `static/index.html`. Những thay đổi này chưa nằm trong commit `0d32cd5` và chưa có trên GitHub.
+- Antidetect là chủ sở hữu Chrome/Profile/Proxy/Fingerprint. Tool chỉ đồng bộ metadata profile, mở profile qua API Antidetect và mượn trình duyệt đang chạy bằng CDP lease; không mở Chrome bằng `user_data_dir` của Antidetect.
+- Sync không ghi đè profile local trùng tên, không kéo mật khẩu proxy về DB. Profile Antidetect dùng pseudo-path `antidetect://<id>` và `antidetect_profile_id`.
+- Upload qua Antidetect bắt buộc Playwright; YouTube Data API bị chặn vì sẽ sai proxy/fingerprint. Không ép mobile/UA/viewport/proxy/stealth script lên trình duyệt Antidetect; chỉ đóng tab do lease tạo, không đóng browser/context của Antidetect.
+- API mới: `GET /api/antidetect/status`, `POST /api/antidetect/sync`; có kiểm tra/khởi chạy profile và probe đăng nhập qua Antidetect. Chưa được xác minh bằng upload thật.
+- 13 test Antidetect dùng HTTP server giả lập, DB tạm và fake lease; full suite hiện 86/86 PASS. DB production hiện chưa có cột `antidetect_profile_id` (migration chưa chạy). Cần review diff, chạy lại server/migration và kiểm thử có giám sát trước khi commit/push.
 
 ### Đợt 1 — Quản lý Profile/Kênh & tùy chọn đăng:
 - Bảng **👤 Quản Lý Profile Chrome** (tab 4) với nút: 🌐 Mở Đăng Nhập, 🔍 Kiểm Tra (mở Chrome khuất `--window-position=-3200,-3200`, tự xác nhận phiên Google còn sống, lưu `chrome_profiles.login_status`/`last_login_check`), 🔄 Quét Kênh (mở hộp chuyển tài khoản Studio, parse tên kênh/handle/email, upsert vào `youtube_channels`), ⚙️ Sửa Proxy (đồng bộ proxy xuống mọi kênh con), 🗑️ Xóa (chỉ xóa bản ghi DB, giữ nguyên thư mục đĩa).
@@ -80,6 +92,23 @@ Tiếp nhận bảo trì và nâng cấp tool "DHB Reup YouTube Studio" trên m�
 
 ---
 
+## 3A. RULE LÀM VIỆC BẮT BUỘC CHO KỸ SƯ/AI TIẾP NHẬN
+
+1. **Phạm vi ghi file:** chỉ sửa/tạo trong `D:\DHB_Reup_YouTube_Studio\`. Không sửa/xóa bất kỳ file nào ngoài thư mục này; `C:\DHB Reup Facebook\` chỉ được đọc tham khảo.
+2. **Không upload thật khi đang audit/test/sửa code.** Chỉ upload khi chủ tool yêu cầu rõ, sau khi Channel ID + phiên đăng nhập đã xác minh, và phải có giám sát. Test dùng video synthetic, DB `:memory:`/thư mục tạm, DOM Studio giả lập.
+3. **Không làm yếu fail-closed:** thiếu/sai Channel ID, Checks không rõ, 18+ không xác nhận, publish URL không đọc được, gap 30 phút không kiểm chứng được → phải dừng/báo lỗi, không fallback để "chạy cho xong".
+4. **Giữ anti-checkpoint:** `emulate_mobile=0`; không đóng Chrome ngay sau Đăng; giãn cách tối thiểu 30 phút; profile và kênh con dùng cùng proxy; Dừng phải chờ upload đang chạy hoàn tất; không kill FFmpeg toàn hệ thống.
+5. **Bảo mật dữ liệu:** không in/log/commit OAuth JSON, refresh/access token, cookie, proxy user/pass, Gemini key. Không đưa secret vào URL, API response, CSV export hay prompt bàn giao. DB, profile và backup phải luôn bị `.gitignore`.
+6. **Test không được chạm dữ liệu production:** mock `get_conn`/`add_log` khi cần, dùng DB trong bộ nhớ, không mở profile thật. Sau test phải kiểm tra không phát sinh dòng giả trong `system_logs`, không còn project/file `_TestZCode*`.
+7. **Sau mọi thay đổi:** chạy toàn bộ test, `py_compile`, `node --check static/app.js`; nếu sửa frontend phải tăng `app.js?v=N`; nếu sửa hành vi phải cập nhật `CHANGELOG.md` và file bàn giao khi cần.
+8. **Git:** không commit/push/đổi git config khi chưa được yêu cầu. Khi được yêu cầu commit, review `git status` + staged diff, loại secret, rồi mới commit. Không force-push, không reset/checkout làm mất công việc.
+9. **Báo cáo trung thực:** phân biệt rõ "đã test bằng code/DOM giả lập" với "đã chạy thật trên YouTube". Không tuyên bố upload/selector 18+ đã xác minh nếu chưa chạy thật.
+10. **Rule Antidetect:** Antidetect sở hữu profile/proxy/fingerprint. Không mở Chrome cục bộ bằng profile Antidetect, không ghi đè proxy/mobile/UA/stealth, không dùng YouTube Data API cho kênh Antidetect. Chỉ nối CDP, mở tab riêng và đóng đúng tab mình tạo; không đóng browser/context dùng chung.
+
+**Dữ liệu nhạy cảm KHÔNG nằm trong prompt này:** OAuth JSON/token, cookie Chrome, mật khẩu proxy, API key, nội dung DB/profile. Chúng chỉ tồn tại local và không được sao chép khi bàn giao.
+
+---
+
 ## 4. BẪY KỸ THUẬT ĐÃ TRẢ GIÁ (đừng mắc lại)
 
 1. **drawtext trên Windows qua argv:** đường dẫn phải escape 2 cấp — dấu `:` ổ đĩa thành `C\:/...` NGAY CẢ trong nháy đơn; dấu phẩy trong biểu thức filter phải `\,` (vd `x='w-mod(t*10\,w+tw)'`). Xem `_ff_path` trong render_engine.
@@ -96,8 +125,8 @@ Tiếp nhận bảo trì và nâng cấp tool "DHB Reup YouTube Studio" trên m�
 - Chạy server nền: `cd /d/DHB_Reup_YouTube_Studio && python app.py > /tmp/dhb.log 2>&1 &` rồi `sleep 7`.
 - Tắt: tìm PID `netstat -ano | grep :8686 | grep LISTENING` → `taskkill //F //PID <pid>` (Git Bash cần `//`).
 - Test bằng HTTP trực tiếp (requests/curl) tới 127.0.0.1:8686; tạo video mẫu bằng `ffmpeg -f lavfi testsrc + sine`; render thật qua `/api/pipeline/start` rồi ffprobe kiểm tra kích thước/thời luợng/audio stream.
-- Bộ test hiện tại nằm trong repo: `tests/test_p1_security.py`, `tests/test_p2_quality.py`, `tests/test_upload_gap_p0_7.py`, `tests/test_p0_fail_closed.py`, `tests/test_p1_p2_remaining.py`. Chạy toàn bộ: `PYTHONIOENCODING=utf-8 python -m unittest discover -s tests -v` (73 test).
-- Sau mọi thay đổi: chạy lại toàn bộ bộ test + `python -m py_compile app.py pipeline_manager.py youtube_uploader.py database.py render_engine.py scanner_downloader.py ai_engine.py config.py`; kiểm tra cú pháp JS bằng `node --check static/app.js`; dọn sạch project/file test (`_TestZCode*`) sau khi xong.
+- Bộ test hiện tại nằm trong repo: `tests/test_p1_security.py`, `tests/test_p2_quality.py`, `tests/test_upload_gap_p0_7.py`, `tests/test_p0_fail_closed.py`, `tests/test_p1_p2_remaining.py`, `tests/test_antidetect_integration.py` (file Antidetect chưa commit). Chạy toàn bộ: `PYTHONIOENCODING=utf-8 python -m unittest discover -s tests -v` (86 test trên working tree).
+- Sau mọi thay đổi: chạy lại toàn bộ bộ test + `python -m py_compile app.py api_security.py antidetect_client.py pipeline_manager.py youtube_uploader.py database.py render_engine.py scanner_downloader.py ai_engine.py config.py`; kiểm tra cú pháp JS bằng `node --check static/app.js`; dọn sạch project/file test (`_TestZCode*`) và kiểm tra DB thật không bị test ghi dữ liệu giả.
 - Kiểm thử Playwright không cần tài khoản thật: dùng trang HTML cục bộ + `page.route()` để giả lập DOM Studio (đã dùng cho P2). TUYỆT ĐỐI không upload thật khi chỉ đang test code.
 
 ---
@@ -112,16 +141,15 @@ Tiếp nhận bảo trì và nâng cấp tool "DHB Reup YouTube Studio" trên m�
 
 **P1 — hạn chế đã biết, đáng làm tiếp:**
 5. Chưa chặn ở UI khi bấm Start lô có kênh thiếu Channel ID (backend đã fail-closed; bảng kênh có badge "⚠️ Thiếu Channel ID").
-6. Chế độ YouTube API: OAuth JSON nhập tay, chưa có hướng dẫn lấy refresh token; API mode chủ động từ chối video 18+ (đúng thiết kế vì API không xác nhận được UI).
+6. Chế độ YouTube API: OAuth JSON nhập tay nhưng UI đã có hướng dẫn lấy refresh token; cần kiểm tra OAuth thật theo từng kênh khi dùng. API mode chủ động từ chối video 18+ (đúng thiết kế vì API không xác nhận được UI).
 7. Từ khóa Checks đã phủ nhiều ngôn ngữ phổ biến; ngôn ngữ Studio lạ sẽ fail-closed (an toàn nhưng không đăng) — có thể bổ sung thêm khi gặp thực tế.
 8. `bulk-group` được tham chiếu trong app.js nhưng không có trong HTML (null-guard, vô hại).
 9. Import đệ quy/ffprobe đã song song hóa — cần theo dõi hiệu năng thực tế với 100+ file.
 10. Monitor heartbeat/restart + dedupe đã có — cần theo dõi thực tế 24/7.
 
-**P2 — ý tưởng nâng cấp tiếp theo (chưa làm):**
-11. Tách hàng đợi render sang tiến trình pool riêng (hiện chạy trong thread pipeline).
-12. Export CSV định kỳ toàn bộ DB ra thư mục ngoài nếu chủ tool yêu cầu (backup SQLite 5 bản đã có).
-13. Git init/commit + branch workflow (hiện repo chưa có `.git`; `.gitignore` và CI đã chuẩn bị sẵn).
+**P2 — nâng cấp tiếp theo (không chặn vận hành):**
+11. Tách hàng đợi render sang process pool riêng nếu cần cô lập tiến trình; hiện hàng đợi render đã tách nhưng vẫn chạy trong tiến trình ứng dụng.
+12. Theo dõi CI GitHub Actions sau mỗi push; export CSV định kỳ và backup SQLite 5 bản đã có, không cần làm lại.
 
 ---
 
@@ -129,8 +157,10 @@ Tiếp nhận bảo trì và nâng cấp tool "DHB Reup YouTube Studio" trên m�
 
 - `app.js?v=18`, DB có các bảng: video_queue, youtube_channels, chrome_profiles (có login_status/last_login_check), channel_groups, upload_option_groups, projects, monitors, published_history, system_logs, app_settings, **render_presets**.
 - Settings toàn cục đáng chú ý: `checks_timeout_seconds` (120), `monitor_upload_gap_minutes` (30), `max_uploads_per_run` (0), `thumbnail_source` (reup), `download_resolution_tiktok` (720p), `max_concurrent_threads` (2), `upload_delay_seconds` (10).
-- Bảo mật cục bộ: mọi `/api/*` (trừ `/api/auth/token`) yêu cầu header `X-DHB-Token`; Host phải là localhost; request thay đổi trạng thái phải có Origin localhost (`api_security.py`). Frontend tự lấy token bằng `ensureApiToken()` và gửi kèm trong `apiFetch()`.
+- Bảo mật cục bộ: mọi `/api/*` (trừ `/api/auth/token`) yêu cầu header `X-DHB-Token`; Host phải là localhost; request thay đổi trạng thái phải có Origin localhost (`api_security.py`). Frontend tự lấy token bằng `ensureApiToken()` và tự refresh/thử lại một lần khi gặp 401 sau restart server.
 - Upload fail-closed: thiếu Channel ID, không đọc được ID thực tế, không thấy Checks an toàn, không xác nhận 18+, hoặc không lấy được URL video sau khi bấm Đăng → coi như lỗi/không chắc chắn, không báo Completed, không move/xóa file nguồn.
-- Lần cuối kiểm chứng: 2026-10-26 — **61/61 test PASS** (`python -m unittest discover -s tests`), `python -m py_compile` sạch, chưa chạy upload thật trong phiên này.
+- Snapshot DB ngày 2026-10-26: 7 kênh đều thuộc nhóm `Mặc định` và đều trống `channel_id`; nhóm `Default` cũ đã được chuẩn hóa; bảng monitors đang trống. Đây là snapshot bàn giao, phải query lại trước khi thao tác.
+- Git: nhánh `main`, remote GitHub private `meolucky051101001-cyber/DHB_Reup_YouTube_Studio`; commit baseline `0d32cd5`. Không có DB/OAuth/profile/log/backup nào được track. Working tree hiện có thay đổi Antidetect chưa commit, phải đọc `git status`/`git diff` trước khi tiếp tục.
+- Lần cuối kiểm chứng: 2026-10-26 — **86/86 test PASS** trên working tree (`python -m unittest discover -s tests -v`), `python -m py_compile` sạch, `node --check static/app.js` sạch, chưa chạy upload thật trong phiên này.
 
-*(Hết prompt bàn giao — đọc kỹ mục 3, 4, 6 trước khi bắt tay vào việc.)*
+*(Hết prompt bàn giao — đọc kỹ mục 3, 3A, 4, 6 trước khi bắt tay vào việc.)*

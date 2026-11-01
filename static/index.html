@@ -948,7 +948,7 @@
             </div>
             <div>
               <label>Tên Thư Mục Profile Chrome:</label>
-              <input type="text" id="ch-prof-name" placeholder="Ví dụ: Công chính" />
+              <input type="text" id="ch-prof-name" placeholder="Ví dụ: Công chính" oninput="onProfileNameTyped()" />
             </div>
           </div>
           <div class="form-group">
@@ -1119,7 +1119,11 @@
       <div class="card" style="margin-top:12px;">
         <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
           <div class="card-title">👤 Quản Lý Profile Chrome & Trạng Thái Đăng Nhập Google</div>
-          <button class="btn btn-outline btn-sm" onclick="loadProfiles()">🔄 Làm Mới Danh Sách</button>
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <span id="antidetect-status" style="font-size:11px; color:var(--text-muted);">Antidetect: chưa kiểm tra</span>
+            <button class="btn btn-accent btn-sm" onclick="syncAntidetectProfiles()" title="Kéo Profile từ Antidetect về tool (không lấy mật khẩu proxy)">🔗 Đồng Bộ Antidetect</button>
+            <button class="btn btn-outline btn-sm" onclick="loadProfiles()">🔄 Làm Mới Danh Sách</button>
+          </div>
         </div>
         <div class="table-wrap" style="max-height:340px;">
           <table>
@@ -1140,6 +1144,7 @@
           💡 <b>🔍 Kiểm Tra</b>: Chrome mở ở vị trí khuất, tự kiểm tra phiên đăng nhập Google và xem trước danh sách kênh YouTube thật trong Profile (~10–20 giây).
           <b>🔄 Quét Kênh</b>: cập nhật danh sách kênh YouTube thật vào hệ thống để chọn đích đăng.
           <b>🌐 Mở Đăng Nhập</b>: mở Chrome để bạn đăng nhập Google thủ công (đóng Chrome sau khi xong).
+          <b>🔗 Đồng Bộ Antidetect</b>: dùng chung Profile/Proxy/Fingerprint của Antidetect; chỉ cần đăng nhập Google một lần trong Antidetect, tool đăng bài sẽ mở tab trên chính trình duyệt đó (không tự mở Chrome riêng).
           Hệ thống luôn chạy định danh Windows Desktop nguyên bản — không bao giờ ép User-Agent di động vào Profile Windows (chống Checkpoint).
         </div>
       </div>
@@ -1771,6 +1776,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=18"></script>
+  <script src="/static/app.js?v=19"></script>
 </body>
 </html>

@@ -610,8 +610,43 @@ async function loadProfiles() {
     if (chProfSelect) chProfSelect.innerHTML = `<option value="">-- Tự nhập tên profile mới --</option>` + profOpts;
 
     renderProfilesTable();
+    refreshAntidetectStatus();
   } catch (e) {
     console.error("Lỗi loadProfiles:", e);
+  }
+}
+
+async function refreshAntidetectStatus() {
+  const el = document.getElementById('antidetect-status');
+  if (!el) return;
+  try {
+    const st = await apiFetch('/api/antidetect/status');
+    if (st.connected) {
+      el.innerHTML = `<span style="color:#34d399;">🟢 Antidetect: ${Number(st.profile_count || 0)} profile</span>`;
+      el.title = st.base_url || '';
+    } else {
+      el.innerHTML = '<span style="color:#fb7185;">🔴 Antidetect: chưa kết nối</span>';
+      el.title = st.error || '';
+    }
+  } catch (e) {
+    el.innerHTML = '<span style="color:#fb7185;">🔴 Antidetect: chưa kết nối</span>';
+    el.title = e.message;
+  }
+}
+
+async function syncAntidetectProfiles() {
+  showToast('🔗 Đang đồng bộ Profile từ Antidetect...', 'info');
+  try {
+    const res = await apiFetch('/api/antidetect/sync', { method: 'POST' });
+    let msg = `✅ Đồng bộ Antidetect xong:\n- Thêm mới: ${res.added}\n- Cập nhật: ${res.updated}\n- Bỏ qua: ${res.skipped}`;
+    if (res.missing && res.missing.length) {
+      msg += `\n\n⚠️ ${res.missing.length} Profile đã đồng bộ trước đây không còn trong Antidetect:\n${res.missing.join(', ')}`;
+    }
+    alert(msg);
+    await loadProfiles();
+    await refreshAntidetectStatus();
+  } catch (e) {
+    alert('Lỗi đồng bộ Antidetect: ' + e.message);
   }
 }
 
@@ -635,18 +670,33 @@ function renderProfilesTable() {
     if (st === 'Đã đăng nhập') stBadge = '<span class="badge badge-ok">✅ Đã đăng nhập</span>';
     else if (st === 'Chưa đăng nhập') stBadge = '<span class="badge badge-err">❌ Chưa đăng nhập</span>';
 
+    const isAd = (p.source === 'Antidetect') || !!p.antidetect_profile_id;
+    const sourceLabel = p.source || (isAd ? 'Antidetect' : 'DHB');
+    const sourceClass = sourceLabel === 'Antidetect' ? 'badge-purple' : (sourceLabel === 'DHB' ? 'badge-video' : 'badge-shorts');
+    const pathLine = isAd
+      ? `ID: ${escapeHtml(p.antidetect_profile_id || '')}`
+      : escapeHtml(p.path || '');
+    const proxyCell = isAd
+      ? (p.proxy
+          ? `<span style="color:#38bdf8;">${escapeHtml(p.proxy)}</span><div style="font-size:10px; color:var(--text-muted);">Antidetect quản lý</div>`
+          : '<span style="color:var(--text-muted);">Theo Antidetect</span>')
+      : (p.proxy ? escapeHtml(p.proxy) : '<span style="color:var(--text-muted)">Trực tiếp</span>');
+    const proxyBtn = isAd
+      ? '<button class="btn btn-outline btn-sm" disabled title="Proxy do Antidetect quản lý — sửa trong Antidetect">🔒</button>'
+      : `<button class="btn btn-outline btn-sm" onclick="profileEditProxy('${escapeJs(p.name)}')" title="Sửa Proxy của Profile">⚙️</button>`;
+
     return `
       <tr>
-        <td><b>${escapeHtml(p.name)}</b><div style="font-size:10.5px; color:var(--text-muted);">${escapeHtml(p.path || '')}</div></td>
-        <td><span class="badge ${p.source === 'DHB' ? 'badge-video' : 'badge-shorts'}">${escapeHtml(p.source || 'DHB')}</span></td>
-        <td style="font-size:11px; color:#38bdf8;">${p.proxy ? escapeHtml(p.proxy) : '<span style="color:var(--text-muted)">Trực tiếp</span>'}</td>
+        <td><b>${escapeHtml(p.name)}</b><div style="font-size:10.5px; color:var(--text-muted);">${pathLine}</div></td>
+        <td><span class="badge ${sourceClass}">${escapeHtml(sourceLabel)}</span></td>
+        <td style="font-size:11px; color:#38bdf8;">${proxyCell}</td>
         <td>${p.channel_count || 0}</td>
         <td>${stBadge}${p.last_login_check ? `<div style="font-size:10px; color:var(--text-muted)">${escapeHtml(p.last_login_check)}</div>` : ''}</td>
         <td>
           <button class="btn btn-success btn-sm" onclick="profileOpenBrowser('${escapeJs(p.name)}')" title="Mở Chrome để đăng nhập Google thủ công">🌐 Mở Đăng Nhập</button>
           <button class="btn btn-accent btn-sm" onclick="profileCheckLogin('${escapeJs(p.name)}')" title="Tự kiểm tra phiên đăng nhập Google của Profile">🔍 Kiểm Tra</button>
           <button class="btn btn-purple btn-sm" onclick="profileRefreshChannels('${escapeJs(p.name)}')" title="Quét danh sách kênh YouTube thật trong Profile">🔄 Quét Kênh</button>
-          <button class="btn btn-outline btn-sm" onclick="profileEditProxy('${escapeJs(p.name)}')" title="Sửa Proxy của Profile">⚙️</button>
+          ${proxyBtn}
           <button class="btn btn-outline btn-sm" style="color:#f87171; border-color:rgba(248,113,113,0.3);" onclick="profileDelete('${escapeJs(p.name)}')" title="Xóa Profile khỏi hệ thống (không xóa thư mục)">🗑️</button>
         </td>
       </tr>
@@ -656,16 +706,20 @@ function renderProfilesTable() {
 
 async function profileOpenBrowser(name) {
   try {
-    showToast('🌐 Đang mở Chrome để đăng nhập...', 'info');
+    showToast('🌐 Đang mở Profile để đăng nhập...', 'info');
     const res = await apiFetch(`/api/profiles/${encodeURIComponent(name)}/open-browser`, { method: 'POST' });
-    alert(res.message + '\n\nHãy đăng nhập tài khoản Google/YouTube trên cửa sổ Chrome vừa mở (kèm Proxy nếu có), sau đó đóng lại và bấm "🔍 Kiểm Tra".');
+    if (res.antidetect) {
+      alert(res.message);
+    } else {
+      alert(res.message + '\n\nHãy đăng nhập tài khoản Google/YouTube trên cửa sổ Chrome vừa mở (kèm Proxy nếu có), sau đó đóng lại và bấm "🔍 Kiểm Tra".');
+    }
   } catch (e) {
     alert('Lỗi mở trình duyệt: ' + e.message);
   }
 }
 
 async function profileCheckLogin(name) {
-  showToast(`🔍 Đang kiểm tra đăng nhập Profile "${name}" (~10-20 giây, Chrome mở khuất)...`, 'info');
+  showToast(`🔍 Đang kiểm tra đăng nhập Profile "${name}" (~10-20 giây)...`, 'info');
   try {
     const res = await apiFetch(`/api/profiles/${encodeURIComponent(name)}/check-login`, { method: 'POST' });
     if (res.logged_in) {
@@ -709,6 +763,10 @@ async function profileRefreshChannels(name) {
 
 async function profileEditProxy(name) {
   const p = gProfiles.find(x => x.name === name);
+  if (p && (p.source === 'Antidetect' || p.antidetect_profile_id)) {
+    alert('Proxy của Profile này do Antidetect quản lý. Hãy sửa proxy trong Antidetect rồi bấm "🔗 Đồng Bộ Antidetect".');
+    return;
+  }
   const cur = p ? (p.proxy || '') : '';
   const proxy = prompt(
     `Proxy cho Profile "${name}"\nĐịnh dạng: IP:PORT hoặc IP:PORT:USER:PASS\nĐể trống = dùng mạng trực tiếp.\n(Lưu ý: cả đăng nhập lẫn đăng tự động sẽ đi qua Proxy này)`,
@@ -791,12 +849,42 @@ async function onModalProfileChange() {
   }
 }
 
+function _applyChannelProfileMode(found) {
+  const isAd = !!(found && (found.source === 'Antidetect' || found.antidetect_profile_id));
+  const modeEl = document.getElementById('ch-mode');
+  const proxyEl = document.getElementById('ch-proxy');
+  if (modeEl) {
+    modeEl.disabled = isAd;
+    if (isAd) modeEl.value = 'playwright';
+    modeEl.title = isAd ? 'Profile Antidetect chỉ hỗ trợ đăng qua trình duyệt Playwright' : '';
+  }
+  if (proxyEl) {
+    proxyEl.disabled = isAd;
+    if (isAd) {
+      proxyEl.value = '';
+      proxyEl.placeholder = 'Theo Antidetect (tự quản lý proxy/phiên)';
+    } else {
+      proxyEl.placeholder = 'Để trống nếu dùng mạng trực tiếp';
+    }
+  }
+  return isAd;
+}
+
+function onProfileNameTyped() {
+  const name = (document.getElementById('ch-prof-name').value || '').trim();
+  _applyChannelProfileMode(gProfiles.find(p => p.name === name));
+}
+
 function onSelectExistingProfile(profName) {
+  const found = gProfiles.find(p => p.name === profName);
+  _applyChannelProfileMode(found);
   if (!profName) return;
   document.getElementById('ch-prof-name').value = profName;
-  const found = gProfiles.find(p => p.name === profName);
   if (found && found.path) {
     document.getElementById('ch-prof-path').value = found.path;
+  }
+  if (found && (found.source === 'Antidetect' || found.antidetect_profile_id)) {
+    showToast('🔗 Profile Antidetect: tool sẽ dùng chung trình duyệt, proxy và fingerprint của Antidetect.', 'info');
   }
 }
 
