@@ -258,6 +258,33 @@ def _extract_api_token(request: Request) -> str:
     return token
 
 
+_JSON_SECRET_KEYS = {
+    "access_token", "refresh_token", "id_token", "auth_token", "session_token",
+    "oauth_token", "oauth_token_json", "api_key", "apikey", "client_secret",
+    "secret", "password", "passwd", "cookie", "authorization",
+}
+
+
+def _redact_json_value(value: Any, secrets: List[str]) -> Any:
+    """Redact JSON values structurally so text patterns cannot corrupt JSON syntax."""
+    if isinstance(value, dict):
+        safe = {}
+        for key, child in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+            is_secret = (
+                normalized_key in _JSON_SECRET_KEYS
+                or normalized_key.endswith(("_api_key", "_client_secret", "_password", "_passwd"))
+                or normalized_key.endswith("_token")
+            )
+            safe[key] = "***" if is_secret and isinstance(child, str) else _redact_json_value(child, secrets)
+        return safe
+    if isinstance(value, list):
+        return [_redact_json_value(item, secrets) for item in value]
+    if isinstance(value, str):
+        return redact_secrets(value, secrets)
+    return value
+
+
 @app.middleware("http")
 async def guard_local_api(request: Request, call_next):
     if not is_allowed_host(request.headers.get("host", "")):
@@ -276,22 +303,42 @@ async def guard_local_api(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     content_type = response.headers.get("content-type", "").lower()
-    if path != "/api/auth/token" and "application/json" in content_type:
+    if (
+        path != "/api/auth/token"
+        and response.status_code not in {204, 304}
+        and ("application/json" in content_type or "+json" in content_type)
+    ):
         try:
             raw_body = b"".join([chunk async for chunk in response.body_iterator])
-            safe_body = redact_secrets(raw_body.decode("utf-8", errors="replace")).encode("utf-8")
-            response_headers = {
-                key: value for key, value in response.headers.items()
-                if key.lower() not in {"content-length", "content-encoding"}
-            }
-            return Response(
+            payload = json.loads(raw_body.decode("utf-8"))
+            safe_payload = _redact_json_value(payload, collect_secret_values())
+            safe_body = json.dumps(safe_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            safe_response = Response(
                 content=safe_body,
                 status_code=response.status_code,
-                headers=response_headers,
+                media_type=response.headers.get("content-type", "application/json"),
                 background=response.background,
             )
         except Exception:
-            pass
+            # The endpoint may already have completed a mutation. Do not return
+            # the consumed body (which may contain credentials) or imply success.
+            safe_response = JSONResponse(
+                {"detail": "Không thể tạo phản hồi JSON an toàn."},
+                status_code=500,
+                background=response.background,
+            )
+            safe_response.headers["X-Content-Type-Options"] = "nosniff"
+
+        # Preserve repeated headers such as Set-Cookie, while dropping metadata
+        # that describes the old representation or encoding.
+        invalidated = {
+            b"content-length", b"content-encoding", b"transfer-encoding",
+            b"content-type", b"etag", b"content-md5", b"digest",
+        }
+        generated = [item for item in safe_response.raw_headers if item[0].lower() in {b"content-type", b"content-length"}]
+        preserved = [item for item in response.raw_headers if item[0].lower() not in invalidated]
+        safe_response.raw_headers = preserved + generated
+        return safe_response
     return response
 
 

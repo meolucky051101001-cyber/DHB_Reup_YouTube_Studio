@@ -9,6 +9,8 @@
 Toàn bộ chạy trên DB tạm riêng; không chạm dữ liệu thật.
 """
 import io
+import asyncio
+import json
 import os
 import shutil
 import sys
@@ -25,6 +27,8 @@ import database
 import pipeline_manager as pm
 from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
+from starlette.requests import Request
+from starlette.responses import StreamingResponse
 
 _OLD_DB = database.APP_DB_PATH
 _OLD_DATA = database.APP_DATA_DIR
@@ -408,6 +412,65 @@ class SmokeTests(unittest.TestCase):
 
         headers["Origin"] = "http://127.0.0.1:8686"
         self.assertEqual(client.post(probe, headers=headers).status_code, 404)
+
+
+class JsonResponseRedactionTests(unittest.TestCase):
+    def _request(self):
+        return Request({
+            "type": "http", "method": "GET", "path": "/acceptance-json",
+            "headers": [(b"host", b"127.0.0.1:8686")], "scheme": "http",
+            "server": ("127.0.0.1", 8686), "query_string": b"",
+        })
+
+    def test_redacts_json_values_without_changing_structure_or_headers(self):
+        payload = {
+            "message": "Cookie: SID=sample",
+            "text": '"quoted"\\line\nnext',
+            "authorization": "Bearer sample-token",
+            "nested": [{"api_key": "sample-key", "refresh_token": "sample-refresh", "ok": True}],
+            "count": 7,
+        }
+
+        async def call_next(_request):
+            async def chunks():
+                yield json.dumps(payload).encode("utf-8")
+            response = StreamingResponse(chunks(), media_type="application/json")
+            response.raw_headers.append((b"set-cookie", b"a=1; HttpOnly"))
+            response.raw_headers.append((b"set-cookie", b"b=2; HttpOnly"))
+            return response
+
+        async def run():
+            with mock.patch.object(app_module, "collect_secret_values", return_value=[]):
+                return await app_module.guard_local_api(self._request(), call_next)
+
+        response = asyncio.run(run())
+        result = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(result["message"], "Cookie: ***")
+        self.assertEqual(result["text"], '"quoted"\\line\nnext')
+        self.assertEqual(result["authorization"], "***")
+        self.assertEqual(result["nested"][0]["api_key"], "***")
+        self.assertEqual(result["nested"][0]["refresh_token"], "***")
+        self.assertIs(result["nested"][0]["ok"], True)
+        self.assertEqual(result["count"], 7)
+        self.assertEqual(int(response.headers["content-length"]), len(response.body))
+        self.assertEqual(sum(1 for key, _ in response.raw_headers if key.lower() == b"set-cookie"), 2)
+
+    def test_invalid_json_fails_closed_without_echoing_body(self):
+        async def call_next(_request):
+            async def chunks():
+                yield b'{"cookie": "Cookie: SID=secret"'
+            return StreamingResponse(chunks(), media_type="application/json")
+
+        async def run():
+            with mock.patch.object(app_module, "collect_secret_values", return_value=[]):
+                return await app_module.guard_local_api(self._request(), call_next)
+
+        response = asyncio.run(run())
+        result = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn("SID=secret", response.body.decode("utf-8"))
+        self.assertIn("detail", result)
 
 
 if __name__ == "__main__":
