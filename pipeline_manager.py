@@ -56,6 +56,92 @@ def _monitor_source_already_published(conn, source_post_id: str, target_channel_
     return row is not None
 
 
+# Điều kiện "nguồn này đã nằm trong hàng đợi của monitor, cùng đích đăng" — dùng ở cả
+# bước lọc khi quét LẪN trong chính câu INSERT (chống TOCTOU: monitor quét xong phải
+# gọi AI hàng chục giây rồi mới insert, monitor khác cùng đích kịp chen hàng giống hệt).
+# Cùng nhóm kênh = cùng vòng xoay kênh (chia theo id video) nên coi là cùng đích.
+_MONITOR_QUEUED_PREDICATE = """
+        post_id = :pid
+        AND (
+            project_name = :own_project
+            OR (
+                project_name LIKE 'Monitor -%'
+                AND COALESCE(target_channel_id, -1) = COALESCE(:chan, -1)
+                AND COALESCE(target_group_name, '') = COALESCE(:grp, '')
+            )
+        )
+    """
+
+
+def _monitor_source_queued(conn, pid: str, own_project: str, chan, grp) -> bool:
+    """Nguồn đã được monitor nào đó cùng đích (hoặc chính monitor này) đưa vào hàng đợi?"""
+    if not pid:
+        return False
+    grp_norm = grp or "Mặc định"  # chuẩn hóa như insert_monitor_queue_item
+    row = conn.execute(
+        f"SELECT id FROM video_queue WHERE {_MONITOR_QUEUED_PREDICATE} LIMIT 1",
+        {"pid": pid, "own_project": own_project, "chan": chan, "grp": grp_norm},
+    ).fetchone()
+    return row is not None
+
+
+def insert_monitor_queue_item(
+    conn,
+    proj_name: str,
+    mon: Dict[str, Any],
+    item_data: Dict[str, Any],
+    title: str,
+    desc: str,
+    tags: str,
+) -> Optional[int]:
+    """Insert hàng monitor vào video_queue một cách NGUYÊN TỨC: chỉ chèn khi chưa có
+    dòng nào trùng nguồn (cùng đích đăng). Trả về id dòng mới, hoặc None nếu bị chặn."""
+    grp_norm = mon.get("target_group_name") or "Mặc định"
+    cur = conn.execute(
+        f"""
+        INSERT INTO video_queue (
+            project_name, source_type, platform, post_id, source_url, input_video_path,
+            title, description, tags, duration, view_count, like_count,
+            upload_to, visibility, target_type, target_channel_id, target_group_name,
+            option_group_id, render_mode, render_config_json, emulate_mobile, status
+        )
+        SELECT
+            :proj, :src_type, :platform, :pid, :src_url, :input_path,
+            :title, :desc, :tags, :duration, :views, :likes,
+            :upload_to, 'public', :target_type, :chan, :grp,
+            :opt_id, :render_mode, :render_cfg, 0, 'Pending'
+        WHERE NOT EXISTS (
+            SELECT 1 FROM video_queue WHERE {_MONITOR_QUEUED_PREDICATE}
+        )
+        """,
+        {
+            "proj": proj_name,
+            "src_type": item_data["source_type"],
+            "platform": item_data["platform"],
+            "pid": item_data["post_id"],
+            "src_url": item_data["source_url"],
+            "input_path": item_data["input_video_path"],
+            "title": title,
+            "desc": desc,
+            "tags": tags,
+            "duration": item_data["duration"],
+            "views": item_data["view_count"],
+            "likes": item_data["like_count"],
+            "upload_to": mon.get("upload_to") or "Shorts",
+            "target_type": "CHANNEL" if mon.get("target_channel_id") else "GROUP",
+            "chan": mon.get("target_channel_id"),
+            "grp": grp_norm,
+            "opt_id": mon.get("option_group_id"),
+            "render_mode": mon.get("render_mode") or "shorts_9_16",
+            "render_cfg": mon.get("render_config_json") or "{}",
+            "own_project": proj_name,
+        },
+    )
+    if cur.rowcount != 1:
+        return None
+    return cur.lastrowid
+
+
 class RenderQueue:
     """Pool render riêng: FFmpeg đã chạy ở process con, lớp này giới hạn số render đồng thời
     độc lập với số luồng tải/đăng của pipeline."""
@@ -201,8 +287,13 @@ def release_item_claim(item_id: int, token: str):
         )
         conn.commit()
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        # Claim bị rò rỉ khiến các lượt chạy sau bỏ qua video này ("đang được tiến trình
+        # khác xử lý") cho tới khi restart — bắt buộc ghi log để nhận diện được.
+        try:
+            add_log("Pipeline", f"Không giải phóng được claim của video #{item_id}: {e}", "WARNING")
+        except Exception:
+            pass
 
 
 def reserve_upload_slot(stop_event: threading.Event) -> bool:
@@ -257,14 +348,95 @@ class PipelineManager:
         return self._is_running
 
     def clear_stale_claims(self):
-        """Dọn claim còn sót từ phiên app trước (gọi một lần lúc khởi động)."""
+        """Phục hồi job mồ côi sau khi app đã giữ singleton lock.
+
+        Một job giữa bước upload có thể đã được nhận bởi YouTube trước khi tiến
+        trình cũ dừng. Job đó cần đối soát thay vì retry tự động. Download/render
+        bị ngắt có thể được chạy lại từ file nguồn còn lưu.
+        """
         try:
             conn = get_conn()
-            conn.execute("UPDATE video_queue SET claim_token = ''")
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
+            try:
+                cur = conn.execute("""
+                    UPDATE video_queue
+                    SET status = CASE
+                            WHEN status LIKE 'Uploading%'
+                              OR status LIKE 'Đang đăng%'
+                              OR status LIKE 'Verifying%'
+                              OR status LIKE 'Đang xác minh%'
+                              OR (
+                                  COALESCE(claim_token, '') != ''
+                                  AND status NOT IN ('Pending', 'Downloaded', 'Rendered', 'Error', 'Stopped', 'Completed')
+                                  AND status NOT LIKE 'Downloading%'
+                                  AND status NOT LIKE 'Đang tải%'
+                                  AND status NOT LIKE 'Rendering%'
+                                  AND status NOT LIKE 'Đang Render%'
+                                  AND status NOT LIKE 'Chờ giãn cách đăng%'
+                                  AND status NOT LIKE '%Bản Quyền%'
+                              )
+                              OR (status = 'Completed' AND COALESCE(published_url, '') = '' AND COALESCE(claim_token, '') != '')
+                            THEN 'NeedsReview'
+                            WHEN status LIKE 'Downloading%'
+                              OR status LIKE 'Đang tải%'
+                              OR status LIKE 'Rendering%'
+                              OR status LIKE 'Đang Render%'
+                              OR status LIKE 'Chờ giãn cách đăng%'
+                            THEN 'Pending'
+                            ELSE status
+                        END,
+                        error_message = CASE
+                            WHEN status LIKE 'Uploading%'
+                              OR status LIKE 'Đang đăng%'
+                              OR status LIKE 'Verifying%'
+                              OR status LIKE 'Đang xác minh%'
+                              OR (
+                                  COALESCE(claim_token, '') != ''
+                                  AND status NOT IN ('Pending', 'Downloaded', 'Rendered', 'Error', 'Stopped', 'Completed')
+                                  AND status NOT LIKE 'Downloading%'
+                                  AND status NOT LIKE 'Đang tải%'
+                                  AND status NOT LIKE 'Rendering%'
+                                  AND status NOT LIKE 'Đang Render%'
+                                  AND status NOT LIKE 'Chờ giãn cách đăng%'
+                                  AND status NOT LIKE '%Bản Quyền%'
+                              )
+                              OR (status = 'Completed' AND COALESCE(published_url, '') = '' AND COALESCE(claim_token, '') != '')
+                            THEN 'Tiến trình cũ dừng khi đang đăng hoặc xác minh. Hãy kiểm tra YouTube Studio trước khi chạy lại.'
+                            WHEN status LIKE 'Downloading%'
+                              OR status LIKE 'Đang tải%'
+                              OR status LIKE 'Rendering%'
+                              OR status LIKE 'Đang Render%'
+                              OR status LIKE 'Chờ giãn cách đăng%'
+                            THEN 'Tiến trình cũ bị ngắt trước bước đăng; có thể tiếp tục xử lý.'
+                            ELSE error_message
+                        END,
+                        claim_token = ''
+                    WHERE COALESCE(claim_token, '') != ''
+                       OR status LIKE 'Uploading%'
+                       OR status LIKE 'Đang đăng%'
+                       OR status LIKE 'Verifying%'
+                       OR status LIKE 'Đang xác minh%'
+                       OR status LIKE 'Downloading%'
+                       OR status LIKE 'Đang tải%'
+                       OR status LIKE 'Rendering%'
+                       OR status LIKE 'Đang Render%'
+                       OR status LIKE 'Chờ giãn cách đăng%'
+                       OR (status = 'Completed' AND COALESCE(published_url, '') = '' AND COALESCE(claim_token, '') != '')
+                """)
+                conn.commit()
+                recovered = cur.rowcount
+            finally:
+                conn.close()
+            if recovered:
+                add_log(
+                    "Pipeline",
+                    f"Đã phục hồi {recovered} job bị ngắt; lượt upload chưa xác minh được giữ ở Cần đối soát.",
+                    "WARNING",
+                )
+        except Exception as e:
+            try:
+                add_log("Pipeline", f"Không dọn được claim_token cũ lúc khởi động: {e}", "WARNING")
+            except Exception:
+                pass
 
     def stop_all(self):
         self._stop_event.set()
@@ -297,8 +469,12 @@ class PipelineManager:
             """)
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            # Lỗi ở đây khiến UI hiển thị sai trạng thái (vẫn Pending dù đã yêu cầu dừng).
+            try:
+                add_log("Pipeline", f"Không cập nhật được trạng thái Stopped khi dừng lô: {e}", "ERROR")
+            except Exception:
+                pass
 
         add_log(
             "Pipeline",
@@ -475,6 +651,18 @@ class PipelineManager:
 
         existing_status = (item.get("status") or "").strip()
         published_url = (item.get("published_url") or "").strip()
+        # A publish request may already have reached YouTube even when Studio did
+        # not return a verifiable URL. Never turn that ambiguous result into an
+        # automatic retry, including when force_reupload was requested.
+        if do_upload and existing_status == "NeedsReview":
+            add_log(
+                "Pipeline",
+                f"Giữ '{title}' ở trạng thái cần đối soát: lượt đăng trước chưa xác minh. "
+                "Kiểm tra YouTube Studio trước khi quyết định đăng lại.",
+                "WARNING",
+                video_title=title,
+            )
+            return
         if do_upload and not force_reupload:
             if existing_status == "Completed" or published_url:
                 add_log(
@@ -515,13 +703,20 @@ class PipelineManager:
 
         def _update_row(**kwargs):
             if not kwargs:
-                return
+                return False
             cols = ", ".join(f"{k} = ?" for k in kwargs.keys())
-            vals = list(kwargs.values()) + [item_id]
+            vals = list(kwargs.values()) + [item_id, token]
             c = get_conn()
-            c.execute(f"UPDATE video_queue SET {cols} WHERE id = ?", vals)
-            c.commit()
-            c.close()
+            try:
+                cur = c.execute(
+                    f"UPDATE video_queue SET {cols} WHERE id = ? AND COALESCE(claim_token, '') = ?",
+                    vals,
+                )
+                c.commit()
+                updated = cur.rowcount == 1
+            finally:
+                c.close()
+            return updated
 
         def _make_progress_cb(progress_col: str):
             state = {"last_pct": -1, "last_time": 0.0}
@@ -533,7 +728,9 @@ class PipelineManager:
                 if pct >= 100 or abs(pct - state["last_pct"]) >= 3 or (now - state["last_time"]) >= 0.8:
                     state["last_pct"] = pct
                     state["last_time"] = now
-                    _update_row(**{progress_col: pct, "status": msg})
+                    # Progress messages are not lifecycle states. Keeping status
+                    # stable also prevents a late callback from reviving a stopped row.
+                    _update_row(**{progress_col: pct})
 
             return _cb
 
@@ -551,6 +748,7 @@ class PipelineManager:
                     source_url=item.get("source_url") or "",
                     post_id=item.get("post_id") or str(item_id),
                     progress_callback=_make_progress_cb("download_progress"),
+                    stop_event=se,
                 )
                 input_path = dl_res["video_path"]
                 thumb_path = dl_res.get("thumbnail_path") or thumb_path
@@ -718,6 +916,8 @@ class PipelineManager:
                     is_uncertain = False
                     warning_msg = ""
 
+                result_unverified = is_uncertain or not (pub_url or "").strip()
+
                 if is_cancelled:
                     _update_row(
                         upload_progress=100,
@@ -745,7 +945,7 @@ class PipelineManager:
                         channel_name=channel["name"],
                         video_title=title,
                     )
-                elif is_uncertain or not (pub_url or "").strip():
+                elif result_unverified:
                     # Đã bấm Xuất bản nhưng không xác minh được URL video.
                     # Không được báo Completed và không tự xóa/move file nguồn.
                     uncertain_msg = warning_msg or (
@@ -754,7 +954,7 @@ class PipelineManager:
                     )
                     _update_row(
                         upload_progress=100,
-                        status="Error",
+                        status="NeedsReview",
                         error_message=uncertain_msg,
                     )
                     add_log(
@@ -771,6 +971,8 @@ class PipelineManager:
                         published_url=pub_url,
                         error_message="",
                     )
+                    # Ghi lịch sử cho MỌI nguồn (link, kéo-thả, local path), không chỉ Monitor.
+                    self._record_published_history_for_item(item_id, channel)
                     add_log(
                         "Upload",
                         f"✅ Đăng thành công lên kênh [{channel['name']}]: {pub_url}",
@@ -781,7 +983,7 @@ class PipelineManager:
 
                 # Tự động di chuyển video nguồn trên máy vào thư mục uploaded/ (chỉ khi đăng thành công)
                 is_local_file = item.get("source_type") in ("File", "LocalFile") or item.get("platform") == "LocalFile"
-                if not is_cancelled and not is_uncertain and pub_url and is_local_file and input_path and os.path.exists(input_path):
+                if not is_cancelled and not result_unverified and pub_url and is_local_file and input_path and os.path.exists(input_path):
                     try:
                         p = Path(input_path)
                         if p.parent.name != "uploaded":
@@ -797,7 +999,7 @@ class PipelineManager:
 
                 # Xóa file tạm nếu cài đặt yêu cầu — chỉ xóa file nằm trong thư mục temp/ của tool
                 settings = get_settings()
-                if settings.get("delete_temp_after_upload") and input_path and not is_uncertain:
+                if settings.get("delete_temp_after_upload") and input_path and not result_unverified:
                     try:
                         real_input = os.path.realpath(input_path)
                         temp_root = os.path.realpath(str(APP_TEMP_DIR))
@@ -1123,6 +1325,36 @@ class PipelineManager:
         conn.commit()
         conn.close()
 
+    @staticmethod
+    def _record_published_history_for_item(queue_id: int, channel: Dict[str, Any]) -> bool:
+        """Ghi published_history cho lượt đăng Completed có link thật.
+
+        Trước đây chỉ Auto Monitor ghi bảng này, nên video Completed từ link /
+        kéo-thả / đường dẫn local không được lưu lịch sử và việc chống đăng lại
+        chỉ còn dựa vào video_queue. Dùng cùng khóa (post_id, channel_id) với
+        Monitor; post_id rỗng thì lấy khóa theo id hàng đợi để không gộp nhầm.
+        """
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT status, published_url, post_id, source_url FROM video_queue WHERE id = ?",
+                (queue_id,),
+            ).fetchone()
+            if not row:
+                return False
+            if (row["status"] or "").strip() != "Completed" or not (row["published_url"] or "").strip():
+                return False
+            post_id = (row["post_id"] or "").strip() or f"queue:{queue_id}"
+            conn.execute(
+                "INSERT OR IGNORE INTO published_history "
+                "(source_post_id, source_url, channel_id, published_url) VALUES (?, ?, ?, ?)",
+                (post_id, row["source_url"] or "", channel.get("id"), (row["published_url"] or "").strip()),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
     def _record_monitor_published(self, queue_id: int, item_data: Dict[str, Any], mon: Dict[str, Any]) -> bool:
         """Ghi published_history CHỈ khi video đã Completed và có link thật. Trả về True nếu đã ghi."""
         conn = get_conn()
@@ -1163,7 +1395,12 @@ class PipelineManager:
 
             try:
                 self._update_monitor_status(monitor_id, f"Đang quét {len(urls)} nguồn...")
-                scanned = scan_social_urls(urls, max_items_per_url=max_vids * 2, min_views=min_views)
+                scanned = scan_social_urls(
+                    urls,
+                    max_items_per_url=max_vids * 2,
+                    min_views=min_views,
+                    stop_event=stop_ev,
+                )
 
                 proj_name = f"Monitor - {mon_name}"
                 new_items = []
@@ -1173,15 +1410,15 @@ class PipelineManager:
                     # Đã đăng thành công trước đó trên đúng kênh đích (history chỉ ghi SAU khi upload xong — S2)
                     already = _monitor_source_already_published(conn, pid, mon.get("target_channel_id"))
                     if not already:
-                        # Đã nằm trong hàng đợi của monitor này (đang chờ / từng lỗi) — không thêm lại
-                        queued = conn.execute(
-                            "SELECT id FROM video_queue WHERE post_id = ? AND project_name = ? LIMIT 1",
-                            (pid, proj_name),
-                        ).fetchone()
-                        if not queued:
-                            new_items.append(s)
-                            if len(new_items) >= max_vids:
-                                break
+                        # Đã nằm trong hàng đợi của monitor này HOẶC monitor khác cùng đích đăng
+                        # (chống đăng trùng khi 2 monitor cùng theo dõi một nguồn — F1).
+                        if _monitor_source_queued(
+                            conn, pid, proj_name, mon.get("target_channel_id"), mon.get("target_group_name") or "Mặc định",
+                        ):
+                            continue
+                        new_items.append(s)
+                        if len(new_items) >= max_vids:
+                            break
                 conn.close()
 
                 if not new_items:
@@ -1216,40 +1453,19 @@ class PipelineManager:
 
                         conn = get_conn()
                         conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (proj_name,))
-                        cur = conn.execute(
-                            """
-                            INSERT INTO video_queue (
-                                project_name, source_type, platform, post_id, source_url, input_video_path,
-                                title, description, tags, duration, view_count, like_count,
-                                upload_to, visibility, target_type, target_channel_id, target_group_name,
-                                option_group_id, render_mode, render_config_json, emulate_mobile, status
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, 0, 'Pending')
-                            """,
-                            (
-                                proj_name,
-                                item_data["source_type"],
-                                item_data["platform"],
-                                item_data["post_id"],
-                                item_data["source_url"],
-                                item_data["input_video_path"],
-                                title,
-                                desc,
-                                tags,
-                                item_data["duration"],
-                                item_data["view_count"],
-                                item_data["like_count"],
-                                mon.get("upload_to") or "Shorts",
-                                "CHANNEL" if mon.get("target_channel_id") else "GROUP",
-                                mon.get("target_channel_id"),
-                                mon.get("target_group_name") or "Mặc định",
-                                mon.get("option_group_id"),
-                                mon.get("render_mode") or "shorts_9_16",
-                                mon.get("render_config_json") or "{}",
-                            ),
-                        )
-                        queue_id = cur.lastrowid
+                        queue_id = insert_monitor_queue_item(conn, proj_name, mon, item_data, title, desc, tags)
                         conn.commit()
                         conn.close()
+                        if queue_id is None:
+                            # Monitor khác cùng đích đã chen nguồn này vào hàng đợi trong lúc AI xử lý —
+                            # insert nguyên tử (WHERE NOT EXISTS) chặn tại DB nên không bao giờ đăng trùng.
+                            add_log(
+                                "Monitor",
+                                f"[{mon_name}] Bỏ qua '{title[:40]}': nguồn đã nằm trong hàng đợi của "
+                                "một monitor khác cùng đích đăng.",
+                                "WARNING",
+                            )
+                            continue
 
                         self._update_monitor_status(monitor_id, f"Đang xử lý video ({idx+1}/{len(new_items)}): {title[:30]}")
                         monitor_token = uuid.uuid4().hex

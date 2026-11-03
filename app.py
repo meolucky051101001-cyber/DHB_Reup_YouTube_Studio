@@ -23,6 +23,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from config import (
     APP_ROOT,
+    APP_DATA_DIR,
     APP_TEMP_DIR,
     DHB_ROOT,
     FFMPEG_EXE,
@@ -65,6 +66,14 @@ from youtube_uploader import (
     check_oauth_token_status,
 )
 from pipeline_manager import pipeline_manager
+from app_instance_lock import AppInstanceAlreadyRunning, acquire_app_instance_lock
+
+try:
+    # Own the local DB before migration/recovery. A second server process must
+    # never clear claims or touch jobs managed by the first one.
+    _APP_INSTANCE_LOCK = acquire_app_instance_lock(APP_DATA_DIR / "app_instance.lock")
+except AppInstanceAlreadyRunning as exc:
+    raise RuntimeError(str(exc)) from exc
 
 init_db()
 pipeline_manager.clear_stale_claims()
@@ -91,6 +100,19 @@ def _is_duplicate_post_id(conn, project_name: str, post_id: str) -> bool:
         "SELECT 1 FROM video_queue WHERE project_name = ? AND post_id = ? LIMIT 1",
         (project_name, post_id),
     ).fetchone() is not None
+
+
+def _upload_file_post_id(path: Path) -> str:
+    """Khóa trùng theo NỘI DUNG (kích thước + 1MB đầu) cho file kéo-thả.
+
+    Tên file đích có random hex nên md5(đường dẫn) không bao giờ trùng — người dùng
+    kéo cùng một video hai lần sẽ tạo 2 hàng đăng trùng. Hash nội dung thì trùng thật.
+    """
+    digest = hashlib.md5()
+    digest.update(str(path.stat().st_size).encode("utf-8"))
+    with open(path, "rb") as handle:
+        digest.update(handle.read(1024 * 1024))
+    return digest.hexdigest()[:16].upper()
 
 
 # Kiểm tra trùng + ghi queue phải liền mạch, trong khi ffprobe được chạy song song bên ngoài lock
@@ -393,7 +415,9 @@ def api_upload_video_files(
     conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (project_name,))
 
     added_count = 0
+    skipped_count = 0
     added_titles = []
+    seen_post_ids = set()
 
     for f in files:
         if not f.filename:
@@ -408,9 +432,19 @@ def api_upload_video_files(
         with open(target_path, "wb") as buffer:
             shutil.copyfileobj(f.file, buffer)
 
+        post_id = _upload_file_post_id(target_path)
+        if post_id in seen_post_ids or _is_duplicate_post_id(conn, project_name, post_id):
+            # Trùng nội dung với video đã có trong dự án — dọn file tạm và bỏ qua.
+            skipped_count += 1
+            try:
+                target_path.unlink()
+            except Exception:
+                pass
+            continue
+        seen_post_ids.add(post_id)
+
         probe = probe_video_info(str(target_path))
         title = Path(f.filename).stem
-        post_id = hashlib.md5(str(target_path).encode("utf-8")).hexdigest()[:16].upper()
 
         is_short = probe["seconds"] <= 65 or (probe["height"] > probe["width"] and probe["seconds"] <= 180)
         final_upload_to = upload_to or ("Shorts" if is_short else "Video")
@@ -449,8 +483,11 @@ def api_upload_video_files(
 
     conn.commit()
     conn.close()
-    add_log("Upload", f"Đã tải lên và thêm {added_count} video vào dự án [{project_name}].", "SUCCESS")
-    return {"ok": True, "added": added_count, "titles": added_titles}
+    log_msg = f"Đã tải lên và thêm {added_count} video vào dự án [{project_name}]."
+    if skipped_count:
+        log_msg += f" Bỏ qua {skipped_count} video trùng nội dung."
+    add_log("Upload", log_msg, "SUCCESS")
+    return {"ok": True, "added": added_count, "skipped": skipped_count, "titles": added_titles}
 
 
 @app.post("/api/browse-native-files")
@@ -881,12 +918,45 @@ def api_delete_queue_items(data: Dict[str, Any] = Body(...)):
     ids = data.get("ids") or []
     if not ids:
         return {"ok": True, "deleted": 0}
+
+    BUSY_STATUS_PREFIXES = (
+        "Uploading", "Đang đăng",
+        "Rendering", "Đang Render",
+        "Downloading", "Đang tải",
+        "Chờ giãn cách",
+    )
     conn = get_conn()
     placeholders = ",".join("?" for _ in ids)
-    conn.execute(f"DELETE FROM video_queue WHERE id IN ({placeholders})", ids)
+    rows = conn.execute(
+        f"SELECT id, status, claim_token FROM video_queue WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+
+    deletable, blocked = [], []
+    for r in rows:
+        status = (r["status"] or "").strip()
+        # claim_token khác rỗng = một worker (batch/monitor) đang giữ video này —
+        # xóa ngay lúc này sẽ khiến worker ghi vào dòng đã mất hoặc đăng video không còn hàng đợi.
+        if (r["claim_token"] or "").strip() or status.startswith(BUSY_STATUS_PREFIXES):
+            blocked.append(f"#{r['id']} ({status or 'đang bị giữ'})")
+        else:
+            deletable.append(r["id"])
+
+    if blocked:
+        conn.close()
+        raise HTTPException(
+            409,
+            f"Không xóa được {len(blocked)} video đang xử lý: {', '.join(blocked[:5])}"
+            + ("..." if len(blocked) > 5 else "")
+            + ". Hãy bấm Dừng và chờ luồng hiện tại kết thúc rồi xóa lại.",
+        )
+
+    if deletable:
+        del_placeholders = ",".join("?" for _ in deletable)
+        conn.execute(f"DELETE FROM video_queue WHERE id IN ({del_placeholders})", deletable)
     conn.commit()
     conn.close()
-    return {"ok": True, "deleted": len(ids)}
+    return {"ok": True, "deleted": len(deletable)}
 
 
 @app.get("/api/queue/{item_id}/stream")
@@ -1010,17 +1080,29 @@ def api_export_csv(project: str = "Default"):
 def api_import_csv(data: Dict[str, Any] = Body(...)):
     import csv
     import io
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
     project_name = data.get("project_name") or "Default"
     csv_text = data.get("csv_text") or ""
     if not csv_text.strip():
         raise HTTPException(400, "Nội dung CSV không được để trống.")
 
-    f = io.StringIO(csv_text.strip())
+    f = io.StringIO(csv_text.lstrip("\ufeff").strip())
     reader = csv.DictReader(f)
-    conn = get_conn()
-    conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (project_name,))
-    added = 0
+    if not reader.fieldnames:
+        raise HTTPException(400, "CSV cần có dòng tiêu đề cột.")
+
+    def _source_key(value: Any) -> str:
+        raw = str(value or "").strip()
+        try:
+            parsed = urlsplit(raw)
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+                return ""
+            query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
+            return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", query, ""))
+        except (TypeError, ValueError):
+            return ""
+
     def _csv_int(row: Dict[str, Any], *names: str) -> int:
         for n in names:
             v = (str(row.get(n) or "")).strip()
@@ -1031,39 +1113,64 @@ def api_import_csv(data: Dict[str, Any] = Body(...)):
                     pass
         return 0
 
-    for row in reader:
-        url = row.get("Source_URL") or row.get("source_url") or row.get("URL") or row.get("url") or ""
-        title = (row.get("Title") or row.get("title") or "").strip()
-        if not title:
-            title = (Path(url).stem if url else "") or "Video"
-        desc = row.get("Description") or row.get("description") or ""
-        tags = row.get("Tags") or row.get("tags") or ""
-        upload_to = row.get("Upload_To") or row.get("upload_to") or "Shorts"
-        render_mode = row.get("Render_Mode") or row.get("render_mode") or "shorts_9_16"
-        visibility = (row.get("Visibility") or row.get("visibility") or "public").lower()
-        schedule_time = (row.get("Schedule_Time") or row.get("schedule_time") or "").strip()
-        made_for_kids = _csv_int(row, "Made_For_Kids", "made_for_kids")
-        age_restriction = _csv_int(row, "Age_Restriction", "age_restriction")
-        altered_content = _csv_int(row, "Altered_Content", "altered_content")
+    conn = get_conn()
+    added = 0
+    skipped = 0
+    seen_urls = set()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (project_name,))
+        existing_urls = conn.execute(
+            "SELECT source_url FROM video_queue WHERE project_name = ? AND COALESCE(source_url, '') != ''",
+            (project_name,),
+        ).fetchall()
+        seen_urls.update(key for row in existing_urls if (key := _source_key(row["source_url"])))
 
-        conn.execute(
-            """
-            INSERT INTO video_queue (
-                project_name, source_type, platform, source_url, title, description, tags,
-                upload_to, render_mode, visibility, schedule_time,
-                made_for_kids, age_restriction, altered_content, emulate_mobile, status
-            ) VALUES (?, 'CSV', 'Custom', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Pending')
-            """,
-            (
-                project_name, url, title, desc, tags, upload_to, render_mode,
-                visibility, schedule_time, made_for_kids, age_restriction, altered_content,
-            ),
-        )
-        added += 1
-    conn.commit()
-    conn.close()
-    add_log("CSV", f"Đã nhập {added} video từ CSV vào dự án [{project_name}].", "SUCCESS")
-    return {"ok": True, "added": added}
+        for row in reader:
+            url = row.get("Source_URL") or row.get("source_url") or row.get("URL") or row.get("url") or ""
+            title = (row.get("Title") or row.get("title") or "").strip()
+            if not title:
+                title = (Path(url).stem if url else "").strip()
+            source_key = _source_key(url)
+            if not source_key or not title:
+                skipped += 1
+                continue
+            if source_key in seen_urls:
+                skipped += 1
+                continue
+            seen_urls.add(source_key)
+            desc = row.get("Description") or row.get("description") or ""
+            tags = row.get("Tags") or row.get("tags") or ""
+            upload_to = row.get("Upload_To") or row.get("upload_to") or "Shorts"
+            render_mode = row.get("Render_Mode") or row.get("render_mode") or "shorts_9_16"
+            visibility = (row.get("Visibility") or row.get("visibility") or "public").lower()
+            schedule_time = (row.get("Schedule_Time") or row.get("schedule_time") or "").strip()
+            made_for_kids = _csv_int(row, "Made_For_Kids", "made_for_kids")
+            age_restriction = _csv_int(row, "Age_Restriction", "age_restriction")
+            altered_content = _csv_int(row, "Altered_Content", "altered_content")
+
+            conn.execute(
+                """
+                INSERT INTO video_queue (
+                    project_name, source_type, platform, source_url, title, description, tags,
+                    upload_to, render_mode, visibility, schedule_time,
+                    made_for_kids, age_restriction, altered_content, emulate_mobile, status
+                ) VALUES (?, 'CSV', 'Custom', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Pending')
+                """,
+                (
+                    project_name, url, title, desc, tags, upload_to, render_mode,
+                    visibility, schedule_time, made_for_kids, age_restriction, altered_content,
+                ),
+            )
+            added += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    add_log("CSV", f"Đã nhập {added} video; bỏ qua {skipped} dòng thiếu/không hợp lệ/trùng từ [{project_name}].", "SUCCESS")
+    return {"ok": True, "added": added, "skipped": skipped}
 
 
 # ==========================================================
@@ -1489,26 +1596,11 @@ def api_export_excel(project: str = "Default", ids: str = ""):
     )
 
 
-@app.post("/api/queue/import-excel")
-async def api_import_excel(
-    file: UploadFile = File(...),
-    project_name: str = Form("Default"),
-    ids: str = Form(""),
-):
+def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int]) -> Dict[str, Any]:
+    """Toàn bộ phần nặng của import Excel (parse + ghép dòng + ghi DB) tách thành hàm sync
+    để chạy trong threadpool — không giữ event loop khi xử lý file lớn (S4)."""
     import io
     from datetime import timedelta
-
-    filename = (file.filename or "").strip()
-    if filename.lower().endswith(".xls"):
-        raise HTTPException(400, "File .xls cũ chưa được hỗ trợ. Hãy lưu lại thành .xlsx rồi nhập.")
-    if filename and not filename.lower().endswith((".xlsx", ".xlsm")):
-        raise HTTPException(400, "Vui lòng chọn file Excel .xlsx hoặc .xlsm.")
-
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(400, "File Excel rỗng.")
-    if len(raw) > 20 * 1024 * 1024:
-        raise HTTPException(400, "File Excel quá lớn (tối đa 20 MB).")
 
     try:
         from openpyxl import load_workbook
@@ -1555,9 +1647,6 @@ async def api_import_excel(
 
     if not excel_rows:
         raise HTTPException(400, "File Excel không có dòng dữ liệu nào.")
-
-    project_name = (project_name or "Default").strip() or "Default"
-    selected_ids = _parse_id_list(ids)
 
     conn = get_conn()
     try:
@@ -1826,6 +1915,31 @@ async def api_import_excel(
     }
 
 
+@app.post("/api/queue/import-excel")
+async def api_import_excel(
+    file: UploadFile = File(...),
+    project_name: str = Form("Default"),
+    ids: str = Form(""),
+):
+    filename = (file.filename or "").strip()
+    if filename.lower().endswith(".xls"):
+        raise HTTPException(400, "File .xls cũ chưa được hỗ trợ. Hãy lưu lại thành .xlsx rồi nhập.")
+    if filename and not filename.lower().endswith((".xlsx", ".xlsm")):
+        raise HTTPException(400, "Vui lòng chọn file Excel .xlsx hoặc .xlsm.")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "File Excel rỗng.")
+    if len(raw) > 20 * 1024 * 1024:
+        raise HTTPException(400, "File Excel quá lớn (tối đa 20 MB).")
+
+    project_name = (project_name or "Default").strip() or "Default"
+    selected_ids = _parse_id_list(ids)
+    # S4: parse openpyxl + xử lý tới 5000 dòng là CPU-bound — đẩy sang threadpool
+    # để không đóng băng event loop (polling 2.5s của toàn dashboard bị khựng).
+    return await run_in_threadpool(_excel_import_worker, raw, project_name, selected_ids)
+
+
 # ==========================================================
 # AI DỊCH THUẬT, VIẾT LẠI SEO & BIÊN TẬP HÀNG LOẠT
 # ==========================================================
@@ -1922,6 +2036,9 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
             continue
         status = (row["status"] or "").strip()
         published = (row["published_url"] or "").strip()
+        if do_up and status == "NeedsReview":
+            skipped.append({"id": item_id, "title": row["title"] or f"#{item_id}", "reason": "cần đối soát YouTube trước khi chạy lại"})
+            continue
         if do_up and not force_reupload and (status == "Completed" or published):
             skipped.append({"id": item_id, "title": row["title"] or f"#{item_id}", "reason": "đã đăng trước đó"})
             continue
@@ -1959,9 +2076,99 @@ def api_antidetect_status():
     return AntidetectClient().status()
 
 
+def sync_antidetect_studio_channels(profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Đồng bộ Antidetect với YouTube Studio: mở TỪNG Profile Antidetect qua lease CDP,
+    đọc trạng thái đăng nhập Google + danh sách kênh thật trong Studio (email, handle,
+    Channel ID) rồi đưa về youtube_channels — đúng luồng 'refresh-channels' của Profile
+    Chrome local. Chạy tuần tự; mỗi profile được ghi log để theo dõi tiến độ ở tab Nhật Ký.
+    Không đụng vào fingerprint/proxy — Antidetect vẫn là chủ sở hữu duy nhất của trình duyệt.
+    """
+    results: List[Dict[str, Any]] = []
+    added_total = updated_total = 0
+    logged_in_count = 0
+
+    for prof in profiles or []:
+        name = str(prof.get("name") or "").strip()
+        ad_id = str(prof.get("antidetect_profile_id") or "").strip()
+        entry = {
+            "name": name, "antidetect_profile_id": ad_id, "logged_in": False,
+            "channels": 0, "added": 0, "updated": 0, "error": "",
+        }
+        if not name or not ad_id:
+            entry["error"] = "thiếu tên Profile hoặc ID liên kết Antidetect"
+            results.append(entry)
+            continue
+
+        add_log("Antidetect", f"[{name}] Đang mở profile qua Antidetect để quét YouTube Studio...", "INFO")
+        try:
+            probe = probe_profile_login(
+                f"antidetect://{ad_id}",
+                "",
+                grab_channels=True,
+                antidetect_profile_id=ad_id,
+            )
+        except Exception as exc:
+            entry["error"] = str(exc)[:300]
+            add_log("Antidetect", f"[{name}] Lỗi quét Studio: {exc}", "ERROR")
+            results.append(entry)
+            continue
+
+        entry["logged_in"] = bool(probe.get("logged_in"))
+        new_status = "Đã đăng nhập" if entry["logged_in"] else "Chưa đăng nhập"
+        conn = get_conn()
+        try:
+            conn.execute(
+                "UPDATE chrome_profiles SET login_status = ?, last_login_check = ? WHERE antidetect_profile_id = ?",
+                (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ad_id),
+            )
+            conn.execute(
+                "UPDATE youtube_channels SET status = ? WHERE profile_name = ?",
+                (new_status, name),
+            )
+            if entry["logged_in"]:
+                found = probe.get("channels") or []
+                prof_row = conn.execute(
+                    "SELECT path, proxy FROM chrome_profiles WHERE antidetect_profile_id = ?",
+                    (ad_id,),
+                ).fetchone()
+                prof_path = ((prof_row["path"] if prof_row else "") or "").strip() or f"antidetect://{ad_id}"
+                prof_proxy = (prof_row["proxy"] if prof_row else "") or ""
+                added, updated = _upsert_profile_channels(conn, name, prof_path, prof_proxy, found, new_status)
+                entry["added"] = added
+                entry["updated"] = updated
+                entry["channels"] = len(found)
+                added_total += added
+                updated_total += updated
+            conn.commit()
+        finally:
+            conn.close()
+
+        if entry["logged_in"]:
+            logged_in_count += 1
+            add_log(
+                "Antidetect",
+                f"[{name}] {probe.get('message', 'Đã đăng nhập')} → "
+                f"+{entry['added']} kênh mới, cập nhật {entry['updated']} kênh.",
+                "SUCCESS",
+            )
+        else:
+            add_log("Antidetect", f"[{name}] {probe.get('message', 'Chưa đăng nhập Google.')}", "WARNING")
+        results.append(entry)
+
+    return {
+        "scanned": len(results),
+        "logged_in": logged_in_count,
+        "channels_added": added_total,
+        "channels_updated": updated_total,
+        "profiles": results,
+    }
+
+
 @app.post("/api/antidetect/sync")
-def api_antidetect_sync():
-    """Kéo danh sách Profile từ Antidetect về chrome_profiles (không lấy mật khẩu proxy)."""
+def api_antidetect_sync(payload: Optional[Dict[str, Any]] = Body(None)):
+    """Kéo danh sách Profile từ Antidetect về chrome_profiles (không lấy mật khẩu proxy).
+    Truyền {"scan_channels": true} để quét tiếp YouTube Studio trong từng profile
+    (đăng nhập Google + kênh YouTube) và đồng bộ về youtube_channels."""
     client = AntidetectClient()
     try:
         remote = client.list_profiles()
@@ -1975,6 +2182,8 @@ def api_antidetect_sync():
         f"bỏ qua {result['skipped']}.",
         "SUCCESS",
     )
+    if isinstance(payload, dict) and payload.get("scan_channels"):
+        result["studio"] = sync_antidetect_studio_channels(result.get("profiles") or [])
     return result
 
 
@@ -2146,37 +2355,19 @@ def api_check_profile_login(profile_name: str):
     return {"ok": True, **probe, "login_status": new_status}
 
 
-@app.post("/api/profiles/{profile_name}/refresh-channels")
-def api_refresh_profile_channels(profile_name: str):
-    """Quét danh sách kênh YouTube thật trong Chrome Profile và cập nhật vào bảng youtube_channels."""
-    prof = get_profile_binding(profile_name)
-    if not prof:
-        raise HTTPException(404, "Không tìm thấy Profile Chrome này.")
-    try:
-        probe = probe_profile_login(
-            prof["path"],
-            prof["proxy"] or "",
-            grab_channels=True,
-            antidetect_profile_id=prof.get("antidetect_profile_id") or "",
-        )
-    except Exception as e:
-        add_log("Profile", f"Lỗi quét kênh Profile '{profile_name}': {e}", "ERROR")
-        raise HTTPException(500, f"Lỗi khi mở Profile để quét kênh: {e}")
-
-    prof_path = prof["path"]
-    prof_proxy = prof["proxy"] or ""
-    found = probe.get("channels") or []
-    new_status = "Đã đăng nhập" if probe.get("logged_in") else "Chưa đăng nhập"
-
-    conn = get_conn()
-    conn.execute(
-        "UPDATE chrome_profiles SET login_status = ?, last_login_check = ? WHERE name = ?",
-        (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), profile_name),
-    )
-    conn.execute("UPDATE youtube_channels SET status = ? WHERE profile_name = ?", (new_status, profile_name))
-
+def _upsert_profile_channels(
+    conn,
+    profile_name: str,
+    prof_path: str,
+    prof_proxy: str,
+    found: List[Dict[str, Any]],
+    new_status: str,
+) -> tuple:
+    """Đồng bộ danh sách kênh quét được từ YouTube Studio của một Profile vào
+    youtube_channels: khớp theo channel_id → handle → tên; trả về (added, updated).
+    Dùng chung cho refresh-channels (Profile Chrome) và sync Antidetect."""
     added, updated = 0, 0
-    for ch in found:
+    for ch in found or []:
         handle = (ch.get("handle") or "").strip()
         ch_name = (ch.get("name") or "").strip() or handle
         email = (ch.get("email") or "").strip()
@@ -2219,11 +2410,44 @@ def api_refresh_profile_channels(profile_name: str):
                 INSERT INTO youtube_channels (
                     name, handle, email, channel_id, group_name, upload_mode, profile_name,
                     profile_path, proxy, emulate_mobile, status, note
-                ) VALUES (?, ?, ?, ?, 'Mặc định', 'playwright', ?, ?, ?, 0, ?, 'Kênh quét tự động từ Chrome Profile')
+                ) VALUES (?, ?, ?, ?, 'Mặc định', 'playwright', ?, ?, ?, 0, ?, 'Kênh quét tự động từ YouTube Studio')
                 """,
                 (ch_name, handle, email, channel_id, profile_name, prof_path, prof_proxy, new_status),
             )
             added += 1
+    return added, updated
+
+
+@app.post("/api/profiles/{profile_name}/refresh-channels")
+def api_refresh_profile_channels(profile_name: str):
+    """Quét danh sách kênh YouTube thật trong Chrome Profile và cập nhật vào bảng youtube_channels."""
+    prof = get_profile_binding(profile_name)
+    if not prof:
+        raise HTTPException(404, "Không tìm thấy Profile Chrome này.")
+    try:
+        probe = probe_profile_login(
+            prof["path"],
+            prof["proxy"] or "",
+            grab_channels=True,
+            antidetect_profile_id=prof.get("antidetect_profile_id") or "",
+        )
+    except Exception as e:
+        add_log("Profile", f"Lỗi quét kênh Profile '{profile_name}': {e}", "ERROR")
+        raise HTTPException(500, f"Lỗi khi mở Profile để quét kênh: {e}")
+
+    prof_path = prof["path"]
+    prof_proxy = prof["proxy"] or ""
+    found = probe.get("channels") or []
+    new_status = "Đã đăng nhập" if probe.get("logged_in") else "Chưa đăng nhập"
+
+    conn = get_conn()
+    conn.execute(
+        "UPDATE chrome_profiles SET login_status = ?, last_login_check = ? WHERE name = ?",
+        (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), profile_name),
+    )
+    conn.execute("UPDATE youtube_channels SET status = ? WHERE profile_name = ?", (new_status, profile_name))
+
+    added, updated = _upsert_profile_channels(conn, profile_name, prof_path, prof_proxy, found, new_status)
     conn.commit()
     conn.close()
     add_log(

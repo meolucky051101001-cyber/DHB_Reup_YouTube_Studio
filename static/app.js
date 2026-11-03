@@ -650,6 +650,55 @@ async function syncAntidetectProfiles() {
   }
 }
 
+async function syncAntidetectChannels() {
+  // Đồng bộ Antidetect với YouTube Studio: quét từng profile để đọc đăng nhập + kênh.
+  const NL_CHAR = String.fromCharCode(10);
+  try {
+    const st = await apiFetch('/api/antidetect/status');
+    if (!st.connected) {
+      alert(`Chưa kết nối được Antidetect Browser Manager. Hãy mở Antidetect trước rồi thử lại.
+
+${st.error || ''}`);
+      return;
+    }
+  } catch (e) {
+    alert('Chưa kết nối được Antidetect Browser Manager: ' + e.message);
+    return;
+  }
+  const ok = confirm(`Quét Kênh YouTube Studio từ các Profile Antidetect?
+
+- Mỗi profile mất khoảng 15-30 giây (mở trình duyệt qua Antidetect → đọc Studio → đóng tab do tool tạo).
+- Kênh tìm được sẽ về tab Quản Lý Kênh với Channel ID đầy đủ, sẵn sàng để đăng.
+- Theo dõi tiến độ chi tiết ở tab Nhật Ký.`);
+  if (!ok) return;
+  showToast('🧲 Đang quét kênh Studio từ các Profile Antidetect...', 'info');
+  try {
+    const res = await apiFetch('/api/antidetect/sync', {
+      method: 'POST',
+      body: JSON.stringify({ scan_channels: true }),
+    });
+    const s = res.studio || { scanned: 0, logged_in: 0, channels_added: 0, channels_updated: 0, profiles: [] };
+    const lines = (s.profiles || []).map(p => {
+      if (p.error) return `• ${p.name}: ⚠️ ${p.error}`;
+      if (!p.logged_in) return `• ${p.name}: chưa đăng nhập Google (mở profile để đăng nhập rồi quét lại)`;
+      return `• ${p.name}: ${p.channels} kênh (+${p.added} mới, ${p.updated} cập nhật)`;
+    });
+    alert(`🧲 Quét Studio xong:
+
+- Profile đã quét: ${s.scanned}
+- Đã đăng nhập: ${s.logged_in}
+- Kênh mới: ${s.channels_added}
+- Kênh cập nhật: ${s.channels_updated}
+
+${lines.join(NL_CHAR) || '(không có profile Antidetect nào)'}`);
+    await loadProfiles();
+    await loadChannels();
+    await refreshAntidetectStatus();
+  } catch (e) {
+    alert('Lỗi quét kênh Studio: ' + e.message);
+  }
+}
+
 function escapeJs(str) {
   return String(str ?? '')
     .replace(/\\/g, '\\\\')
@@ -1370,6 +1419,8 @@ async function loadQueue(preserveSelection = false) {
     let statusBadge = `<span class="badge badge-wait">${escapeHtml(item.status)}</span>`;
     if (item.status === 'Completed') {
       statusBadge = `<span class="badge badge-ok">✅ Đã đăng</span>`;
+    } else if (item.status === 'NeedsReview') {
+      statusBadge = `<span class="badge" style="background:rgba(245,158,11,0.2); color:#f59e0b; border:1px solid #f59e0b; font-weight:700;" title="${escapeHtml(item.error_message || 'Hãy kiểm tra YouTube Studio trước khi chạy lại')}">🔎 Cần đối soát</span>`;
     } else if (item.status === 'Stopped' || (item.status && item.status.includes('Dừng'))) {
       statusBadge = `<span class="badge" style="background:rgba(245,158,11,0.2); color:#f59e0b; border:1px solid #f59e0b; font-weight:700;" title="${escapeHtml(item.error_message || 'Đã dừng theo yêu cầu')}">⏹️ Đã dừng</span>`;
     } else if (item.status && (item.status.includes('Render') || item.status.includes('Đang Render'))) {
@@ -1996,6 +2047,58 @@ async function handleImportCsv(event) {
   reader.readAsText(file, 'UTF-8');
 }
 
+// Cùng thuật toán với backend (_resolve_target_channel): xác định kênh đích thực tế
+// của từng video để chặn sớm khi kênh thiếu Channel ID (backend vẫn fail-closed).
+function findChannelIdBlockers(ids, forceReupload) {
+  const channels = Array.isArray(gChannels) ? gChannels.slice() : [];
+  if (!channels.length) return [];
+
+  const byId = new Map();
+  const byProfile = new Map();
+  const byGroup = new Map();
+  channels.forEach(c => {
+    byId.set(Number(c.id), c);
+    const prof = String(c.profile_name || '');
+    if (!byProfile.has(prof)) byProfile.set(prof, []);
+    byProfile.get(prof).push(c);
+    const grp = String(c.group_name || '');
+    if (!byGroup.has(grp)) byGroup.set(grp, []);
+    byGroup.get(grp).push(c);
+  });
+  // Backend quay vòng theo ORDER BY id ASC; /api/channels trả id DESC nên phải sắp lại.
+  [byProfile, byGroup].forEach(m => m.forEach(list => list.sort((a, b) => Number(a.id) - Number(b.id))));
+
+  const blockers = [];
+  ids.forEach(id => {
+    const item = gQueueItems.find(v => Number(v.id) === Number(id));
+    if (!item) return;
+    const status = String(item.status || '').trim();
+    const published = String(item.published_url || '').trim();
+    // Các video backend sẽ bỏ qua trước khi chọn kênh thì không chặn oan.
+    if (!forceReupload && (status === 'Completed' || published)) return;
+    if (!forceReupload && (status.startsWith('Uploading') || status.startsWith('Đang đăng'))) return;
+
+    let target = null;
+    if (item.target_channel_id) {
+      target = byId.get(Number(item.target_channel_id)) || null;
+    } else if (String(item.target_profile_name || '').trim()) {
+      const list = byProfile.get(String(item.target_profile_name).trim()) || [];
+      if (list.length === 1) target = list[0];
+    } else {
+      const group = String(item.target_group_name || '').trim() || 'Mặc định';
+      const list = byGroup.get(group) || [];
+      if (list.length) {
+        const key = Number(item.id);
+        target = list[(Number.isFinite(key) ? Math.abs(key) : 0) % list.length];
+      }
+    }
+    if (target && !String(target.channel_id || '').trim()) {
+      blockers.push({ item, target });
+    }
+  });
+  return blockers;
+}
+
 async function startPipeline(doDownload, doRender, doUpload, overrideIds = null) {
   let ids;
   if (Array.isArray(overrideIds) && overrideIds.length > 0) {
@@ -2021,6 +2124,19 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
         `OK = ĐĂNG LẠI các video này (có thể tạo video trùng trên kênh)\n` +
         `Cancel = Bỏ qua các video đã đăng, chỉ chạy video còn lại`
       );
+    }
+    const channelIdBlockers = findChannelIdBlockers(ids, forceReupload);
+    if (channelIdBlockers.length) {
+      const lines = channelIdBlockers.slice(0, 6).map(b =>
+        `• #${b.item.id}${b.item.title ? ` "${b.item.title}"` : ''} → kênh "${b.target.name}"`
+      );
+      if (channelIdBlockers.length > 6) lines.push(`… và ${channelIdBlockers.length - 6} video khác.`);
+      alert(
+        `⛔ Chưa thể bắt đầu: kênh đích thiếu Channel ID.\n\n${lines.join('\n')}\n\n` +
+        `Hệ thống bắt buộc phải có Channel ID để xác minh đúng kênh trước khi đăng (fail-closed).\n` +
+        `Hãy bấm "🔄 Quét Kênh" hoặc nhập Channel ID trong tab "Quản Lý Kênh & Profile Chrome", rồi chạy lại.`
+      );
+      return;
     }
     if (!confirm(`Bắt đầu xử lý và đăng ${ids.length} video?`)) return;
   }

@@ -155,9 +155,11 @@ class FailClosedSourceTests(unittest.TestCase):
         self.assertIn('if metadata.get("age_restriction") and not age_confirmed:', self.uploader)
         self.assertIn("raise RuntimeError(age_error)", self.uploader)
 
-    def test_pipeline_marks_uncertain_result_as_error(self):
-        self.assertIn('if is_uncertain or not (pub_url or "").strip():', self.pipeline)
+    def test_pipeline_marks_uncertain_result_for_review(self):
+        self.assertIn("elif result_unverified:", self.pipeline)
+        self.assertIn('status="NeedsReview"', self.pipeline)
         self.assertIn("error_message=uncertain_msg", self.pipeline)
+        self.assertIn('existing_status == "NeedsReview"', self.pipeline)
 
 
 class StopSemanticsTests(unittest.TestCase):

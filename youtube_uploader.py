@@ -361,6 +361,76 @@ def _extract_channel_id(raw: str) -> str:
     return match.group(1) if match else ""
 
 
+def _no_channel_or_redirect_message(page) -> str:
+    """Studio không mở (redirect khỏi studio.youtube.com) sau khi đã đăng nhập Google:
+    phân biệt rõ 'chưa có kênh' (form Tạo kênh) với lỗi khác để người dùng biết phải làm gì.
+    Dò qua body.innerText vì form Tạo kênh nằm trong shadow DOM (locator text= không thấy)."""
+    cur_url = (page.url or "").strip()
+    body_text = ""
+    try:
+        # Form "Tạo kênh" render chậm hơn redirect — chờ thêm trước khi dò.
+        page.wait_for_timeout(2000)
+        body_text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        body_text = ""
+    lowered = body_text.lower()
+    if "tạo kênh" in lowered or "create a channel" in lowered:
+        return (
+            "Tài khoản Google này CHƯA CÓ kênh YouTube nào (Studio chuyển về form 'Tạo kênh'). "
+            "Hãy tạo kênh trong profile rồi quét lại."
+        )
+    return (
+        f"Đã đăng nhập Google nhưng Studio không mở được (đang ở: {cur_url[:90]}). "
+        "Hãy mở profile, vào Studio thủ công một lần rồi quét lại."
+    )
+
+
+def _resolve_channel_id_by_handle(page, handle: str) -> str:
+    """Đọc ID kênh thật qua trang youtube.com/@handle (tab do tool tạo, đọc thụ động qua
+    ytcfg.CHANNEL_ID của trang kênh). Dùng cho kênh KHÔNG active mà hộp chuyển tài khoản
+    không trả browseId (Studio build mới). Navigate đi rồi quay về Studio, không đổi state."""
+    h = (handle or "").strip()
+    if not h:
+        return ""
+    if not h.startswith("@"):
+        h = "@" + h
+    original_url = page.url or "https://studio.youtube.com"
+    try:
+        page.goto(f"https://www.youtube.com/{quote(h)}", wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2000)
+        # Thứ tự tin cậy: canonical link → og:url → meta identifier → ytcfg.
+        # (ytcfg.CHANNEL_ID đã xác minh rỗng trên youtube.com build 2026-11.)
+        blob = page.evaluate(
+            """() => {
+                try {
+                    const parts = [];
+                    const canonical = document.querySelector('link[rel="canonical"]');
+                    if (canonical && canonical.href) parts.push(canonical.href);
+                    const og = document.querySelector('meta[property="og:url"]');
+                    if (og && og.content) parts.push(og.content);
+                    const ident = document.querySelector('meta[itemprop="identifier"]');
+                    if (ident && ident.content) parts.push(ident.content);
+                    try {
+                        const cfg = window.ytcfg;
+                        if (cfg && cfg.get) parts.push(String(cfg.get('CHANNEL_ID') || ''));
+                    } catch (e) {}
+                    return parts.join('\\n');
+                } catch (e) { return ''; }
+            }"""
+        ) or ""
+        cid = _extract_channel_id(blob)
+        if not cid:
+            cid = _extract_channel_id(page.url or "")
+        return cid
+    except Exception:
+        return ""
+    finally:
+        try:
+            page.goto(original_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            pass
+
+
 def _read_studio_channel_id(page) -> str:
     match = _STUDIO_CHANNEL_ID_RE.search(page.url or "")
     if match:
@@ -739,10 +809,21 @@ def _collect_studio_channels(page) -> tuple:
     """Quét kênh trong hộp chuyển tài khoản Studio; trả về (active, danh sách kênh)."""
     active = _read_active_studio_account(page)
     entries = []
-    if _open_studio_account_menu(page):
-        active = _read_active_studio_account(page)
-        if _open_studio_switch_account_list(page):
-            entries = _list_studio_accounts(page)
+    # Xác minh thật 2026-11-02: mở hộp chuyển tài khoản thỉnh thoảng hụt do timing
+    # (Studio vừa load, overlay chưa sẵn sàng) — thử tối đa 2 lần trước khi bỏ cuộc.
+    for attempt in (1, 2):
+        if _open_studio_account_menu(page):
+            active = _read_active_studio_account(page)
+            if _open_studio_switch_account_list(page):
+                entries = _list_studio_accounts(page)
+                if entries:
+                    break
+        if attempt == 1:
+            _close_studio_account_menus(page)
+            try:
+                page.wait_for_timeout(2000)
+            except Exception:
+                pass
 
     current_email = active.get("email", "")
     channels = [
@@ -755,6 +836,32 @@ def _collect_studio_channels(page) -> tuple:
         for entry in entries
         if entry["name"] or entry["handle"] or entry.get("channel_id")
     ][:50]
+
+    # Xác minh thật 2026-11-02 (Studio build mới): item trong hộp chuyển tài khoản không
+    # trả browseId qua el.data — nhưng ID kênh ĐANG HOẠT ĐỘNG đọc được từ URL/ytcfg.
+    # Gắn cho đúng item: khớp handle/tên, hoặc khi hộp chỉ có đúng 1 kênh.
+    active_id = (active.get("channel_id") or "").strip()
+    if active_id and channels:
+        active_name = (active.get("name") or "").strip().casefold()
+        active_handle = (active.get("handle") or "").strip()
+        for ch in channels:
+            if ch.get("channel_id"):
+                continue
+            matches_active = (
+                (active_handle and (ch.get("handle") or "").strip() == active_handle)
+                or (active_name and (ch.get("name") or "").strip().casefold() == active_name)
+            )
+            if matches_active or len(channels) == 1:
+                ch["channel_id"] = active_id
+
+    # Kênh KHÔNG active không có ID từ hộp chuyển tài khoản — tra qua youtube.com/@handle
+    # (tối đa 5 kênh/lượt để không kéo dài lượt quét).
+    unresolved = [ch for ch in channels if not (ch.get("channel_id") or "").strip() and (ch.get("handle") or "").strip()]
+    for ch in unresolved[:5]:
+        cid = _resolve_channel_id_by_handle(page, ch["handle"])
+        if cid:
+            ch["channel_id"] = cid
+
     if not channels and (active.get("name") or active.get("handle")):
         channels = [{
             "name": active.get("name", ""),
@@ -775,52 +882,62 @@ def _probe_antidetect_login(profile_id: str, grab_channels: bool = True) -> Dict
         "antidetect": True,
     }
     try:
-        with AntidetectBrowserLease(profile_id, stop_if_started=True) as lease:
-            page = lease.page
-            page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3500)
+        # Cùng khóa với luồng upload: đang upload trên profile này thì quét Studio phải chờ,
+        # và ngược lại — tránh 2 lease CDP tranh cùng một Chrome của Antidetect.
+        with _get_antidetect_lock(profile_id):
+            with AntidetectBrowserLease(profile_id, stop_if_started=True) as lease:
+                page = lease.page
+                page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3500)
 
-            try:
-                cont_btn = page.locator(
-                    "a:has-text('Continue to Studio'), button:has-text('Continue to Studio'), "
-                    "a:has-text('Tiếp tục tới Studio'), button:has-text('Tiếp tục tới Studio'), "
-                    "[aria-label*='Continue to Studio' i]"
-                ).first
-                if cont_btn.count() > 0 and cont_btn.is_visible():
-                    cont_btn.click()
-                    page.wait_for_timeout(2500)
-            except Exception as cont_err:
-                _log_optional_step_failure("bấm Continue to Studio khi kiểm tra đăng nhập Antidetect", cont_err, {}, {})
+                try:
+                    cont_btn = page.locator(
+                        "a:has-text('Continue to Studio'), button:has-text('Continue to Studio'), "
+                        "a:has-text('Tiếp tục tới Studio'), button:has-text('Tiếp tục tới Studio'), "
+                        "[aria-label*='Continue to Studio' i]"
+                    ).first
+                    if cont_btn.count() > 0 and cont_btn.is_visible():
+                        cont_btn.click()
+                        page.wait_for_timeout(2500)
+                except Exception as cont_err:
+                    _log_optional_step_failure("bấm Continue to Studio khi kiểm tra đăng nhập Antidetect", cont_err, {}, {})
 
-            if "accounts.google.com" in page.url or "signin" in page.url.lower():
-                result["message"] = "Profile Antidetect này chưa đăng nhập tài khoản Google/YouTube."
-                return result
+                if "accounts.google.com" in page.url or "signin" in page.url.lower():
+                    result["message"] = "Profile Antidetect này chưa đăng nhập tài khoản Google/YouTube."
+                    return result
+                if "studio.youtube.com" not in (page.url or ""):
+                    # Xác minh thật 2026-11-02: tài khoản Google chưa có kênh → Studio redirect
+                    # về youtube.com kèm form "Tạo kênh". Báo đúng nguyên nhân thay vì báo lỗi DOM.
+                    result["message"] = _no_channel_or_redirect_message(page)
+                    # Google session vẫn còn (không bị đá về trang đăng nhập) — chỉ là chưa có kênh.
+                    result["logged_in"] = True
+                    return result
 
-            result["logged_in"] = True
-            result["message"] = "Profile Antidetect đã đăng nhập Google."
-            if not grab_channels:
-                return result
+                result["logged_in"] = True
+                result["message"] = "Profile Antidetect đã đăng nhập Google."
+                if not grab_channels:
+                    return result
 
-            try:
-                active, channels = _collect_studio_channels(page)
-                result["channels"] = channels
-                result["email"] = active.get("email", "")
-                result["channel_id"] = active.get("channel_id", "")
-                if channels:
+                try:
+                    active, channels = _collect_studio_channels(page)
+                    result["channels"] = channels
+                    result["email"] = active.get("email", "")
+                    result["channel_id"] = active.get("channel_id", "")
+                    if channels:
+                        result["message"] = (
+                            "Profile Antidetect đã đăng nhập Google"
+                            + (f" ({result['email']})" if result["email"] else "")
+                            + f", phát hiện {len(channels)} kênh YouTube."
+                        )
+                    else:
+                        result["message"] = (
+                            "Profile Antidetect đã đăng nhập Google nhưng không đọc được "
+                            "danh sách kênh trong hộp chuyển tài khoản."
+                        )
+                except Exception as parse_err:
                     result["message"] = (
-                        "Profile Antidetect đã đăng nhập Google"
-                        + (f" ({result['email']})" if result["email"] else "")
-                        + f", phát hiện {len(channels)} kênh YouTube."
+                        f"Profile Antidetect đã đăng nhập Google nhưng không quét được danh sách kênh: {parse_err}"
                     )
-                else:
-                    result["message"] = (
-                        "Profile Antidetect đã đăng nhập Google nhưng không đọc được "
-                        "danh sách kênh trong hộp chuyển tài khoản."
-                    )
-            except Exception as parse_err:
-                result["message"] = (
-                    f"Profile Antidetect đã đăng nhập Google nhưng không quét được danh sách kênh: {parse_err}"
-                )
     except Exception as e:
         raise RuntimeError(f"Không kiểm tra được Profile Antidetect {profile_id}: {e}") from e
     return result
@@ -908,6 +1025,11 @@ def probe_profile_login(
 
                 if "accounts.google.com" in page.url or "signin" in page.url.lower():
                     result["message"] = "Profile này chưa đăng nhập tài khoản Google/YouTube."
+                    return result
+                if "studio.youtube.com" not in (page.url or ""):
+                    # Cùng phân biệt với Antidetect: đăng nhập rồi nhưng chưa có kênh → form Tạo kênh.
+                    result["message"] = _no_channel_or_redirect_message(page)
+                    result["logged_in"] = True
                     return result
 
                 result["logged_in"] = True

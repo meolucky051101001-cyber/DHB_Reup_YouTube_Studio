@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, List, Any, Optional
@@ -180,9 +181,12 @@ def scan_social_urls(
     min_comments: int = 0,
     only_shorts: bool = False,
     recursive_local: bool = False,
+    stop_event: Optional[threading.Event] = None,
 ) -> List[Dict[str, Any]]:
     """
     Quét danh sách video từ link kênh hoặc link video lẻ (TikTok, Douyin, YouTube, FB, IG, Twitter...).
+    stop_event: khi được truyền (làn Monitor), kiểm tra giữa các URL để bấm Dừng có hiệu lực
+    ngay thay vì quét hết toàn bộ nguồn mới thoát.
     """
     results: List[Dict[str, Any]] = []
     ydl_opts = {
@@ -195,6 +199,8 @@ def scan_social_urls(
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         for raw_url in urls:
+            if stop_event is not None and stop_event.is_set():
+                break
             url = raw_url.strip()
             if not url:
                 continue
@@ -297,11 +303,17 @@ def download_video(
     source_url: str,
     post_id: str = "",
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> Dict[str, str]:
     """
     Tải video và thumbnail về thư mục temp (kết hợp yt-dlp và youtube-dl.exe của DHB).
+    stop_event: cho phép làn batch/monitor ngắt giữa chừng khi người dùng bấm Dừng
+    (yt-dlp không có timeout dựng sẵn — cơ chế ngắt là raise trong progress hook).
     Trả về dict: {"video_path": ..., "thumbnail_path": ..., "title": ..., "duration": ...}
     """
+    if stop_event is not None and stop_event.is_set():
+        raise InterruptedError("Đã dừng trước khi bắt đầu tải video.")
+
     if os.path.exists(source_url) and os.path.isfile(source_url):
         if progress_callback:
             progress_callback(100, "Đã có sẵn file trên máy")
@@ -324,6 +336,8 @@ def download_video(
         height_cap = _height_cap(str(get_settings().get("download_resolution", "1080p FullHD") or "1080p"))
 
     def _hook(d):
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError("Người dùng đã bấm Dừng khi đang tải video.")
         if d.get("status") == "downloading" and progress_callback:
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             downloaded = d.get("downloaded_bytes") or 0
@@ -347,6 +361,8 @@ def download_video(
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(source_url, download=True)
+            if stop_event is not None and stop_event.is_set():
+                raise InterruptedError("Đã dừng ngay sau khi tải xong luồng video.")
             downloaded_file = ydl.prepare_filename(info)
             mp4_candidate = Path(downloaded_file).with_suffix(".mp4")
             if mp4_candidate.exists():
@@ -369,7 +385,13 @@ def download_video(
                 "title": info.get("title") or safe_id,
                 "duration": probe["duration"],
             }
+    except InterruptedError:
+        # Dừng theo yêu cầu người dùng — KHÔNG được rơi xuống nhánh fallback youtube-dl.
+        raise
     except Exception as first_err:
+        if stop_event is not None and stop_event.is_set():
+            # Lỗi do người dùng bấm Dừng trong lúc tải (hook raise) — coi như ngắt, không fallback.
+            raise InterruptedError("Đã dừng trong khi tải video.") from first_err
         # Fallback sang youtube-dl.exe tại C:\DHB Reup Facebook\youtube-dl.exe
         out_mp4 = str(APP_TEMP_DIR / f"dl_{safe_id}.mp4")
         cmd = [
@@ -384,14 +406,23 @@ def download_video(
             out_mp4,
             source_url,
         ]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError("Đã dừng trong khi tải video.")
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                # youtube-dl.exe cũ không có cơ chế ngắt — chặn trên bằng timeout cứng.
+                timeout=1800,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except subprocess.TimeoutExpired as timeout_err:
+            raise RuntimeError(
+                f"youtube-dl.exe vượt quá 30 phút không xong — đã hủy tải từ {source_url}."
+            ) from timeout_err
         if proc.returncode == 0 and os.path.exists(out_mp4):
             probe = probe_video_info(out_mp4)
             if progress_callback:

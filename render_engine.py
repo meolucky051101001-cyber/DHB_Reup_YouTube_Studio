@@ -19,6 +19,11 @@ from scanner_downloader import probe_video_info
 
 TIME_REGEX = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 
+# Watchdog: FFmpeg không ghi ra stderr trong khoảng này (giây) thì coi như bị treo,
+# tự hủy tiến trình để không kẹt vĩnh viễn worker của render queue (pool chỉ có 2 slot).
+# Encode bình thường luôn ghi dòng progress ~0.5s/lần nên 120s là dư an toàn.
+FFMPEG_SILENCE_TIMEOUT_SEC = 120.0
+
 # Quản lý toàn bộ tiến trình FFmpeg đang chạy để có thể dừng ngay lập tức khi người dùng bấm '⏹️ Dừng'.
 # Mỗi PID gắn owner ('batch' / 'monitor') để Dừng batch không giết render của Monitor.
 _ACTIVE_FFMPEG_LOCK = threading.Lock()
@@ -681,6 +686,10 @@ def render_video(
                 + ["-i", input_path, "-stream_loop", "-1", "-i", str(bg_music_path)]
                 + extra_inputs
                 + ["-filter_complex", filter_complex + audio_fc, "-map", "[outv]", "-map", "[outa]"]
+                # P0: -t đặt trước -i chỉ giới hạn input 0, còn nhạc nền -stream_loop -1 là
+                # luồng vô hạn — video câm + nhạc nền phải có -shortest để output dừng theo video,
+                # nếu không FFmpeg encode âm thanh mãi không thoát (đã reproduce: file phình vô hạn).
+                + (["-shortest"] if not has_audio else [])
                 + ["-c:v", "libx264", "-r", str(fps), "-crf", crf_val, "-b:v", bitrate, "-preset", preset]
                 + ["-c:a", "aac", "-b:a", "320k", "-ar", "48000"]
                 + _clear_metadata_args()
@@ -845,6 +854,8 @@ def render_video(
                 + ["-i", input_path, "-stream_loop", "-1", "-i", str(bg_music_path)]
                 + extra_inputs
                 + ["-filter_complex", filter_complex, "-map", "[outv]", "-map", "[outa]"]
+                # P0: như nhánh shorts_9_16 — video câm + nhạc nền lặp vô hạn cần -shortest.
+                + (["-shortest"] if not has_audio else [])
                 + ["-c:v", "libx264", "-r", str(fps), "-b:v", bitrate, "-preset", preset]
                 + ["-c:a", "aac", "-b:a", "192k"]
                 + _clear_metadata_args()
@@ -907,6 +918,7 @@ def _run_ffmpeg_with_progress(
     stop_event: Optional[threading.Event] = None,
     partial_output: Optional[str] = None,
     owner: str = "",
+    silence_timeout: Optional[float] = None,
 ):
     if progress_callback:
         progress_callback(5, "Khởi chạy FFmpeg render...")
@@ -927,8 +939,30 @@ def _run_ffmpeg_with_progress(
     with _ACTIVE_FFMPEG_LOCK:
         _ACTIVE_FFMPEG_PROCS[proc.pid] = (proc, owner)
 
+    # Watchdog chống treo: readline() ở luồng chính là BLOCKING, nên nếu FFmpeg im lặng
+    # (treo thật sự, không ghi gì ra stderr) thì stop_event không bao giờ được kiểm tra và
+    # worker render kẹt vĩnh viễn. Luồng phụ này kill tiến trình khi (a) người dùng bấm
+    # Dừng hoặc (b) không có output trong silence_timeout giây — lúc đó readline nhận EOF
+    # và luồng chính thoát ra xử lý lỗi bình thường.
+    timeout_sec = FFMPEG_SILENCE_TIMEOUT_SEC if silence_timeout is None else max(1.0, float(silence_timeout))
+    watchdog_state = {"last_output": time.time(), "watchdog_killed": False}
+
+    def _watchdog():
+        while proc.poll() is None:
+            if stop_event is not None and stop_event.is_set():
+                _terminate_ffmpeg_proc(proc)
+                return
+            if time.time() - watchdog_state["last_output"] > timeout_sec:
+                watchdog_state["watchdog_killed"] = True
+                _terminate_ffmpeg_proc(proc)
+                return
+            time.sleep(1.0)
+
+    watchdog_t = threading.Thread(target=_watchdog, daemon=True, name="DHB-FFmpeg-Watchdog")
+
     stderr_lines = []
     try:
+        watchdog_t.start()
         if proc.stderr:
             while True:
                 if stop_event and stop_event.is_set():
@@ -942,6 +976,7 @@ def _run_ffmpeg_with_progress(
                     time.sleep(0.04)
                     continue
 
+                watchdog_state["last_output"] = time.time()
                 stderr_lines.append(line)
                 m = TIME_REGEX.search(line)
                 if m and progress_callback and expected_duration > 0:
@@ -955,6 +990,11 @@ def _run_ffmpeg_with_progress(
         proc.wait()
         if stop_event and stop_event.is_set():
             raise InterruptedError("Người dùng đã bấm Dừng Render.")
+        if watchdog_state["watchdog_killed"]:
+            raise RuntimeError(
+                f"FFmpeg không ghi ra gì trong {int(timeout_sec)}s — tiến trình có thể bị treo, "
+                "đã tự hủy để giải phóng slot render. Hãy thử lại; nếu lặp lại, kiểm tra file nguồn/ổ đĩa."
+            )
         if proc.returncode != 0:
             err_tail = "".join(stderr_lines[-10:])
             raise RuntimeError(f"FFmpeg render thất bại (code {proc.returncode}): {err_tail}")

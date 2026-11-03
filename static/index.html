@@ -1122,6 +1122,7 @@
           <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
             <span id="antidetect-status" style="font-size:11px; color:var(--text-muted);">Antidetect: chưa kiểm tra</span>
             <button class="btn btn-accent btn-sm" onclick="syncAntidetectProfiles()" title="Kéo Profile từ Antidetect về tool (không lấy mật khẩu proxy)">🔗 Đồng Bộ Antidetect</button>
+            <button class="btn btn-sm" onclick="syncAntidetectChannels()" title="Mở từng Profile Antidetect đọc kênh YouTube Studio (đăng nhập, email, Channel ID) và đưa về Quản Lý Kênh — khoảng 15-30 giây mỗi profile">🧲 Quét Kênh Studio</button>
             <button class="btn btn-outline btn-sm" onclick="loadProfiles()">🔄 Làm Mới Danh Sách</button>
           </div>
         </div>
@@ -1776,6 +1777,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=19"></script>
+  <script src="/static/app.js?v=21"></script>
 </body>
 </html>
