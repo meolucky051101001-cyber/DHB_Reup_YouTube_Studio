@@ -9,12 +9,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from database import get_conn, add_log, get_settings, save_settings
-from config import APP_TEMP_DIR
+from database import get_conn, add_log, get_settings, save_settings, register_managed_artifact
+from config import APP_OUTPUT_DIR, APP_TEMP_DIR
 from scanner_downloader import download_video, scan_social_urls
 from render_engine import render_video, generate_thumbnail_from_video
 from ai_engine import ai_optimize_youtube_metadata
-from youtube_uploader import upload_video_to_youtube
+from youtube_uploader import upload_video_to_youtube, validate_upload_preflight, normalize_published_video_url
+from content_identity import normalize_source_url, sha256_file, source_dedupe_key
+from group_distribution import choose_target_channel, target_group_names
+from phase4_rules import (
+    GROUP_SCHEMA_VERSION, serialize_group_names, validate_metadata_fields,
+    validate_queue_fields, validate_source_url,
+)
+from storage_manager import (
+    MIN_DOWNLOAD_HEADROOM_BYTES,
+    delete_completed_temp_artifact,
+    ensure_disk_space,
+    estimate_render_bytes,
+)
 
 
 MONITOR_HEARTBEAT_SECONDS = 30
@@ -33,6 +45,280 @@ _UPLOAD_GAP_LOCK = threading.Lock()
 _UPLOAD_GAP_STATE_BROKEN = False
 
 RENDER_QUEUE_DEFAULT_WORKERS = 2
+
+
+def _history_contains_item(conn, item, channel_id, content_key):
+    """Match current identity to both new fingerprints and legacy source IDs."""
+    rows = conn.execute(
+        "SELECT content_key, source_post_id, source_url FROM published_history "
+        "WHERE channel_id = ? OR channel_id IS NULL",
+        (channel_id,),
+    ).fetchall()
+    post_id = str(item.get("post_id") or "").strip()
+    normalized_url = normalize_source_url(item.get("source_url"))
+    for row in rows:
+        if content_key and str(row["content_key"] or "").strip() == content_key:
+            return True
+        if post_id and str(row["source_post_id"] or "").strip() == post_id:
+            return True
+        old_url = normalize_source_url(row["source_url"])
+        if normalized_url and old_url == normalized_url:
+            return True
+    return False
+
+
+def _store_content_fingerprint(queue_id, claim_token, content_key, allow_duplicate=False):
+    """Persist a file fingerprint and serialize same-project queue dedupe."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT project_name, claim_token FROM video_queue WHERE id = ?",
+            (queue_id,),
+        ).fetchone()
+        if not row or str(row["claim_token"] or "") != claim_token:
+            conn.rollback()
+            return "claim_lost"
+        duplicate = conn.execute(
+            "SELECT id FROM video_queue WHERE project_name = ? AND content_key = ? AND id != ? LIMIT 1",
+            (row["project_name"], content_key, queue_id),
+        ).fetchone()
+        if duplicate and not allow_duplicate:
+            conn.execute(
+                "UPDATE video_queue SET status = 'SkippedDuplicate', "
+                "error_message = ? WHERE id = ? AND claim_token = ?",
+                (f"Nội dung trùng với video #{duplicate['id']} trong cùng dự án.", queue_id, claim_token),
+            )
+            conn.commit()
+            return "duplicate"
+        conn.execute(
+            "UPDATE video_queue SET content_key = ? WHERE id = ? AND claim_token = ?",
+            (content_key, queue_id, claim_token),
+        )
+        conn.commit()
+        return "stored"
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _acquire_content_reservation(queue_id, claim_token, item, channel_id, force_reupload=False):
+    """Atomically reserve one identity for one channel before the upload wait."""
+    content_key = source_dedupe_key(item, queue_id)
+    if not content_key:
+        raise RuntimeError("Không xác định được khóa nội dung để chống đăng trùng.")
+    channel_id = int(channel_id)
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute(
+            "SELECT claim_token FROM video_queue WHERE id = ?",
+            (queue_id,),
+        ).fetchone()
+        if not owner or str(owner["claim_token"] or "") != claim_token:
+            conn.rollback()
+            return content_key, "claim_lost"
+
+        if not force_reupload and _history_contains_item(
+            conn, item, channel_id, str(item.get("content_key") or "").strip()
+        ):
+            conn.commit()
+            return content_key, "published"
+
+        existing = conn.execute(
+            "SELECT queue_id, claim_token, state FROM content_reservations "
+            "WHERE content_key = ? AND channel_id = ?",
+            (content_key, channel_id),
+        ).fetchone()
+        if existing:
+            if (
+                int(existing["queue_id"]) == int(queue_id)
+                and str(existing["claim_token"] or "") == claim_token
+                and str(existing["state"] or "Active") == "Active"
+            ):
+                conn.commit()
+                return content_key, "acquired"
+            state = str(existing["state"] or "Active")
+            conn.commit()
+            return content_key, "needs_review" if state == "NeedsReview" else "busy"
+
+        conn.execute(
+            "INSERT INTO content_reservations "
+            "(content_key, channel_id, queue_id, claim_token, state) VALUES (?, ?, ?, ?, 'Active')",
+            (content_key, channel_id, queue_id, claim_token),
+        )
+        conn.commit()
+        return content_key, "acquired"
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _set_content_reservation_state(content_key, channel_id, queue_id, claim_token, state):
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE content_reservations SET state = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE content_key = ? AND channel_id = ? AND queue_id = ? AND claim_token = ?",
+            (state, content_key, channel_id, queue_id, claim_token),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _validate_content_reservation(content_key, channel_id, queue_id, claim_token, item, force_reupload=False):
+    """Recheck lock ownership and history immediately before invoking the uploader."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        reservation = conn.execute(
+            "SELECT state FROM content_reservations WHERE content_key = ? AND channel_id = ? "
+            "AND queue_id = ? AND claim_token = ?",
+            (content_key, int(channel_id), queue_id, claim_token),
+        ).fetchone()
+        if not reservation or str(reservation["state"] or "Active") != "Active":
+            conn.rollback()
+            return "reservation_lost"
+        if not force_reupload and _history_contains_item(
+            conn, item, int(channel_id), str(item.get("content_key") or "").strip()
+        ):
+            conn.commit()
+            return "published"
+        conn.commit()
+        return "ready"
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _release_content_reservation(content_key, channel_id, queue_id, claim_token):
+    conn = get_conn()
+    try:
+        conn.execute(
+            "DELETE FROM content_reservations WHERE content_key = ? AND channel_id = ? "
+            "AND queue_id = ? AND claim_token = ? AND state = 'Active'",
+            (content_key, channel_id, queue_id, claim_token),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _history_source_post_id(item, queue_id):
+    post_id = str(item.get("post_id") or "").strip()
+    if post_id:
+        return post_id
+    normalized_url = normalize_source_url(item.get("source_url"))
+    return f"url:{normalized_url}" if normalized_url else f"queue:{queue_id}"
+
+
+def _start_upload_attempt(queue_id, claim_token, item, channel_id):
+    """Create an attempt or advance a previously authorized single-item retry."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        queue = conn.execute(
+            "SELECT claim_token, manual_reupload_authorized, manual_reupload_reason, last_attempt_id "
+            "FROM video_queue WHERE id = ?",
+            (queue_id,),
+        ).fetchone()
+        if not queue or str(queue["claim_token"] or "") != claim_token:
+            conn.rollback()
+            return None
+
+        authorized = bool(queue["manual_reupload_authorized"])
+        attempt = None
+        if authorized and queue["last_attempt_id"]:
+            attempt = conn.execute(
+                "SELECT id, outcome FROM upload_attempts WHERE id = ? AND queue_id = ?",
+                (queue["last_attempt_id"], queue_id),
+            ).fetchone()
+            if attempt and attempt["outcome"] != "Authorized":
+                attempt = None
+
+        if attempt:
+            attempt_id = int(attempt["id"])
+            conn.execute(
+                "UPDATE upload_attempts SET phase = 'Uploading', outcome = 'InProgress', "
+                "channel_id = ?, content_key = ?, source_post_id = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
+                (
+                    channel_id,
+                    str(item.get("content_key") or "").strip(),
+                    _history_source_post_id(item, queue_id),
+                    attempt_id,
+                ),
+            )
+        else:
+            attempt_no = conn.execute(
+                "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM upload_attempts WHERE queue_id = ?",
+                (queue_id,),
+            ).fetchone()[0]
+            cur = conn.execute(
+                "INSERT INTO upload_attempts "
+                "(queue_id, attempt_no, attempt_type, source_post_id, content_key, channel_id, phase, outcome, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'Uploading', 'InProgress', ?)",
+                (
+                    queue_id,
+                    attempt_no,
+                    "manual_reupload" if authorized else "upload",
+                    _history_source_post_id(item, queue_id),
+                    str(item.get("content_key") or "").strip(),
+                    channel_id,
+                    str(queue["manual_reupload_reason"] or "") if authorized else "",
+                ),
+            )
+            attempt_id = int(cur.lastrowid)
+
+        conn.execute(
+            "UPDATE video_queue SET last_attempt_id = ?, manual_reupload_authorized = 0, "
+            "manual_reupload_reason = '' WHERE id = ? AND claim_token = ?",
+            (attempt_id, queue_id, claim_token),
+        )
+        conn.commit()
+        return attempt_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _finish_upload_attempt(attempt_id, outcome, published_url="", error_message=""):
+    if not attempt_id:
+        return
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE upload_attempts SET phase = 'Finished', outcome = ?, published_url = ?, "
+            "error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (outcome, published_url or "", error_message or "", attempt_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_upload_attempt_phase(attempt_id, phase):
+    if not attempt_id or not phase:
+        return
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE upload_attempts SET phase = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ? AND outcome = 'InProgress'",
+            (phase, attempt_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _monitor_source_already_published(conn, source_post_id: str, target_channel_id: Optional[int]) -> bool:
@@ -103,12 +389,13 @@ def insert_monitor_queue_item(
             project_name, source_type, platform, post_id, source_url, input_video_path,
             title, description, tags, duration, view_count, like_count,
             upload_to, visibility, target_type, target_channel_id, target_group_name,
+            target_group_names_json, group_schema_version,
             option_group_id, render_mode, render_config_json, emulate_mobile, status
         )
         SELECT
             :proj, :src_type, :platform, :pid, :src_url, :input_path,
             :title, :desc, :tags, :duration, :views, :likes,
-            :upload_to, 'public', :target_type, :chan, :grp,
+            :upload_to, 'public', :target_type, :chan, :grp, :groups_json, :group_schema_version,
             :opt_id, :render_mode, :render_cfg, 0, 'Pending'
         WHERE NOT EXISTS (
             SELECT 1 FROM video_queue WHERE {_MONITOR_QUEUED_PREDICATE}
@@ -131,6 +418,8 @@ def insert_monitor_queue_item(
             "target_type": "CHANNEL" if mon.get("target_channel_id") else "GROUP",
             "chan": mon.get("target_channel_id"),
             "grp": grp_norm,
+            "groups_json": serialize_group_names([grp_norm]) if not mon.get("target_channel_id") else "[]",
+            "group_schema_version": GROUP_SCHEMA_VERSION,
             "opt_id": mon.get("option_group_id"),
             "render_mode": mon.get("render_mode") or "shorts_9_16",
             "render_cfg": mon.get("render_config_json") or "{}",
@@ -422,6 +711,75 @@ class PipelineManager:
                        OR status LIKE 'Chờ giãn cách đăng%'
                        OR (status = 'Completed' AND COALESCE(published_url, '') = '' AND COALESCE(claim_token, '') != '')
                 """)
+                reservations_exist = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'content_reservations'"
+                ).fetchone()
+                if reservations_exist:
+                    # The singleton lock guarantees these Active reservations belong
+                    # to a dead process. Ambiguous uploads remain reserved for review;
+                    # work known to be safe to retry can release its reservation.
+                    conn.execute("""
+                        UPDATE content_reservations
+                        SET state = 'NeedsReview', updated_at = CURRENT_TIMESTAMP
+                        WHERE state = 'Active' AND (
+                            NOT EXISTS (
+                                SELECT 1 FROM video_queue q
+                                WHERE q.id = content_reservations.queue_id
+                            )
+                            OR EXISTS (
+                                SELECT 1 FROM video_queue q
+                                WHERE q.id = content_reservations.queue_id
+                                  AND q.status = 'NeedsReview'
+                            )
+                        )
+                    """)
+                    conn.execute("""
+                        DELETE FROM content_reservations
+                        WHERE state = 'Active' AND EXISTS (
+                            SELECT 1 FROM video_queue q
+                            WHERE q.id = content_reservations.queue_id
+                              AND q.status != 'NeedsReview'
+                        )
+                    """)
+                attempts_exist = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'upload_attempts'"
+                ).fetchone()
+                queue_columns = {row[1] for row in conn.execute("PRAGMA table_info(video_queue)").fetchall()}
+                if attempts_exist and "last_attempt_id" in queue_columns:
+                    conn.execute("""
+                        UPDATE upload_attempts
+                        SET phase = 'Recovered', outcome = 'Completed',
+                            published_url = (
+                                SELECT published_url FROM video_queue q
+                                WHERE q.last_attempt_id = upload_attempts.id
+                            ),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE outcome = 'InProgress' AND id IN (
+                            SELECT last_attempt_id FROM video_queue
+                            WHERE status = 'Completed' AND COALESCE(published_url, '') != ''
+                              AND last_attempt_id IS NOT NULL
+                        )
+                    """)
+                    conn.execute("""
+                        UPDATE upload_attempts
+                        SET phase = 'Recovered', outcome = 'NeedsReview',
+                            error_message = 'Ứng dụng dừng sau khi bắt đầu upload; cần đối soát YouTube.',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE outcome = 'InProgress' AND id IN (
+                            SELECT last_attempt_id FROM video_queue
+                            WHERE status = 'NeedsReview' AND last_attempt_id IS NOT NULL
+                        )
+                    """)
+                    conn.execute("""
+                        UPDATE upload_attempts
+                        SET phase = 'Recovered', outcome = 'NotSent',
+                            error_message = 'Ứng dụng dừng trước khi gửi yêu cầu upload.',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE outcome = 'InProgress' AND id IN (
+                            SELECT last_attempt_id FROM video_queue
+                            WHERE status != 'NeedsReview' AND last_attempt_id IS NOT NULL
+                        )
+                    """)
                 conn.commit()
                 recovered = cur.rowcount
             finally:
@@ -496,6 +854,12 @@ class PipelineManager:
             if self._is_running or self._active_threads > 0:
                 return {"ok": False, "message": "Hệ thống đang chạy hoặc đang dừng một tiến trình khác."}
 
+            if do_upload:
+                try:
+                    self._freeze_batch_assignments(item_ids)
+                except Exception as exc:
+                    return {"ok": False, "message": f"Không thể xác nhận kênh đích cho batch: {exc}"}
+
             self._stop_event.clear()
             self._is_running = True
             self._batch_upload_box = {"n": 0}
@@ -521,6 +885,120 @@ class PipelineManager:
                 self._active_threads = 0
             return {"ok": False, "message": f"Không thể khởi chạy tiến trình: {exc}"}
         return {"ok": True, "message": f"Đã bắt đầu xử lý {len(item_ids)} video."}
+
+    @staticmethod
+    def _freeze_batch_assignments(item_ids: List[int]) -> Dict[int, int]:
+        """Validate destinations and persist channel assignments before worker threads start."""
+        conn = get_conn()
+        frozen: Dict[int, int] = {}
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for item_id in item_ids:
+                row = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
+                if not row:
+                    raise ValueError(f"Video #{item_id} không còn trong hàng đợi.")
+                item = dict(row)
+                status = str(item.get("status") or "").strip()
+                if item.get("claim_token") or status.startswith(("Uploading", "Downloading", "Rendering", "Đang đăng")):
+                    raise ValueError(f"Video #{item_id} đang được worker xử lý; hãy đợi lượt đó kết thúc.")
+
+                validate_queue_fields(item)
+                validate_metadata_fields(item, require_title=True)
+                source_type = str(item.get("source_type") or "").lower()
+                platform = str(item.get("platform") or "").lower()
+                if source_type not in {"file", "localfile"} and platform not in {"localfile", "localupload"}:
+                    item["source_url"] = validate_source_url(item.get("source_url"))
+                channel, frozen_groups = choose_target_channel(conn, item, validate_existing_assignment=True)
+                channel_id = int(channel["id"])
+                groups = frozen_groups
+
+                if not str(channel.get("channel_id") or "").strip():
+                    raise ValueError(
+                        f"Kênh '{channel.get('name') or channel_id}' chưa có Channel ID; "
+                        "hãy bổ sung ID trước khi chạy."
+                    )
+                legacy_group = groups[0] if groups else str(item.get("target_group_name") or "")
+                conn.execute(
+                    "UPDATE video_queue SET assigned_channel_id = ?, assigned_group_names_json = ?, "
+                    "target_group_names_json = CASE WHEN ? = 'GROUP' THEN ? ELSE target_group_names_json END, "
+                    "target_group_name = CASE WHEN ? = 'GROUP' THEN ? ELSE target_group_name END, "
+                    "group_schema_version = 1 WHERE id = ?",
+                    (
+                        channel_id,
+                        serialize_group_names(frozen_groups),
+                        str(item.get("target_type") or "GROUP").upper(),
+                        serialize_group_names(groups),
+                        str(item.get("target_type") or "GROUP").upper(),
+                        legacy_group,
+                        item_id,
+                    ),
+                )
+                frozen[item_id] = channel_id
+            conn.commit()
+            return frozen
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def preview_distribution(item_ids: List[int]) -> List[Dict[str, Any]]:
+        conn = get_conn()
+        previews: List[Dict[str, Any]] = []
+        try:
+            for item_id in item_ids:
+                row = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
+                if not row:
+                    previews.append({"id": item_id, "blocked": True, "reasons": ["video không còn tồn tại"]})
+                    continue
+                item = dict(row)
+                entry: Dict[str, Any] = {
+                    "id": int(item_id),
+                    "title": item.get("title") or f"#{item_id}",
+                    "visibility": item.get("visibility") or "public",
+                    "schedule_time": item.get("schedule_time") or "",
+                    "groups": [],
+                    "channel_id": None,
+                    "channel_name": "",
+                    "warnings": [],
+                    "reasons": [],
+                    "blocked": False,
+                }
+                try:
+                    normalized = validate_queue_fields(item)
+                    validate_metadata_fields(item, require_title=True)
+                    source_type = str(item.get("source_type") or "").lower()
+                    platform = str(item.get("platform") or "").lower()
+                    if source_type not in {"file", "localfile"} and platform not in {"localfile", "localupload"}:
+                        validate_source_url(item.get("source_url"))
+                    entry["visibility"] = normalized["visibility"]
+                    entry["schedule_time"] = normalized["schedule_time"]
+                    channel, groups = choose_target_channel(conn, item, validate_existing_assignment=True)
+                    entry["groups"] = groups
+                    entry["channel_id"] = int(channel["id"])
+                    entry["channel_name"] = str(channel.get("name") or "")
+                    if not str(channel.get("channel_id") or "").strip():
+                        entry["reasons"].append("kênh đích thiếu Channel ID")
+                    try:
+                        if _history_contains_item(
+                            conn, item, int(channel["id"]), str(item.get("content_key") or "").strip()
+                        ):
+                            entry["warnings"].append("nội dung đã có trong lịch sử đăng ở kênh này")
+                    except Exception:
+                        entry["warnings"].append("không kiểm tra được lịch sử đăng trùng")
+                    if str(item.get("status") or "").strip() == "NeedsReview":
+                        entry["reasons"].append("cần đối soát lượt đăng trước")
+                    status = str(item.get("status") or "")
+                    if item.get("claim_token") or status.startswith(("Uploading", "Downloading", "Rendering", "Đang đăng")):
+                        entry["reasons"].append("đang được worker khác giữ")
+                except Exception as exc:
+                    entry["reasons"].append(str(exc))
+                entry["blocked"] = bool(entry["reasons"])
+                previews.append(entry)
+        finally:
+            conn.close()
+        return previews
 
     def _batch_worker_guarded(
         self,
@@ -644,6 +1122,7 @@ class PipelineManager:
 
         item = dict(row)
         title = item.get("title") or f"Video #{item_id}"
+        manual_reupload_authorized = bool(item.get("manual_reupload_authorized"))
         # Mỗi làn (batch / monitor) mang stop-event và bộ đếm riêng: bấm Dừng batch
         # không được phép giết item của monitor (S1), bộ đếm giới hạn cũng tách làn (S3).
         se = stop_event if stop_event is not None else self._stop_event
@@ -719,11 +1198,43 @@ class PipelineManager:
             return updated
 
         def _make_progress_cb(progress_col: str):
-            state = {"last_pct": -1, "last_time": 0.0}
+            state = {"last_pct": -1, "last_time": 0.0, "stage": ""}
 
             def _cb(pct: int, msg: str):
                 if se.is_set():
                     return
+                if progress_col == "upload_progress" and upload_attempt_id:
+                    text = str(msg or "").casefold()
+                    if "checks" in text or "kiểm duyệt" in text or "bản quyền" in text:
+                        stage = "Checks"
+                    elif "hiển thị" in text or "visibility" in text or "lịch đăng" in text:
+                        stage = "Visibility"
+                    elif "đang gửi đăng" in text or "xuất bản" in text or "publish" in text:
+                        stage = "Publishing"
+                    elif "xác minh video" in text or "đọc lại metadata" in text or "verifying" in text:
+                        stage = "VerifyingResult"
+                    elif "đang xử lý video" in text or "processing" in text:
+                        stage = "Processing"
+                    elif "điền" in text or "metadata" in text or "tiêu đề" in text:
+                        stage = "Metadata"
+                    elif "chuyển file" in text or "upload" in text or "tải lên" in text:
+                        stage = "Transferring"
+                    elif "kênh" in text or "studio" in text or "profile" in text:
+                        stage = "VerifyingChannel"
+                    else:
+                        stage = ""
+                    if stage and stage != state["stage"]:
+                        state["stage"] = stage
+                        try:
+                            _set_upload_attempt_phase(upload_attempt_id, stage)
+                            _update_row(status=f"Uploading -> {stage}")
+                        except Exception as phase_err:
+                            add_log(
+                                "Pipeline",
+                                f"Không lưu được giai đoạn upload '{stage}': {phase_err}",
+                                "WARNING",
+                                video_title=title,
+                            )
                 now = time.time()
                 if pct >= 100 or abs(pct - state["last_pct"]) >= 3 or (now - state["last_time"]) >= 0.8:
                     state["last_pct"] = pct
@@ -734,7 +1245,36 @@ class PipelineManager:
 
             return _cb
 
+        reservation_key = ""
+        reservation_channel_id = None
+        reservation_owned = False
+        reservation_keep = False
+        upload_started = False
+        upload_attempt_id = None
+        channel = None
+        option_group = None
+
         try:
+            if do_upload:
+                channel = self._resolve_target_channel(item, row_idx)
+                if not channel:
+                    raise RuntimeError(
+                        "Chưa chọn Kênh YouTube đích hoặc Nhóm Kênh chưa có kênh nào. "
+                        "Hãy thêm/chọn kênh trước khi chạy video."
+                    )
+                if item.get("option_group_id"):
+                    c_opt = get_conn()
+                    try:
+                        og_row = c_opt.execute(
+                            "SELECT * FROM upload_option_groups WHERE id = ?",
+                            (item["option_group_id"],),
+                        ).fetchone()
+                    finally:
+                        c_opt.close()
+                    if og_row:
+                        option_group = dict(og_row)
+                validate_upload_preflight(item, channel, option_group)
+
             input_path = item.get("input_video_path") or ""
             thumb_path = item.get("thumbnail_path") or ""
 
@@ -743,12 +1283,14 @@ class PipelineManager:
                 if se.is_set():
                     _update_row(status="Stopped")
                     return
+                ensure_disk_space(APP_TEMP_DIR, MIN_DOWNLOAD_HEADROOM_BYTES, "tải video")
                 _update_row(status="Downloading...", download_progress=5, error_message="")
                 dl_res = download_video(
                     source_url=item.get("source_url") or "",
                     post_id=item.get("post_id") or str(item_id),
                     progress_callback=_make_progress_cb("download_progress"),
                     stop_event=se,
+                    owner_id=item_id,
                 )
                 input_path = dl_res["video_path"]
                 thumb_path = dl_res.get("thumbnail_path") or thumb_path
@@ -765,12 +1307,47 @@ class PipelineManager:
 
             # BƯỚC 2: RENDER & LÁCH BẢN QUYỀN FFMPEG
             output_path = item.get("output_video_path") or ""
+            # Hash file trong worker để không chặn request thêm local path. Ưu tiên
+            # file nguồn; chỉ dùng output cũ khi queue không còn file nguồn.
+            identity_path = input_path if input_path and os.path.isfile(input_path) else ""
+            if not identity_path and output_path and os.path.isfile(output_path):
+                identity_path = output_path
+            if identity_path:
+                content_key = sha256_file(identity_path)
+                stored = _store_content_fingerprint(
+                    item_id,
+                    token,
+                    content_key,
+                    allow_duplicate=manual_reupload_authorized or force_reupload,
+                )
+                if stored == "duplicate":
+                    add_log(
+                        "Pipeline",
+                        f"Bỏ qua '{title}': nội dung trùng với video khác trong cùng dự án.",
+                        "WARNING",
+                        video_title=title,
+                    )
+                    return
+                if stored == "claim_lost":
+                    add_log(
+                        "Pipeline",
+                        f"Bỏ qua '{title}': worker không còn sở hữu hàng đợi khi lưu fingerprint.",
+                        "WARNING",
+                        video_title=title,
+                    )
+                    return
+                item["content_key"] = content_key
+
             if do_render:
                 if se.is_set():
                     _update_row(status="Stopped")
                     return
                 if not input_path or not os.path.exists(input_path):
                     raise FileNotFoundError("Chưa có file video gốc để Render.")
+
+                ensure_disk_space(
+                    APP_OUTPUT_DIR, estimate_render_bytes(input_path), "render video"
+                )
 
                 _update_row(status="Rendering...", render_progress=5, error_message="")
                 try:
@@ -792,6 +1369,7 @@ class PipelineManager:
                         progress_callback=_make_progress_cb("render_progress"),
                         stop_event=se,
                         owner=owner,
+                        owner_id=item_id,
                     ).result()
                 except InterruptedError:
                     _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
@@ -811,7 +1389,7 @@ class PipelineManager:
                 # 'generate' = luôn tự chụp từ video render. Mặc định reup.
                 thumb_source = str(get_settings().get("thumbnail_source") or "reup").lower()
                 if thumb_source == "generate" or not thumb_path or not os.path.exists(thumb_path):
-                    gen_thumb = generate_thumbnail_from_video(output_path or input_path)
+                    gen_thumb = generate_thumbnail_from_video(output_path or input_path, owner_id=item_id)
                     if gen_thumb:
                         thumb_path = gen_thumb
 
@@ -847,7 +1425,6 @@ class PipelineManager:
                             return
                         counter["n"] += 1
 
-                channel = self._resolve_target_channel(item, row_idx)
                 if not channel:
                     raise RuntimeError(
                         "Chưa chọn Kênh YouTube đích hoặc Nhóm Kênh chưa có kênh nào. Hãy thêm/chọn kênh ở tab Quản Lý Kênh."
@@ -858,16 +1435,45 @@ class PipelineManager:
                 conn_f.close()
                 fresh_item = dict(f_row) if f_row else item
 
-                option_group = None
-                if fresh_item.get("option_group_id"):
-                    c_opt = get_conn()
-                    og_row = c_opt.execute(
-                        "SELECT * FROM upload_option_groups WHERE id = ?",
-                        (fresh_item["option_group_id"],),
-                    ).fetchone()
-                    c_opt.close()
-                    if og_row:
-                        option_group = dict(og_row)
+                reservation_key, reservation_result = _acquire_content_reservation(
+                    item_id,
+                    token,
+                    fresh_item,
+                    channel["id"],
+                    force_reupload=force_reupload or manual_reupload_authorized,
+                )
+                reservation_channel_id = int(channel["id"])
+                if reservation_result == "published":
+                    _update_row(
+                        status="SkippedDuplicate",
+                        error_message=f"Nguồn này đã được đăng lên kênh {channel['name']} trước đó.",
+                    )
+                    add_log(
+                        "Pipeline",
+                        f"Bỏ qua '{title}': nội dung/nguồn đã có trong lịch sử kênh [{channel['name']}].",
+                        "WARNING",
+                        channel_name=channel["name"],
+                        video_title=title,
+                    )
+                    return
+                if reservation_result == "claim_lost":
+                    return
+                if reservation_result in ("busy", "needs_review"):
+                    message = (
+                        "Nội dung này đang có lượt đăng cần đối soát trên kênh đích."
+                        if reservation_result == "needs_review"
+                        else "Nội dung này đang được một worker khác đăng lên kênh đích; có thể chạy lại sau."
+                    )
+                    _update_row(status="Pending", error_message=message)
+                    add_log(
+                        "Pipeline",
+                        f"Tạm hoãn '{title}': {message}",
+                        "WARNING",
+                        channel_name=channel["name"],
+                        video_title=title,
+                    )
+                    return
+                reservation_owned = reservation_result == "acquired"
 
                 # P0-7: giãn cách bắt buộc >= 30 phút, tính từ mốc muộn hơn giữa
                 # lúc bắt đầu và kết thúc lượt upload trước. Fail closed nếu mốc không đọc được.
@@ -891,7 +1497,43 @@ class PipelineManager:
                     _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
                     return
 
-                _update_row(status=f"Uploading -> {channel['name']}", upload_progress=10, error_message="")
+                reservation_check = _validate_content_reservation(
+                    reservation_key,
+                    reservation_channel_id,
+                    item_id,
+                    token,
+                    fresh_item,
+                    force_reupload=force_reupload or manual_reupload_authorized,
+                )
+                if reservation_check == "published":
+                    _update_row(
+                        status="SkippedDuplicate",
+                        error_message=f"Nguồn này đã được đăng lên kênh {channel['name']} trong lúc chờ giãn cách.",
+                    )
+                    return
+                if reservation_check != "ready":
+                    _update_row(
+                        status="Pending",
+                        error_message="Reservation chống trùng không còn thuộc worker này; lượt đăng chưa được gửi.",
+                    )
+                    return
+
+                upload_attempt_id = _start_upload_attempt(
+                    item_id,
+                    token,
+                    fresh_item,
+                    reservation_channel_id,
+                )
+                if not upload_attempt_id:
+                    _update_row(
+                        status="Pending",
+                        error_message="Worker không còn quyền sở hữu lượt đăng; chưa gửi yêu cầu lên YouTube.",
+                    )
+                    return
+                if not _update_row(status=f"Uploading -> {channel['name']}", upload_progress=10, error_message=""):
+                    _finish_upload_attempt(upload_attempt_id, "NotSent", error_message="Claim đã đổi trước khi gọi uploader.")
+                    return
+                upload_started = True
                 try:
                     pub_res = upload_video_to_youtube(
                         video_item=fresh_item,
@@ -916,7 +1558,15 @@ class PipelineManager:
                     is_uncertain = False
                     warning_msg = ""
 
-                result_unverified = is_uncertain or not (pub_url or "").strip()
+                raw_pub_url = str(pub_url or "").strip()
+                pub_url = normalize_published_video_url(raw_pub_url)
+                invalid_url_warning = ""
+                if raw_pub_url and not pub_url:
+                    invalid_url_warning = (
+                        "Uploader trả URL không phải URL video YouTube hợp lệ; không ghi Completed. "
+                        "Hãy đối soát kết quả trong YouTube Studio."
+                    )
+                result_unverified = is_uncertain or not pub_url
 
                 if is_cancelled:
                     _update_row(
@@ -924,6 +1574,7 @@ class PipelineManager:
                         status="Đã Hủy (Dính Bản Quyền)",
                         error_message=warning_msg,
                     )
+                    _finish_upload_attempt(upload_attempt_id, "Cancelled", error_message=warning_msg)
                     add_log(
                         "Upload",
                         f"🛑 ĐÃ HỦY ĐĂNG lên kênh [{channel['name']}] do CẢNH BÁO VI PHẠM BẢN QUYỀN: {warning_msg}",
@@ -938,6 +1589,7 @@ class PipelineManager:
                         published_url=pub_url,
                         error_message=warning_msg,
                     )
+                    _finish_upload_attempt(upload_attempt_id, "Warning", pub_url, warning_msg)
                     add_log(
                         "Upload",
                         f"⚠️ Cảnh báo bản quyền: {warning_msg}",
@@ -948,7 +1600,7 @@ class PipelineManager:
                 elif result_unverified:
                     # Đã bấm Xuất bản nhưng không xác minh được URL video.
                     # Không được báo Completed và không tự xóa/move file nguồn.
-                    uncertain_msg = warning_msg or (
+                    uncertain_msg = warning_msg or invalid_url_warning or (
                         "Không xác minh được video đã đăng thành công (thiếu URL từ YouTube Studio). "
                         "Có thể video đã lên Studio — hãy kiểm tra trực tiếp trước khi chạy lại để tránh đăng trùng."
                     )
@@ -957,6 +1609,8 @@ class PipelineManager:
                         status="NeedsReview",
                         error_message=uncertain_msg,
                     )
+                    reservation_keep = True
+                    _finish_upload_attempt(upload_attempt_id, "NeedsReview", error_message=uncertain_msg)
                     add_log(
                         "Upload",
                         f"❌ KHÔNG xác minh được kết quả đăng lên kênh [{channel['name']}]: {uncertain_msg}",
@@ -965,14 +1619,20 @@ class PipelineManager:
                         video_title=title,
                     )
                 else:
-                    _update_row(
+                    completed_saved = _update_row(
                         upload_progress=100,
                         status="Completed",
                         published_url=pub_url,
                         error_message="",
                     )
+                    if not completed_saved:
+                        reservation_keep = True
+                        raise RuntimeError("Không lưu được trạng thái Completed sau khi YouTube trả URL.")
                     # Ghi lịch sử cho MỌI nguồn (link, kéo-thả, local path), không chỉ Monitor.
-                    self._record_published_history_for_item(item_id, channel)
+                    if not self._record_published_history_for_item(item_id, channel):
+                        reservation_keep = True
+                        raise RuntimeError("Không ghi được published_history sau khi YouTube trả URL.")
+                    _finish_upload_attempt(upload_attempt_id, "Completed", pub_url)
                     add_log(
                         "Upload",
                         f"✅ Đăng thành công lên kênh [{channel['name']}]: {pub_url}",
@@ -993,95 +1653,125 @@ class PipelineManager:
                             if not dest_file.exists():
                                 shutil.move(str(p), str(dest_file))
                                 _update_row(input_video_path=str(dest_file))
+                                try:
+                                    temp_root = os.path.normcase(str(APP_TEMP_DIR.resolve()))
+                                    moved_path = os.path.normcase(str(dest_file.resolve()))
+                                    if os.path.commonpath([moved_path, temp_root]) == temp_root:
+                                        try:
+                                            register_managed_artifact(str(dest_file), "upload_archive", "queue", item_id)
+                                        except Exception as manifest_err:
+                                            add_log("Storage", f"Không ghi được manifest cho file archive queue #{item_id}; file được giữ lại ({type(manifest_err).__name__}).", "WARNING", video_title=title)
+                                except (OSError, ValueError):
+                                    pass
+                                input_path = str(dest_file)
                                 add_log("Pipeline", f"Đã lưu trữ video gốc vào: {dest_file}", "INFO")
                     except Exception as mv_err:
                         add_log("Pipeline", f"Không thể di chuyển file vào uploaded/: {mv_err}", "WARNING")
 
                 # Xóa file tạm nếu cài đặt yêu cầu — chỉ xóa file nằm trong thư mục temp/ của tool
                 settings = get_settings()
-                if settings.get("delete_temp_after_upload") and input_path and not result_unverified:
+                if (
+                    settings.get("delete_temp_after_upload") and input_path and pub_url
+                    and not is_cancelled and not is_flagged and not result_unverified
+                ):
                     try:
-                        real_input = os.path.realpath(input_path)
-                        temp_root = os.path.realpath(str(APP_TEMP_DIR))
-                        if real_input.startswith(temp_root):
-                            os.remove(real_input)
+                        delete_completed_temp_artifact(input_path, item_id)
                     except Exception:
-                        pass
+                        add_log("Storage", f"Không xóa artifact tạm thuộc queue #{item_id}; file được giữ để kiểm tra.", "WARNING", video_title=title)
 
         except InterruptedError:
-            _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
-            add_log("Pipeline", f"Đã dừng xử lý video: {title}", "WARNING", video_title=title)
+            if upload_started:
+                reservation_keep = True
+                _finish_upload_attempt(
+                    upload_attempt_id,
+                    "NeedsReview",
+                    error_message="Worker bị ngắt sau khi gọi uploader; cần đối soát Studio.",
+                )
+                _update_row(
+                    status="NeedsReview",
+                    error_message="Worker bị ngắt trong lượt upload; hãy kiểm tra YouTube Studio trước khi chạy lại.",
+                )
+                add_log(
+                    "Pipeline",
+                    f"Giữ '{title}' để đối soát vì worker bị ngắt sau khi bắt đầu upload.",
+                    "WARNING",
+                    video_title=title,
+                )
+            else:
+                _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
+                add_log("Pipeline", f"Đã dừng xử lý video: {title}", "WARNING", video_title=title)
         except Exception as e:
+            if upload_started:
+                reservation_keep = True
+                err_msg = str(e)
+                try:
+                    _finish_upload_attempt(upload_attempt_id, "NeedsReview", error_message=err_msg)
+                except Exception:
+                    pass
+                _update_row(
+                    status="NeedsReview",
+                    error_message=(
+                        "Không xác định được kết quả sau khi bắt đầu upload. Hãy kiểm tra YouTube Studio "
+                        f"trước khi chạy lại. Chi tiết: {err_msg}"
+                    ),
+                )
+                add_log(
+                    "Error",
+                    f"Lỗi sau khi bắt đầu upload '{title}'; giữ reservation để đối soát: {err_msg}",
+                    "ERROR",
+                    video_title=title,
+                )
+                return
             if se.is_set():
                 _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
                 return
             err_msg = str(e)
             _update_row(status="Error", error_message=err_msg)
             add_log("Error", f"Lỗi xử lý '{title}': {err_msg}", "ERROR", video_title=title)
+        finally:
+            if reservation_owned:
+                try:
+                    _set_content_reservation_state(
+                        reservation_key,
+                        reservation_channel_id,
+                        item_id,
+                        token,
+                        "NeedsReview",
+                    ) if reservation_keep else _release_content_reservation(
+                        reservation_key,
+                        reservation_channel_id,
+                        item_id,
+                        token,
+                    )
+                except Exception as reservation_error:
+                    try:
+                        add_log(
+                            "Pipeline",
+                            f"Không cập nhật được reservation chống trùng cho '{title}': {reservation_error}",
+                            "ERROR",
+                            video_title=title,
+                        )
+                    except Exception:
+                        pass
 
     def _resolve_target_channel(self, item: Dict[str, Any], row_idx: int) -> Dict[str, Any]:
         conn = get_conn()
         try:
-            if item.get("target_channel_id"):
-                ch = conn.execute(
-                    "SELECT * FROM youtube_channels WHERE id = ?",
-                    (item["target_channel_id"],),
-                ).fetchone()
-                if not ch:
-                    raise RuntimeError(
-                        f"Kênh đích đã chọn (ID {item['target_channel_id']}) không còn tồn tại hoặc đã bị xóa. "
-                        "Hãy chọn lại kênh cụ thể trước khi bắt đầu — hệ thống không tự đăng sang kênh khác."
-                    )
-                return dict(ch)
-
-            target_prof = (item.get("target_profile_name") or "").strip()
-            if target_prof:
-                channels_in_prof = conn.execute(
-                    "SELECT * FROM youtube_channels WHERE profile_name = ? ORDER BY id ASC",
-                    (target_prof,),
-                ).fetchall()
-                if not channels_in_prof:
-                    raise RuntimeError(
-                        f"Profile '{target_prof}' chưa có kênh YouTube nào. Hãy thêm kênh hoặc chọn kênh cụ thể."
-                    )
-                if len(channels_in_prof) > 1:
-                    names = ", ".join(c["name"] for c in channels_in_prof)
-                    raise RuntimeError(
-                        f"Profile '{target_prof}' có {len(channels_in_prof)} kênh ({names}). "
-                        "Hãy chọn kênh cụ thể để tránh đăng nhầm kênh."
-                    )
-                return dict(channels_in_prof[0])
-
-            if (item.get("target_type") or "").upper() == "CHANNEL":
-                raise RuntimeError(
-                    "Video được gán chế độ 'kênh cụ thể' nhưng không còn kênh hợp lệ (có thể kênh đã bị xóa). "
-                    "Hãy chọn lại kênh trước khi bắt đầu."
-                )
-
-            group_name = (item.get("target_group_name") or "").strip() or "Mặc định"
-            channels = conn.execute(
-                "SELECT * FROM youtube_channels WHERE group_name = ? ORDER BY id ASC",
-                (group_name,),
-            ).fetchall()
-            if not channels:
-                raise RuntimeError(
-                    f"Nhóm kênh '{group_name}' chưa có kênh nào. Hãy thêm kênh vào nhóm hoặc chọn kênh cụ thể."
-                )
-            # Chia vòng theo ID video (không theo thứ tự xử lý) để một video luôn nhận
-            # đúng một kênh dù chạy lại hay batch đổi thứ tự.
-            try:
-                rotation_key = int(item.get("id") or 0)
-            except (TypeError, ValueError):
-                rotation_key = row_idx
-            selected = channels[rotation_key % len(channels)]
+            selected, group_names = choose_target_channel(
+                conn, item, validate_existing_assignment=False
+            )
+            if not group_names and item.get("assigned_channel_id"):
+                group_names = target_group_names(item)
             add_log(
                 "Pipeline",
-                f"Chia kênh theo nhóm '{group_name}': video #{item.get('id')} → '{selected['name']}' "
-                f"(kênh #{selected['id']}).",
+                f"Chọn kênh video #{item.get('id')} → '{selected['name']}' (kênh #{selected['id']})"
+                + (f" từ nhóm: {', '.join(group_names)}." if group_names else "."),
                 "INFO",
                 video_title=item.get("title") or "",
             )
-            return dict(selected)
+            return selected
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
         finally:
             conn.close()
 
@@ -1330,25 +2020,44 @@ class PipelineManager:
         """Ghi published_history cho lượt đăng Completed có link thật.
 
         Trước đây chỉ Auto Monitor ghi bảng này, nên video Completed từ link /
-        kéo-thả / đường dẫn local không được lưu lịch sử và việc chống đăng lại
-        chỉ còn dựa vào video_queue. Dùng cùng khóa (post_id, channel_id) với
-        Monitor; post_id rỗng thì lấy khóa theo id hàng đợi để không gộp nhầm.
+        kéo-thả / đường dẫn local không được lưu lịch sử. Giữ source_post_id để
+        tương thích dữ liệu cũ và lưu content_key riêng cho file đã nhận diện.
         """
         conn = get_conn()
         try:
             row = conn.execute(
-                "SELECT status, published_url, post_id, source_url FROM video_queue WHERE id = ?",
+                "SELECT status, published_url, post_id, source_url, content_key FROM video_queue WHERE id = ?",
                 (queue_id,),
             ).fetchone()
             if not row:
                 return False
             if (row["status"] or "").strip() != "Completed" or not (row["published_url"] or "").strip():
                 return False
-            post_id = (row["post_id"] or "").strip() or f"queue:{queue_id}"
+            post_id = _history_source_post_id(dict(row), queue_id)
             conn.execute(
                 "INSERT OR IGNORE INTO published_history "
-                "(source_post_id, source_url, channel_id, published_url) VALUES (?, ?, ?, ?)",
-                (post_id, row["source_url"] or "", channel.get("id"), (row["published_url"] or "").strip()),
+                "(source_post_id, source_url, channel_id, content_key, published_url) VALUES (?, ?, ?, ?, ?)",
+                (
+                    post_id,
+                    row["source_url"] or "",
+                    channel.get("id"),
+                    (row["content_key"] or "").strip(),
+                    (row["published_url"] or "").strip(),
+                ),
+            )
+            conn.execute(
+                "UPDATE published_history SET "
+                "source_url = CASE WHEN COALESCE(source_url, '') = '' THEN ? ELSE source_url END, "
+                "content_key = CASE WHEN COALESCE(content_key, '') = '' THEN ? ELSE content_key END, "
+                "published_url = CASE WHEN COALESCE(published_url, '') = '' THEN ? ELSE published_url END "
+                "WHERE source_post_id = ? AND channel_id = ?",
+                (
+                    row["source_url"] or "",
+                    (row["content_key"] or "").strip(),
+                    (row["published_url"] or "").strip(),
+                    post_id,
+                    channel.get("id"),
+                ),
             )
             conn.commit()
             return True
@@ -1360,15 +2069,36 @@ class PipelineManager:
         conn = get_conn()
         try:
             row = conn.execute(
-                "SELECT status, published_url FROM video_queue WHERE id = ?", (queue_id,)
+                "SELECT status, published_url, content_key FROM video_queue WHERE id = ?", (queue_id,)
             ).fetchone()
             if not row:
                 return False
             if (row["status"] or "").strip() != "Completed" or not (row["published_url"] or "").strip():
                 return False
             conn.execute(
-                "INSERT OR IGNORE INTO published_history (source_post_id, source_url, channel_id) VALUES (?, ?, ?)",
-                (item_data.get("post_id"), item_data.get("source_url"), mon.get("target_channel_id")),
+                "INSERT OR IGNORE INTO published_history "
+                "(source_post_id, source_url, channel_id, content_key, published_url) VALUES (?, ?, ?, ?, ?)",
+                (
+                    item_data.get("post_id"),
+                    item_data.get("source_url"),
+                    mon.get("target_channel_id"),
+                    (row["content_key"] or "").strip(),
+                    (row["published_url"] or "").strip(),
+                ),
+            )
+            conn.execute(
+                "UPDATE published_history SET "
+                "source_url = CASE WHEN COALESCE(source_url, '') = '' THEN ? ELSE source_url END, "
+                "content_key = CASE WHEN COALESCE(content_key, '') = '' THEN ? ELSE content_key END, "
+                "published_url = CASE WHEN COALESCE(published_url, '') = '' THEN ? ELSE published_url END "
+                "WHERE source_post_id = ? AND channel_id = ?",
+                (
+                    item_data.get("source_url") or "",
+                    (row["content_key"] or "").strip(),
+                    (row["published_url"] or "").strip(),
+                    item_data.get("post_id"),
+                    mon.get("target_channel_id"),
+                ),
             )
             conn.commit()
             return True

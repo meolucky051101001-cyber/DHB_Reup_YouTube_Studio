@@ -151,10 +151,10 @@ class FrontendTokenRefreshTests(unittest.TestCase):
         self.assertIn("ensureApiToken(true)", self.source)
 
     def test_excel_import_uses_retrying_fetch(self):
-        start = self.source.index("Đang nhập Excel")
+        start = self.source.index("const sendImport = (previewOnly)")
         body = self.source[start:start + 400]
-        self.assertIn("apiFetch('/api/queue/import-excel'", body)
-        self.assertNotIn("await fetch('/api/queue/import-excel'", body)
+        self.assertIn("return apiFetch('/api/queue/import-excel'", body)
+        self.assertNotIn("return fetch('/api/queue/import-excel'", body)
 
 
 if __name__ == "__main__":

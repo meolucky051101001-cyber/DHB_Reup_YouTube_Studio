@@ -94,7 +94,9 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                 thumbnail_path TEXT, target_channel_id INTEGER,
                 download_progress INTEGER, upload_progress INTEGER, error_message TEXT,
                 render_config_json TEXT, resolution TEXT, render_mode TEXT,
-                cut_start TEXT, cut_end TEXT
+                cut_start TEXT, cut_end TEXT, project_name TEXT DEFAULT 'Default',
+                content_key TEXT DEFAULT '', manual_reupload_authorized INTEGER DEFAULT 0,
+                manual_reupload_reason TEXT DEFAULT '', last_attempt_id INTEGER DEFAULT NULL
             );
             CREATE TABLE youtube_channels (
                 id INTEGER PRIMARY KEY, name TEXT, channel_id TEXT, handle TEXT,
@@ -105,9 +107,27 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                 source_post_id TEXT NOT NULL,
                 source_url TEXT DEFAULT '',
                 channel_id INTEGER DEFAULT NULL,
+                content_key TEXT DEFAULT '',
                 published_url TEXT DEFAULT '',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(source_post_id, channel_id)
+            );
+            CREATE TABLE content_reservations (
+                content_key TEXT NOT NULL, channel_id INTEGER NOT NULL,
+                queue_id INTEGER NOT NULL, claim_token TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'Active',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (content_key, channel_id)
+            );
+            CREATE TABLE upload_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, queue_id INTEGER NOT NULL,
+                attempt_no INTEGER NOT NULL, attempt_type TEXT NOT NULL DEFAULT 'upload',
+                source_post_id TEXT DEFAULT '', content_key TEXT DEFAULT '', channel_id INTEGER,
+                phase TEXT DEFAULT 'Queued', outcome TEXT DEFAULT 'InProgress', reason TEXT DEFAULT '',
+                published_url TEXT DEFAULT '', error_message TEXT DEFAULT '',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(queue_id, attempt_no)
             );
             """
         )
@@ -145,7 +165,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                     mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value=True), \
                     mock.patch.object(
                         pipeline_manager, "upload_video_to_youtube",
-                        return_value={"url": "https://youtu.be/abc123"},
+                        return_value={"url": "https://youtu.be/dQw4w9WgXcQ"},
                     ), \
                     mock.patch.object(pipeline_manager, "_record_upload_finished_safely"):
                 manager.process_single_item(
@@ -163,8 +183,42 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
             self.assertEqual(row["source_post_id"], "POST-1")
             self.assertEqual(row["source_url"], "https://src.example/v")
             self.assertEqual(row["channel_id"], 7)
-            self.assertEqual(row["published_url"], "https://youtu.be/abc123")
+            self.assertEqual(row["published_url"], "https://youtu.be/dQw4w9WgXcQ")
+            self.assertEqual(row["content_key"], pipeline_manager.sha256_file(Path(db_path).parent / "input.mp4"))
             self.assertEqual(queue_row["status"], "Completed")
+
+    def test_non_youtube_result_url_is_held_for_review_not_completed(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = self._make_db(td)
+            manager = pipeline_manager.PipelineManager()
+            with mock.patch.object(pipeline_manager, "get_conn", side_effect=self._connect(db_path)), \
+                    mock.patch.object(pipeline_manager, "add_log"), \
+                    mock.patch.object(pipeline_manager, "get_settings", return_value={}), \
+                    mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
+                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value=True), \
+                    mock.patch.object(
+                        pipeline_manager, "upload_video_to_youtube",
+                        return_value={"url": "https://example.com/watch?v=dQw4w9WgXcQ"},
+                    ), \
+                    mock.patch.object(pipeline_manager, "_record_upload_finished_safely"):
+                manager.process_single_item(
+                    1, do_download=False, do_render=False, do_upload=True,
+                    stop_event=threading.Event(),
+                )
+
+            conn = sqlite3.connect(db_path)
+            queue = conn.execute(
+                "SELECT status, published_url FROM video_queue WHERE id = 1"
+            ).fetchone()
+            history_count = conn.execute("SELECT COUNT(*) FROM published_history").fetchone()[0]
+            reservation = conn.execute(
+                "SELECT state FROM content_reservations WHERE queue_id = 1"
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(queue[0], "NeedsReview")
+            self.assertEqual(queue[1], "")
+            self.assertEqual(history_count, 0)
+            self.assertEqual(reservation, "NeedsReview")
 
     def test_unverified_publish_requires_manual_review_and_is_not_retried(self):
         with tempfile.TemporaryDirectory() as td:
@@ -202,6 +256,82 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                 )
                 upload.assert_called_once()
 
+    def test_uploader_exception_keeps_reservation_for_review(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = self._make_db(td)
+            manager = pipeline_manager.PipelineManager()
+            with mock.patch.object(pipeline_manager, "get_conn", side_effect=self._connect(db_path)), \
+                    mock.patch.object(pipeline_manager, "add_log"), \
+                    mock.patch.object(pipeline_manager, "get_settings", return_value={}), \
+                    mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
+                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value=True), \
+                    mock.patch.object(
+                        pipeline_manager, "upload_video_to_youtube", side_effect=RuntimeError("connection lost")
+                    ), \
+                    mock.patch.object(pipeline_manager, "_record_upload_finished_safely"):
+                manager.process_single_item(
+                    1, do_download=False, do_render=False, do_upload=True,
+                    stop_event=threading.Event(),
+                )
+
+            conn = sqlite3.connect(db_path)
+            status = conn.execute("SELECT status FROM video_queue WHERE id = 1").fetchone()[0]
+            reservation = conn.execute(
+                "SELECT state FROM content_reservations WHERE queue_id = 1"
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(status, "NeedsReview")
+            self.assertEqual(reservation, "NeedsReview")
+
+    def test_authorized_single_item_reupload_bypasses_its_own_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = self._make_db(td)
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            content_key = pipeline_manager.sha256_file(Path(td) / "input.mp4")
+            cur = conn.execute(
+                "INSERT INTO upload_attempts "
+                "(queue_id, attempt_no, attempt_type, content_key, channel_id, phase, outcome, reason) "
+                "VALUES (1, 1, 'manual_reupload', ?, 7, 'Authorized', 'Authorized', ?)",
+                (content_key, "Người dùng yêu cầu đăng lại item này"),
+            )
+            conn.execute(
+                "UPDATE video_queue SET status = 'Pending', published_url = '', content_key = ?, "
+                "manual_reupload_authorized = 1, manual_reupload_reason = ?, last_attempt_id = ? WHERE id = 1",
+                (content_key, "Người dùng yêu cầu đăng lại item này", cur.lastrowid),
+            )
+            conn.execute(
+                "INSERT INTO published_history (source_post_id, source_url, channel_id, content_key, published_url) "
+                "VALUES ('POST-1', 'https://src.example/v', 7, ?, 'https://youtu.be/old')",
+                (content_key,),
+            )
+            conn.commit()
+            conn.close()
+
+            manager = pipeline_manager.PipelineManager()
+            with mock.patch.object(pipeline_manager, "get_conn", side_effect=self._connect(db_path)), \
+                    mock.patch.object(pipeline_manager, "add_log"), \
+                    mock.patch.object(pipeline_manager, "get_settings", return_value={}), \
+                    mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
+                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value=True), \
+                    mock.patch.object(
+                        pipeline_manager, "upload_video_to_youtube",
+                        return_value={"url": "https://youtu.be/9bZkp7q19f0"},
+                    ) as upload, \
+                    mock.patch.object(pipeline_manager, "_record_upload_finished_safely"):
+                manager.process_single_item(
+                    1, do_download=False, do_render=False, do_upload=True,
+                    stop_event=threading.Event(),
+                )
+
+            conn = sqlite3.connect(db_path)
+            queue = conn.execute("SELECT status, published_url FROM video_queue WHERE id = 1").fetchone()
+            attempt = conn.execute("SELECT outcome, published_url FROM upload_attempts WHERE id = 1").fetchone()
+            conn.close()
+            upload.assert_called_once()
+            self.assertEqual(queue, ("Completed", "https://youtu.be/9bZkp7q19f0"))
+            self.assertEqual(attempt, ("Completed", "https://youtu.be/9bZkp7q19f0"))
+
     def test_unfinished_item_is_not_recorded(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = self._make_db(td)
@@ -219,7 +349,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
             self.assertFalse(recorded)
             self.assertEqual(count, 0)
 
-    def test_empty_post_id_uses_queue_scoped_key_and_is_idempotent(self):
+    def test_empty_post_id_uses_url_key_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = self._make_db(td)
             conn = sqlite3.connect(db_path)
@@ -237,7 +367,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
             conn.close()
             self.assertTrue(first)
             self.assertTrue(second)
-            self.assertEqual(rows, [("queue:1",)])
+            self.assertEqual(rows, [("url:https://src.example/v",)])
 
 
 class UploaderLoggingTests(unittest.TestCase):

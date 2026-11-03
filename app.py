@@ -37,6 +37,7 @@ from api_security import (
     is_allowed_origin,
     token_matches,
 )
+from content_identity import copy_stream_and_hash, normalize_source_url
 from database import (
     init_db,
     get_conn,
@@ -55,18 +56,35 @@ from database import (
     public_channel,
     public_settings,
     redact_secrets,
+    content_identity_migration_report,
+    set_channel_group_memberships,
+    register_managed_artifact,
 )
 from antidetect_client import AntidetectClient, AntidetectError
-from scanner_downloader import scan_social_urls, probe_video_info, probe_video_infos, VIDEO_EXTENSIONS
+from scanner_downloader import scan_social_urls, probe_video_info, probe_video_infos, VIDEO_EXTENSIONS, VideoProbeError
 from ai_engine import ai_optimize_youtube_metadata, apply_batch_text_edit
 from youtube_uploader import (
     open_profile_for_login,
     probe_profile_login,
     get_oauth_token_local_status,
     check_oauth_token_status,
+    normalize_published_video_url,
 )
 from pipeline_manager import pipeline_manager
+from group_distribution import group_channel_pool, target_group_names
+from phase4_rules import (
+    GROUP_SCHEMA_VERSION, normalize_group_names, serialize_group_names,
+    validate_metadata_fields, validate_queue_fields, validate_source_url,
+)
+from queue_import import preview_csv_import
 from app_instance_lock import AppInstanceAlreadyRunning, acquire_app_instance_lock
+from render_engine import normalize_render_speed
+from storage_manager import (
+    DEFAULT_RETENTION_DAYS,
+    cleanup_managed_artifacts,
+    ensure_disk_space,
+    storage_overview,
+)
 
 try:
     # Own the local DB before migration/recovery. A second server process must
@@ -102,17 +120,102 @@ def _is_duplicate_post_id(conn, project_name: str, post_id: str) -> bool:
     ).fetchone() is not None
 
 
-def _upload_file_post_id(path: Path) -> str:
-    """Khóa trùng theo NỘI DUNG (kích thước + 1MB đầu) cho file kéo-thả.
+def _is_duplicate_content_key(conn, project_name: str, content_key: str) -> bool:
+    if not content_key:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM video_queue WHERE project_name = ? AND content_key = ? LIMIT 1",
+        (project_name, content_key),
+    ).fetchone() is not None
 
-    Tên file đích có random hex nên md5(đường dẫn) không bao giờ trùng — người dùng
-    kéo cùng một video hai lần sẽ tạo 2 hàng đăng trùng. Hash nội dung thì trùng thật.
-    """
-    digest = hashlib.md5()
-    digest.update(str(path.stat().st_size).encode("utf-8"))
-    with open(path, "rb") as handle:
-        digest.update(handle.read(1024 * 1024))
-    return digest.hexdigest()[:16].upper()
+
+def _validated_group_names(conn, raw: Any, legacy: Any = "", default: Optional[str] = None) -> List[str]:
+    try:
+        is_missing = raw is None or (isinstance(raw, str) and not raw.strip())
+        names = normalize_group_names(raw, legacy_name=legacy, default=default if is_missing and not legacy else None)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not names:
+        raise HTTPException(400, "Phải chọn ít nhất một nhóm kênh; nhóm rỗng không thể dùng làm đích.")
+    placeholders = ",".join("?" for _ in names)
+    found = {
+        str(row[0]) for row in conn.execute(
+            f"SELECT name FROM channel_groups WHERE name IN ({placeholders})", names
+        ).fetchall()
+    }
+    missing = [name for name in names if name not in found]
+    if missing:
+        raise HTTPException(400, "Không tìm thấy nhóm kênh: " + ", ".join(missing))
+    return names
+
+
+def _queue_target_updates(conn, updates: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize mutually exclusive channel/profile/group destination edits."""
+    target = dict(updates)
+    destination_changed = any(k in updates for k in (
+        "target_channel_id", "target_profile_name", "target_group_name", "target_group_names",
+        "target_group_names_json", "target_type",
+    ))
+    if not destination_changed:
+        return target
+
+    channel_id = target.get("target_channel_id", current.get("target_channel_id"))
+    profile_name = str(target.get("target_profile_name", current.get("target_profile_name")) or "").strip()
+    raw_groups = target.get("target_group_names", target.get("target_group_names_json"))
+    if raw_groups is None and "target_group_name" in target:
+        raw_groups = target.get("target_group_name")
+    explicit_channel = "target_channel_id" in updates and bool(updates.get("target_channel_id"))
+    explicit_profile = "target_profile_name" in updates and bool(str(updates.get("target_profile_name") or "").strip())
+    try:
+        has_groups = raw_groups is not None and bool(normalize_group_names(raw_groups))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not explicit_channel and not explicit_profile and (has_groups or (raw_groups is not None and str(target.get("target_type") or "").upper() == "GROUP")):
+        groups = _validated_group_names(conn, raw_groups, default="Mặc định")
+        target["target_group_names_json"] = serialize_group_names(groups)
+        target["target_group_name"] = groups[0]
+        target["group_schema_version"] = GROUP_SCHEMA_VERSION
+        target["target_type"] = "GROUP"
+        target["target_channel_id"] = None
+        target["target_profile_name"] = ""
+    elif channel_id:
+        channel = conn.execute("SELECT id, profile_name FROM youtube_channels WHERE id = ?", (channel_id,)).fetchone()
+        if not channel:
+            raise HTTPException(400, f"Không tìm thấy kênh đích #{channel_id}.")
+        target["target_type"] = "CHANNEL"
+        target["target_group_names_json"] = "[]"
+        target["target_group_name"] = ""
+        target["group_schema_version"] = GROUP_SCHEMA_VERSION
+        explicit_profile = str(updates.get("target_profile_name") or "").strip()
+        target["target_profile_name"] = str(channel["profile_name"] or explicit_profile)
+    elif profile_name:
+        rows = conn.execute(
+            "SELECT id FROM youtube_channels WHERE profile_name = ? ORDER BY id ASC", (profile_name,)
+        ).fetchall()
+        if len(rows) != 1:
+            raise HTTPException(
+                400,
+                f"Profile '{profile_name}' phải ánh xạ đúng một kênh YouTube; hiện có {len(rows)}.",
+            )
+        target["target_type"] = "PROFILE"
+        target["target_channel_id"] = None
+        target["target_group_names_json"] = "[]"
+        target["target_group_name"] = ""
+        target["group_schema_version"] = GROUP_SCHEMA_VERSION
+    else:
+        raise HTTPException(400, "Chọn một kênh, một Profile có đúng một kênh hoặc ít nhất một nhóm.")
+
+    # Editing a destination is explicit confirmation; stale assignments must be cleared.
+    target["assigned_channel_id"] = None
+    target["assigned_group_names_json"] = ""
+    return target
+
+
+def _ensure_destination_not_active(row: Dict[str, Any], destination_changed: bool):
+    status = str(row.get("status") or "").strip()
+    active = status.startswith(("Uploading", "Downloading", "Rendering", "Đang đăng"))
+    if destination_changed and (active or str(row.get("claim_token") or "")):
+        raise HTTPException(409, f"Video #{row.get('id')} đang được worker giữ; không thể đổi kênh đích lúc này.")
 
 
 # Kiểm tra trùng + ghi queue phải liền mạch, trong khi ffprobe được chạy song song bên ngoài lock
@@ -264,6 +367,12 @@ def api_get_queue(project: str = ""):
     return [dict(r) for r in rows]
 
 
+@app.get("/api/queue/content-identity-report")
+def api_content_identity_report():
+    """Read-only summary for legacy queue/history rows without fingerprints."""
+    return content_identity_migration_report()
+
+
 @app.post("/api/queue/scan")
 def api_scan_and_add(data: Dict[str, Any] = Body(...)):
     project_name = data.get("project_name") or "Default"
@@ -271,6 +380,16 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
     urls = [u.strip() for u in raw_urls.splitlines() if u.strip()]
     if not urls:
         raise HTTPException(400, "Vui lòng nhập ít nhất 1 đường dẫn URL hoặc đường dẫn thư mục.")
+    normalized_sources = []
+    for value in urls:
+        if Path(value).exists():
+            normalized_sources.append(value)
+            continue
+        try:
+            normalized_sources.append(validate_source_url(value))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    urls = normalized_sources
 
     max_items = int(data.get("max_items", 20) or 20)
     min_views = int(data.get("min_views", 0) or 0)
@@ -279,50 +398,70 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
     only_shorts = bool(data.get("only_shorts", False))
     recursive = bool(data.get("recursive", False))
     target_channel_id = data.get("target_channel_id") or None
-    target_group_name = data.get("target_group_name") or "Mặc định"
+    raw_group_names = data.get("target_group_names", data.get("target_group_names_json"))
+    if raw_group_names is None:
+        raw_group_names = data.get("target_group_name") or "Mặc định"
+    validation_conn = get_conn()
+    try:
+        group_names = _validated_group_names(
+            validation_conn, raw_group_names, legacy=data.get("target_group_name") or "", default="Mặc định"
+        ) if not target_channel_id else []
+        if target_channel_id and not validation_conn.execute(
+            "SELECT 1 FROM youtube_channels WHERE id = ?", (target_channel_id,)
+        ).fetchone():
+            raise HTTPException(400, f"Không tìm thấy kênh đích #{target_channel_id}.")
+    finally:
+        validation_conn.close()
     option_group_id = data.get("option_group_id") or None
     render_mode = data.get("render_mode") or "shorts_9_16"
     upload_to = data.get("upload_to") or "Shorts"
     resolution = data.get("resolution") or "1080p"
     emulate_mobile = 1 if data.get("emulate_mobile", False) else 0
-    visibility = (data.get("visibility") or "public").lower()
-    if visibility == "scheduled":
-        visibility = "schedule"
-    if visibility not in ("public", "unlisted", "private", "schedule"):
-        raise HTTPException(400, "Chế độ hiển thị không hợp lệ (chỉ nhận public / unlisted / private / schedule).")
     base_schedule_time = (data.get("schedule_time") or "").strip()
     schedule_interval_minutes = int(data.get("schedule_interval_minutes") or 0)
-    is_premiere = 1 if data.get("is_premiere") else 0
-    made_for_kids = 1 if data.get("made_for_kids") else 0
-    age_restriction = 1 if data.get("age_restriction") else 0
-    altered_content = 1 if data.get("altered_content") else 0
+    is_premiere = data.get("is_premiere", 0)
+    made_for_kids = data.get("made_for_kids", 0)
+    age_restriction = data.get("age_restriction", 0)
+    altered_content = data.get("altered_content", 0)
 
     from datetime import datetime, timedelta
     start_dt = None
+    try:
+        normalized = validate_queue_fields({
+            "visibility": data.get("visibility") or "public",
+            "schedule_time": base_schedule_time,
+            "is_premiere": is_premiere,
+            "made_for_kids": made_for_kids,
+            "age_restriction": age_restriction,
+            "altered_content": altered_content,
+            "upload_to": upload_to,
+            "render_mode": render_mode,
+            "resolution": resolution,
+        })
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    visibility = normalized["visibility"]
+    is_premiere = normalized["is_premiere"]
+    made_for_kids = normalized["made_for_kids"]
+    age_restriction = normalized["age_restriction"]
+    altered_content = normalized["altered_content"]
+    base_schedule_time = normalized["schedule_time"]
     if visibility == "schedule":
-        if not base_schedule_time:
-            raise HTTPException(
-                400,
-                "Chế độ Lên lịch bắt buộc phải nhập thời gian đăng cụ thể trong tương lai. "
-                "Hệ thống không tự chuyển sang Công khai khi thiếu giờ.",
-            )
-        try:
-            start_dt = datetime.fromisoformat(base_schedule_time.replace(" ", "T"))
-        except Exception:
-            raise HTTPException(400, "Thời gian bắt đầu đặt lịch không đúng định dạng (ví dụ đúng: 2026-10-25 19:30).")
-        if start_dt <= datetime.now():
-            raise HTTPException(400, "Thời gian bắt đầu đặt lịch phải ở TƯƠNG LAI.")
+        start_dt = datetime.fromisoformat(base_schedule_time)
         schedule_interval_minutes = max(30, schedule_interval_minutes)
 
-    scanned = scan_social_urls(
-        urls=urls,
-        max_items_per_url=max_items,
-        min_views=min_views,
-        min_likes=min_likes,
-        min_comments=min_comments,
-        only_shorts=only_shorts,
-        recursive_local=recursive,
-    )
+    try:
+        scanned = scan_social_urls(
+            urls=urls,
+            max_items_per_url=max_items,
+            min_views=min_views,
+            min_likes=min_likes,
+            min_comments=min_comments,
+            only_shorts=only_shorts,
+            recursive_local=recursive,
+        )
+    except VideoProbeError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     conn = get_conn()
     with _import_insert_lock:
@@ -351,9 +490,10 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
                     title, description, tags, duration, view_count, like_count,
                     upload_to, visibility, schedule_time, is_premiere, made_for_kids,
                     age_restriction, altered_content, target_type, target_channel_id,
-                    target_group_name, option_group_id, render_mode, resolution,
+                    target_group_name, target_group_names_json, group_schema_version,
+                    option_group_id, render_mode, resolution,
                     emulate_mobile, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending')
                 """,
                 (
                     project_name,
@@ -377,7 +517,9 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
                     altered_content,
                     "CHANNEL" if target_channel_id else "GROUP",
                     target_channel_id,
-                    target_group_name,
+                    group_names[0] if group_names else "",
+                    serialize_group_names(group_names),
+                    1,
                     option_group_id,
                     render_mode,
                     resolution,
@@ -401,23 +543,56 @@ def api_upload_video_files(
     render_mode: str = Form("shorts_9_16"),
     resolution: str = Form("1080p"),
     visibility: str = Form("public"),
+    schedule_time: str = Form(""),
+    schedule_interval_minutes: int = Form(60),
+    is_premiere: int = Form(0),
     made_for_kids: int = Form(0),
     age_restriction: int = Form(0),
     altered_content: int = Form(0),
     emulate_mobile: int = Form(0),
+    target_group_names: str = Form(""),
     files: List[UploadFile] = File(...),
 ):
     """Tải lên trực tiếp các file video từ trình duyệt hoặc kéo thả vào thư mục temp/uploads và nạp vào hàng đợi."""
+    try:
+        final_settings = validate_queue_fields({
+            "visibility": visibility,
+            "schedule_time": schedule_time,
+            "schedule_interval_minutes": schedule_interval_minutes,
+            "is_premiere": is_premiere,
+            "made_for_kids": made_for_kids,
+            "age_restriction": age_restriction,
+            "altered_content": altered_content,
+            "upload_to": upload_to,
+            "render_mode": render_mode,
+            "resolution": resolution,
+        })
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    from datetime import timedelta
+    start_dt = datetime.fromisoformat(final_settings["schedule_time"]) if final_settings["schedule_time"] else None
+    schedule_interval_minutes = max(30, int(schedule_interval_minutes or 30))
+    upload_to = final_settings["upload_to"]
+    render_mode = final_settings["render_mode"]
+    resolution = final_settings["resolution"]
+    visibility = final_settings["visibility"]
     upload_dir = APP_TEMP_DIR / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
 
+    validation_conn = get_conn()
+    try:
+        group_names = _validated_group_names(validation_conn, target_group_names, default="Mặc định")
+    finally:
+        validation_conn.close()
     conn = get_conn()
     conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (project_name,))
 
     added_count = 0
     skipped_count = 0
     added_titles = []
-    seen_post_ids = set()
+    invalid_files = []
+    seen_content_keys = set()
+    conn.commit()
 
     for f in files:
         if not f.filename:
@@ -426,14 +601,30 @@ def api_upload_video_files(
         if ext and ext not in VIDEO_EXTENSIONS:
             continue
 
-        safe_name = f"{Path(f.filename).stem}_{os.urandom(4).hex()}{ext}"
+        safe_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(f.filename).stem).strip(" .")[:150] or "video"
+        safe_name = f"{safe_stem}_{os.urandom(4).hex()}{ext}"
         target_path = upload_dir / safe_name
 
-        with open(target_path, "wb") as buffer:
-            shutil.copyfileobj(f.file, buffer)
+        uploaded_size = int(getattr(f, "size", 0) or 0)
+        required_space = uploaded_size + 256 * 1024 * 1024 if uploaded_size > 0 else 1024 * 1024 * 1024
+        try:
+            ensure_disk_space(upload_dir, required_space, f"nhận file {Path(f.filename).name}")
+        except OSError as exc:
+            conn.close()
+            raise HTTPException(507, str(exc)) from exc
 
-        post_id = _upload_file_post_id(target_path)
-        if post_id in seen_post_ids or _is_duplicate_post_id(conn, project_name, post_id):
+        try:
+            content_key, bytes_written = copy_stream_and_hash(f.file, target_path)
+        except Exception as exc:
+            target_path.unlink(missing_ok=True)
+            conn.close()
+            raise HTTPException(400, f"Không đọc được file {Path(f.filename).name}: {exc}") from exc
+        if not bytes_written:
+            target_path.unlink(missing_ok=True)
+            skipped_count += 1
+            continue
+        post_id = content_key.partition(":")[2][:16].upper()
+        if content_key in seen_content_keys or _is_duplicate_content_key(conn, project_name, content_key):
             # Trùng nội dung với video đã có trong dự án — dọn file tạm và bỏ qua.
             skipped_count += 1
             try:
@@ -441,45 +632,84 @@ def api_upload_video_files(
             except Exception:
                 pass
             continue
-        seen_post_ids.add(post_id)
+        seen_content_keys.add(content_key)
 
-        probe = probe_video_info(str(target_path))
+        try:
+            probe = probe_video_info(str(target_path))
+        except Exception as exc:
+            target_path.unlink(missing_ok=True)
+            skipped_count += 1
+            invalid_files.append({"name": Path(f.filename).name, "reason": str(exc)})
+            continue
         title = Path(f.filename).stem
 
         is_short = probe["seconds"] <= 65 or (probe["height"] > probe["width"] and probe["seconds"] <= 180)
         final_upload_to = upload_to or ("Shorts" if is_short else "Video")
+        item_schedule = (start_dt + timedelta(minutes=added_count * schedule_interval_minutes)).strftime("%Y-%m-%d %H:%M:%S") if start_dt else ""
 
-        conn.execute(
-            """
-            INSERT INTO video_queue (
-                project_name, source_type, platform, post_id, source_url, input_video_path,
-                title, description, tags, duration, view_count, like_count,
-                upload_to, visibility, schedule_time, is_premiere, made_for_kids,
-                age_restriction, altered_content, target_type, target_channel_id,
-                target_group_name, option_group_id, render_mode, resolution,
-                emulate_mobile, download_progress, status
-            ) VALUES (?, 'File', 'LocalUpload', ?, ?, ?, ?, ?, '#shorts #trending', ?, 0, 0, ?, ?, '', 0, ?, ?, ?, 'GROUP', NULL, 'Mặc định', NULL, ?, ?, ?, 100, 'Pending')
-            """,
-            (
-                project_name,
-                post_id,
-                str(target_path),
-                str(target_path),
-                title,
-                title,
-                probe["duration"],
-                final_upload_to,
-                visibility.lower(),
-                1 if made_for_kids else 0,
-                1 if age_restriction else 0,
-                1 if altered_content else 0,
-                render_mode,
-                resolution,
-                1 if emulate_mobile else 0,
-            ),
-        )
+        inserted = False
+        try:
+            with _import_insert_lock:
+                conn.execute("BEGIN IMMEDIATE")
+                if not _is_duplicate_content_key(conn, project_name, content_key):
+                    insert_cursor = conn.execute(
+                        """
+                        INSERT INTO video_queue (
+                            project_name, source_type, platform, post_id, content_key, source_url, input_video_path,
+                            title, description, tags, duration, view_count, like_count,
+                            upload_to, visibility, schedule_time, is_premiere, made_for_kids,
+                            age_restriction, altered_content, target_type, target_channel_id,
+                            target_group_name, target_group_names_json, group_schema_version,
+                            option_group_id, render_mode, resolution,
+                            emulate_mobile, download_progress, status
+                        ) VALUES (?, 'File', 'LocalUpload', ?, ?, ?, ?, ?, ?, '#shorts #trending', ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, 'GROUP', NULL, ?, ?, 1, NULL, ?, ?, ?, 100, 'Pending')
+                        """,
+                        (
+                            project_name,
+                            post_id,
+                            content_key,
+                            str(target_path),
+                            str(target_path),
+                            title,
+                            title,
+                            probe["duration"],
+                            final_upload_to,
+                            visibility.lower(),
+                            item_schedule,
+                            final_settings["is_premiere"],
+                            final_settings["made_for_kids"],
+                            final_settings["age_restriction"],
+                            final_settings["altered_content"],
+                            group_names[0],
+                            serialize_group_names(group_names),
+                            render_mode,
+                            resolution,
+                            1 if emulate_mobile else 0,
+                        ),
+                    )
+                    conn.commit()
+                    inserted = True
+                    queue_id = int(insert_cursor.lastrowid)
+                else:
+                    conn.rollback()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            target_path.unlink(missing_ok=True)
+            conn.close()
+            raise
+        if not inserted:
+            skipped_count += 1
+            target_path.unlink(missing_ok=True)
+            continue
         added_count += 1
         added_titles.append(title)
+        try:
+            register_managed_artifact(str(target_path), "upload", "queue", queue_id)
+        except Exception as exc:
+            add_log("Storage", f"Không ghi được manifest cho file upload của queue #{queue_id}; file được giữ lại ({type(exc).__name__}).", "WARNING", video_title=title)
 
     conn.commit()
     conn.close()
@@ -487,7 +717,10 @@ def api_upload_video_files(
     if skipped_count:
         log_msg += f" Bỏ qua {skipped_count} video trùng nội dung."
     add_log("Upload", log_msg, "SUCCESS")
-    return {"ok": True, "added": added_count, "skipped": skipped_count, "titles": added_titles}
+    return {
+        "ok": True, "added": added_count, "skipped": skipped_count,
+        "titles": added_titles, "invalid_files": invalid_files,
+    }
 
 
 @app.post("/api/browse-native-files")
@@ -593,7 +826,40 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
     render_mode = data.get("render_mode") or "shorts_9_16"
     resolution = data.get("resolution") or "1080p"
     visibility = (data.get("visibility") or "public").lower()
+    target_group_names = data.get("target_group_names") if "target_group_names" in data else None
+    schedule_time = str(data.get("schedule_time") or "").strip()
+    try:
+        schedule_interval_minutes = int(data.get("schedule_interval_minutes") or 60)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Khoảng cách lịch phải là số phút hợp lệ.")
+    try:
+        final_settings = validate_queue_fields({
+            "visibility": visibility,
+            "schedule_time": schedule_time,
+            "is_premiere": data.get("is_premiere", 0),
+            "made_for_kids": data.get("made_for_kids", 0),
+            "age_restriction": data.get("age_restriction", 0),
+            "altered_content": data.get("altered_content", 0),
+            "upload_to": upload_to,
+            "render_mode": render_mode,
+            "resolution": resolution,
+        })
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    from datetime import timedelta
+    start_dt = datetime.fromisoformat(final_settings["schedule_time"]) if final_settings["schedule_time"] else None
+    schedule_interval_minutes = max(30, schedule_interval_minutes)
+    visibility = final_settings["visibility"]
+    upload_to = final_settings["upload_to"]
+    render_mode = final_settings["render_mode"]
+    resolution = final_settings["resolution"]
     recursive = bool(data.get("recursive", False))
+
+    validation_conn = get_conn()
+    try:
+        group_names = _validated_group_names(validation_conn, target_group_names, default="Mặc định")
+    finally:
+        validation_conn.close()
 
     if not paths:
         raise HTTPException(400, "Không có tệp nào được chọn.")
@@ -634,7 +900,10 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
     finally:
         conn.close()
 
-    probe_map = probe_video_infos([str(f) for f in pending_files])
+    try:
+        probe_map = probe_video_infos([str(f) for f in pending_files])
+    except VideoProbeError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     added_count = 0
     added_titles = []
@@ -651,6 +920,8 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
                 title = f.stem
                 is_short = probe["seconds"] <= 65 or (probe["height"] > probe["width"] and probe["seconds"] <= 180)
                 final_upload_to = upload_to or ("Shorts" if is_short else "Video")
+                item_schedule = (start_dt + timedelta(minutes=added_count * schedule_interval_minutes)).strftime("%Y-%m-%d %H:%M:%S") if start_dt else ""
+                item_premiere = final_settings["is_premiere"] if start_dt else 0
 
                 conn.execute(
                     """
@@ -659,9 +930,10 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
                         title, description, tags, duration, view_count, like_count,
                         upload_to, visibility, schedule_time, is_premiere, made_for_kids,
                         age_restriction, altered_content, target_type, target_channel_id,
-                        target_group_name, option_group_id, render_mode, resolution,
+                        target_group_name, target_group_names_json, group_schema_version,
+                        option_group_id, render_mode, resolution,
                         emulate_mobile, download_progress, status
-                    ) VALUES (?, 'File', 'LocalFile', ?, ?, ?, ?, ?, '#shorts #trending', ?, 0, 0, ?, ?, '', 0, 0, 0, 0, 'GROUP', NULL, 'Mặc định', NULL, ?, ?, 0, 100, 'Pending')
+                    ) VALUES (?, 'File', 'LocalFile', ?, ?, ?, ?, ?, '#shorts #trending', ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, 'GROUP', NULL, ?, ?, 1, NULL, ?, ?, 0, 100, 'Pending')
                     """,
                     (
                         project_name,
@@ -673,6 +945,13 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
                         probe["duration"],
                         final_upload_to,
                         visibility,
+                        item_schedule,
+                        item_premiere,
+                        final_settings["made_for_kids"],
+                        final_settings["age_restriction"],
+                        final_settings["altered_content"],
+                        group_names[0],
+                        serialize_group_names(group_names),
                         render_mode,
                         resolution,
                     ),
@@ -692,87 +971,171 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
 
 @app.post("/api/queue/bulk-update")
 def api_bulk_update_queue(data: Dict[str, Any] = Body(...)):
-    ids = data.get("ids") or []
+    raw_ids = data.get("ids") or []
     updates = data.get("updates") or {}
-    if not ids or not updates:
-        return {"ok": False}
+    if not raw_ids or not isinstance(updates, dict) or not updates:
+        return {"ok": False, "updated": 0, "existing": 0}
+    try:
+        ids = list(dict.fromkeys(int(value) for value in raw_ids))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Danh sách ID video không hợp lệ.")
 
     allowed = {
         "title", "description", "tags", "upload_to", "visibility", "schedule_time",
-        "target_type", "target_channel_id", "target_group_name", "option_group_id",
-        "render_mode", "render_config_json", "cut_start", "cut_end", "status",
-        "resolution", "emulate_mobile", "target_profile_name",
-        "made_for_kids", "age_restriction", "altered_content", "is_premiere",
+        "target_type", "target_channel_id", "target_group_name", "target_group_names",
+        "target_group_names_json", "target_profile_name", "option_group_id", "render_mode",
+        "render_config_json", "cut_start", "cut_end", "resolution", "emulate_mobile",
+        "made_for_kids", "age_restriction", "altered_content", "is_premiere", "group_schema_version",
     }
-    
-    interval = int(updates.get("schedule_interval_minutes") or 0)
-    base_sched = (updates.get("schedule_time") or "").strip()
-    from datetime import datetime, timedelta
-    base_dt = None
-    if base_sched:
+    filtered = {key: value for key, value in updates.items() if key in allowed}
+    if not filtered:
+        return {"ok": False, "updated": 0, "existing": 0}
+    if "render_config_json" in filtered:
+        raw_config = filtered["render_config_json"]
         try:
-            base_dt = datetime.fromisoformat(base_sched.replace(" ", "T"))
-        except Exception:
-            raise HTTPException(400, f"Thời gian đặt lịch không đúng định dạng: '{base_sched}'.")
-        if base_dt <= datetime.now():
-            raise HTTPException(400, "Thời gian bắt đầu đặt lịch phải ở TƯƠNG LAI.")
-    start_dt = base_dt if (base_dt and interval > 0) else None
-    if start_dt:
-        interval = max(30, interval)
+            render_config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "Cấu hình render phải là JSON hợp lệ.") from exc
+        if not isinstance(render_config, dict):
+            raise HTTPException(400, "Cấu hình render phải là một object JSON.")
+        if "speed" in render_config:
+            try:
+                render_config["speed"] = normalize_render_speed(render_config["speed"])
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        filtered["render_config_json"] = json.dumps(render_config, ensure_ascii=False)
 
-    filtered = {k: v for k, v in updates.items() if k in allowed and k != "schedule_time"}
-    if filtered.get("visibility") == "scheduled":
-        filtered["visibility"] = "schedule"
-    immediate_mode = filtered.get("visibility") in ("public", "unlisted", "private")
-    if immediate_mode and base_sched:
-        raise HTTPException(
-            400,
-            "Chế độ đăng ngay (Công khai/Không công khai/Riêng tư) không đi kèm giờ đặt lịch. "
-            "Hãy chọn 'Lên lịch' nếu muốn hẹn giờ.",
-        )
-
+    try:
+        interval = int(updates.get("schedule_interval_minutes") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Khoảng cách lịch phải là số phút hợp lệ.")
+    base_raw = str(updates.get("schedule_time") or "").strip()
     conn = get_conn()
-    if filtered.get("visibility") == "schedule" and not base_sched:
-        missing = []
-        for item_id in ids:
-            row = conn.execute("SELECT schedule_time FROM video_queue WHERE id = ?", (item_id,)).fetchone()
-            existing = (row["schedule_time"] or "").strip() if row else ""
-            valid = False
-            if existing:
-                try:
-                    valid = datetime.fromisoformat(existing.replace(" ", "T")) > datetime.now()
-                except Exception:
-                    valid = False
-            if not valid:
-                missing.append(item_id)
-        if missing:
-            conn.close()
-            raise HTTPException(
-                400,
-                f"{len(missing)} video chưa có thời gian đăng hợp lệ trong TƯƠNG LAI. "
-                "Chế độ Lên lịch bắt buộc phải có giờ đăng — hệ thống không tự chuyển sang Công khai.",
-            )
+    updated = 0
+    existing_ids = set()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        marks = ",".join("?" for _ in ids)
+        rows = conn.execute(f"SELECT * FROM video_queue WHERE id IN ({marks})", ids).fetchall()
+        current_by_id = {int(row["id"]): dict(row) for row in rows}
+        existing_ids = set(current_by_id)
+        missing_ids = [item_id for item_id in ids if item_id not in existing_ids]
+        target_keys = {
+            "target_type", "target_channel_id", "target_group_name", "target_group_names",
+            "target_group_names_json", "target_profile_name",
+        }
+        dest_changed = any(key in filtered for key in target_keys)
+        if dest_changed:
+            active = [row for row in current_by_id.values() if (
+                str(row.get("claim_token") or "")
+                or str(row.get("status") or "").startswith(("Uploading", "Downloading", "Rendering", "Đang đăng"))
+            )]
+            if active:
+                raise HTTPException(409, "Có video đang được worker giữ; không thể đổi đích của lô này.")
 
-    for idx, item_id in enumerate(ids):
-        item_updates = dict(filtered)
-        if start_dt:
-            item_dt = start_dt + timedelta(minutes=idx * interval)
-            item_updates["schedule_time"] = item_dt.strftime("%Y-%m-%d %H:%M:%S")
-        elif "schedule_time" in updates and base_sched:
-            item_updates["schedule_time"] = base_sched
-        if immediate_mode:
-            item_updates["schedule_time"] = ""
-            item_updates["is_premiere"] = 0
+        from datetime import timedelta
+        base_dt = None
+        if base_raw:
+            try:
+                normalized_base = validate_queue_fields({
+                    **{key: current_by_id[ids[0]].get(key) for key in (
+                        "upload_to", "render_mode", "resolution", "made_for_kids", "age_restriction"
+                    ) if ids[0] in current_by_id},
+                    "visibility": "schedule",
+                    "schedule_time": base_raw,
+                    "is_premiere": 0,
+                })
+                base_raw = normalized_base["schedule_time"]
+                base_dt = datetime.fromisoformat(base_raw)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
 
-        if item_updates:
-            cols = ", ".join(f"{k} = ?" for k in item_updates.keys())
-            conn.execute(
-                f"UPDATE video_queue SET {cols} WHERE id = ?",
-                list(item_updates.values()) + [item_id],
+        if filtered.get("visibility") in ("public", "unlisted", "private") and base_raw:
+            raise HTTPException(400, "Chế độ đăng ngay không được kèm thời gian đặt lịch.")
+        wants_schedule = str(filtered.get("visibility") or "").lower() in ("schedule", "scheduled")
+        if wants_schedule and not base_dt and len(existing_ids) > 1:
+            raise HTTPException(400, "Chọn lịch cho nhiều video cần giờ bắt đầu để phân cách từng lịch.")
+        if base_dt and len(existing_ids) > 1:
+            interval = max(30, interval or 30)
+
+        planned: Dict[int, Dict[str, Any]] = {}
+        for index, item_id in enumerate(ids):
+            current = current_by_id.get(item_id)
+            if not current:
+                continue
+            item_updates = dict(filtered)
+            item_updates.pop("schedule_time", None)
+            if "target_group_names" in item_updates or "target_group_names_json" in item_updates:
+                raw_groups = item_updates.pop("target_group_names", item_updates.get("target_group_names_json"))
+                item_updates.update(_queue_target_updates(conn, {"target_group_names": raw_groups}, current))
+                item_updates.pop("target_group_names_json", None)
+            elif dest_changed:
+                item_updates = _queue_target_updates(conn, item_updates, current)
+
+            if base_dt:
+                item_updates["schedule_time"] = (base_dt + timedelta(minutes=index * interval)).strftime("%Y-%m-%d %H:%M:%S")
+                if not item_updates.get("visibility"):
+                    item_updates["visibility"] = "schedule"
+            elif "schedule_time" in updates:
+                item_updates["schedule_time"] = base_raw
+            elif item_updates.get("visibility") in ("public", "unlisted", "private"):
+                item_updates["schedule_time"] = ""
+                item_updates["is_premiere"] = 0
+
+            if "option_group_id" in item_updates and item_updates["option_group_id"]:
+                if not conn.execute("SELECT 1 FROM upload_option_groups WHERE id = ?", (item_updates["option_group_id"],)).fetchone():
+                    raise HTTPException(400, f"Không tìm thấy bộ tùy chọn đăng #{item_updates['option_group_id']}.")
+
+            merged = dict(current)
+            merged.update(item_updates)
+            try:
+                final = validate_queue_fields(merged)
+                metadata = validate_metadata_fields(merged)
+            except ValueError as exc:
+                raise HTTPException(400, f"Video #{item_id}: {exc}") from exc
+            item_updates.update({
+                "visibility": final["visibility"],
+                "schedule_time": final["schedule_time"],
+                "is_premiere": final["is_premiere"],
+                "made_for_kids": final["made_for_kids"],
+                "age_restriction": final["age_restriction"],
+                "altered_content": final["altered_content"],
+                "upload_to": final["upload_to"],
+                "render_mode": final["render_mode"],
+                "resolution": final["resolution"],
+            })
+            item_updates.update({key: metadata[key] for key in ("title", "description", "tags") if key in item_updates})
+            planned[item_id] = item_updates
+
+        for item_id, item_updates in planned.items():
+            safe = {key: value for key, value in item_updates.items() if key in allowed or key in {
+                "target_group_names_json", "assigned_channel_id", "assigned_group_names_json"
+            }}
+            changed = {key: value for key, value in safe.items() if current_by_id[item_id].get(key) != value}
+            if not changed:
+                continue
+            columns = ", ".join(f"{key} = ?" for key in changed)
+            cur = conn.execute(
+                f"UPDATE video_queue SET {columns} WHERE id = ? AND COALESCE(claim_token, '') = '' "
+                "AND status NOT LIKE 'Uploading%' AND status NOT LIKE 'Downloading%' AND status NOT LIKE 'Rendering%'",
+                list(changed.values()) + [item_id],
             )
-    conn.commit()
-    conn.close()
-    return {"ok": True, "updated": len(ids)}
+            if cur.rowcount != 1:
+                raise HTTPException(409, f"Video #{item_id} đã được một worker giữ; không cập nhật được lô.")
+            updated += 1
+        conn.commit()
+        return {
+            "ok": True, "updated": updated, "existing": len(existing_ids),
+            "missing_ids": missing_ids, "requested": len(ids),
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @app.post("/api/queue/shorts-boost")
@@ -804,7 +1167,11 @@ def api_shorts_boost(data: Dict[str, Any] = Body(...)):
         cfg["enforce_shorts_duration"] = True
         cfg["shorts_visual_pop"] = True
         cfg["shorts_fit_mode"] = "speedup"
-        if "speed" not in cfg or cfg["speed"] < 1.05:
+        try:
+            cfg["speed"] = normalize_render_speed(cfg.get("speed", 1.0))
+        except ValueError:
+            cfg["speed"] = 1.0
+        if cfg["speed"] < 1.05:
             cfg["speed"] = 1.05
         cfg["hflip"] = True
         cfg["audio_pitch_shift"] = True
@@ -834,83 +1201,122 @@ def api_edit_queue_metadata(data: Dict[str, Any] = Body(...)):
     item_id = data.get("id")
     if not item_id:
         raise HTTPException(400, "Thiếu ID video cần chỉnh sửa.")
-    title = (data.get("title") or "").strip()
-    desc = (data.get("description") or "").strip()
-    tags = (data.get("tags") or "").strip()
-    resolution = (data.get("resolution") or "1080p").strip()
-    emulate_mobile = 1 if data.get("emulate_mobile", False) else 0
-    render_mode = data.get("render_mode") or "shorts_9_16"
-    option_group_id = data.get("option_group_id") or None
-    cut_start = (data.get("cut_start") or "").strip()
-    cut_end = (data.get("cut_end") or "").strip()
-    visibility = (data.get("visibility") or "public").lower()
-    if visibility == "scheduled":
-        visibility = "schedule"
-    if visibility not in ("public", "unlisted", "private", "schedule"):
-        raise HTTPException(400, "Chế độ hiển thị không hợp lệ (chỉ nhận public / unlisted / private / schedule).")
-    schedule_time = (data.get("schedule_time") or "").strip()
-    is_premiere = 1 if data.get("is_premiere") else 0
-    if visibility in ("public", "unlisted", "private"):
-        schedule_time = ""
-        is_premiere = 0
-    elif visibility == "schedule":
-        if not schedule_time:
-            raise HTTPException(400, "Vui lòng nhập thời gian đặt lịch phát hành.")
-        try:
-            sched_dt = datetime.fromisoformat(schedule_time.replace(" ", "T"))
-        except Exception:
-            raise HTTPException(400, "Thời gian đặt lịch không đúng định dạng.")
-        if sched_dt <= datetime.now():
-            raise HTTPException(400, "Thời gian đặt lịch phải ở TƯƠNG LAI.")
-    made_for_kids = 1 if data.get("made_for_kids") else 0
-    age_restriction = 1 if data.get("age_restriction") else 0
-    altered_content = 1 if data.get("altered_content") else 0
-
-    # C1: các cột targeting chỉ được ghi khi request GỬI KÈM khóa tương ứng —
-    # modal sửa video không gửi target_group_name/target_profile_name nên tuyệt đối
-    # không được xóa trắng cấu hình kênh đích sẵn có của video.
+    item_id = int(item_id)
     conn = get_conn()
-    if option_group_id is not None:
-        exists = conn.execute("SELECT 1 FROM upload_option_groups WHERE id = ?", (option_group_id,)).fetchone()
-        if not exists:
-            conn.close()
-            raise HTTPException(400, f"Không tìm thấy bộ tùy chọn đăng #{option_group_id}.")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Không tìm thấy video #{item_id} trong hàng đợi.")
+        current = dict(row)
+        updates: Dict[str, Any] = {
+            "title": (data.get("title") or "").strip(),
+            "description": (data.get("description") or "").strip(),
+            "tags": (data.get("tags") or "").strip(),
+            "resolution": (data.get("resolution") or "1080p").strip(),
+            "emulate_mobile": 1 if data.get("emulate_mobile", False) else 0,
+            "render_mode": data.get("render_mode") or "shorts_9_16",
+            "cut_start": (data.get("cut_start") or "").strip(),
+            "cut_end": (data.get("cut_end") or "").strip(),
+            "visibility": data.get("visibility") or "public",
+            "schedule_time": (data.get("schedule_time") or "").strip(),
+            "is_premiere": 1 if data.get("is_premiere") else 0,
+            "made_for_kids": 1 if data.get("made_for_kids") else 0,
+            "age_restriction": 1 if data.get("age_restriction") else 0,
+            "altered_content": 1 if data.get("altered_content") else 0,
+        }
+        if "option_group_id" in data:
+            option_group_id = data.get("option_group_id") or None
+            if option_group_id is not None and not conn.execute(
+                "SELECT 1 FROM upload_option_groups WHERE id = ?", (option_group_id,)
+            ).fetchone():
+                raise HTTPException(400, f"Không tìm thấy bộ tùy chọn đăng #{option_group_id}.")
+            updates["option_group_id"] = option_group_id
 
-    set_sql = """
-        title = ?, description = ?, tags = ?, resolution = ?,
-        emulate_mobile = ?, render_mode = ?, cut_start = ?, cut_end = ?,
-        visibility = ?, schedule_time = ?, is_premiere = ?, made_for_kids = ?,
-        age_restriction = ?, altered_content = ?
-    """
-    set_vals = [
-        title, desc, tags, resolution, emulate_mobile,
-        render_mode, cut_start, cut_end,
-        visibility, schedule_time, is_premiere, made_for_kids,
-        age_restriction, altered_content,
-    ]
-    if "option_group_id" in data:
-        set_sql += ", option_group_id = ?"
-        set_vals.append(option_group_id)
-    if "target_channel_id" in data:
-        set_sql += ", target_channel_id = ?"
-        set_vals.append(data.get("target_channel_id") or None)
-    if "target_group_name" in data:
-        set_sql += ", target_group_name = ?"
-        set_vals.append((data.get("target_group_name") or "").strip())
-    if "target_profile_name" in data:
-        set_sql += ", target_profile_name = ?"
-        set_vals.append((data.get("target_profile_name") or "").strip() or None)
+        destination_keys = {
+            "target_channel_id", "target_profile_name", "target_group_name", "target_group_names",
+            "target_group_names_json",
+        }
+        destination_changed = False
+        if "target_group_names" in data or "target_group_names_json" in data or "target_group_name" in data:
+            raw_groups = data.get("target_group_names", data.get("target_group_names_json", data.get("target_group_name")))
+            requested_groups = _validated_group_names(conn, raw_groups, default="Mặc định")
+            current_groups = target_group_names(current) if str(current.get("target_type") or "GROUP").upper() == "GROUP" else []
+            destination_changed = current_groups != requested_groups or str(current.get("target_type") or "").upper() != "GROUP"
+            if not destination_changed and current.get("assigned_channel_id"):
+                try:
+                    from group_distribution import choose_target_channel
+                    choose_target_channel(conn, current, validate_existing_assignment=True)
+                except ValueError:
+                    destination_changed = True
+            if destination_changed:
+                updates.update(_queue_target_updates(conn, {"target_group_names": requested_groups}, current))
+        elif "target_channel_id" in data or "target_profile_name" in data:
+            requested_channel = data.get("target_channel_id") or None
+            requested_profile = str(data.get("target_profile_name") or "").strip()
+            destination_changed = (
+                (int(current.get("target_channel_id") or 0) != int(requested_channel or 0))
+                or (str(current.get("target_profile_name") or "").strip() != requested_profile)
+                or (str(current.get("target_type") or "").upper() == "GROUP")
+            )
+            if not destination_changed and current.get("assigned_channel_id"):
+                try:
+                    from group_distribution import choose_target_channel
+                    choose_target_channel(conn, current, validate_existing_assignment=True)
+                except ValueError:
+                    destination_changed = True
+            if destination_changed:
+                updates.update(_queue_target_updates(conn, {
+                    "target_channel_id": requested_channel,
+                    "target_profile_name": requested_profile,
+                }, current))
 
-    cur = conn.execute(
-        f"UPDATE video_queue SET {set_sql} WHERE id = ?",
-        (*set_vals, item_id),
-    )
-    if cur.rowcount == 0:
+        _ensure_destination_not_active(current, destination_changed)
+        merged = dict(current)
+        merged.update(updates)
+        try:
+            final = validate_queue_fields(merged)
+            metadata = validate_metadata_fields(merged)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        updates.update({
+            "visibility": final["visibility"],
+            "schedule_time": final["schedule_time"],
+            "is_premiere": final["is_premiere"],
+            "made_for_kids": final["made_for_kids"],
+            "age_restriction": final["age_restriction"],
+            "altered_content": final["altered_content"],
+            "upload_to": final["upload_to"],
+            "render_mode": final["render_mode"],
+            "resolution": final["resolution"],
+        })
+        updates.update({key: metadata[key] for key in ("title", "description", "tags")})
+        safe = {key: value for key, value in updates.items() if key in {
+            "title", "description", "tags", "resolution", "emulate_mobile", "render_mode",
+            "cut_start", "cut_end", "visibility", "schedule_time", "is_premiere",
+            "made_for_kids", "age_restriction", "altered_content", "option_group_id",
+            "target_channel_id", "target_group_name", "target_group_names_json", "target_type",
+            "target_profile_name", "assigned_channel_id", "assigned_group_names_json", "group_schema_version",
+        }}
+        changed = {key: value for key, value in safe.items() if current.get(key) != value}
+        if changed:
+            columns = ", ".join(f"{key} = ?" for key in changed)
+            cur = conn.execute(
+                f"UPDATE video_queue SET {columns} WHERE id = ? AND COALESCE(claim_token, '') = ''",
+                list(changed.values()) + [item_id],
+            )
+            if cur.rowcount != 1:
+                raise HTTPException(409, f"Video #{item_id} đã được worker giữ; không lưu được thay đổi.")
+        conn.commit()
+        return {"ok": True, "updated": 1 if changed else 0, "destination_changed": destination_changed}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        raise HTTPException(404, f"Không tìm thấy video #{item_id} trong hàng đợi.")
-    conn.commit()
-    conn.close()
-    return {"ok": True}
 
 
 @app.post("/api/queue/delete")
@@ -928,7 +1334,10 @@ def api_delete_queue_items(data: Dict[str, Any] = Body(...)):
     conn = get_conn()
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(
-        f"SELECT id, status, claim_token FROM video_queue WHERE id IN ({placeholders})",
+        f"SELECT id, status, claim_token, "
+        f"(SELECT state FROM content_reservations cr WHERE cr.queue_id = video_queue.id "
+        f"ORDER BY CASE state WHEN 'NeedsReview' THEN 0 ELSE 1 END LIMIT 1) AS reservation_state "
+        f"FROM video_queue WHERE id IN ({placeholders})",
         ids,
     ).fetchall()
 
@@ -937,8 +1346,14 @@ def api_delete_queue_items(data: Dict[str, Any] = Body(...)):
         status = (r["status"] or "").strip()
         # claim_token khác rỗng = một worker (batch/monitor) đang giữ video này —
         # xóa ngay lúc này sẽ khiến worker ghi vào dòng đã mất hoặc đăng video không còn hàng đợi.
-        if (r["claim_token"] or "").strip() or status.startswith(BUSY_STATUS_PREFIXES):
-            blocked.append(f"#{r['id']} ({status or 'đang bị giữ'})")
+        if (
+            (r["claim_token"] or "").strip()
+            or status.startswith(BUSY_STATUS_PREFIXES)
+            or status == "NeedsReview"
+            or r["reservation_state"]
+        ):
+            reason = "cần đối soát" if status == "NeedsReview" or r["reservation_state"] == "NeedsReview" else "đang bị giữ"
+            blocked.append(f"#{r['id']} ({status or reason}; {reason})")
         else:
             deletable.append(r["id"])
 
@@ -946,7 +1361,7 @@ def api_delete_queue_items(data: Dict[str, Any] = Body(...)):
         conn.close()
         raise HTTPException(
             409,
-            f"Không xóa được {len(blocked)} video đang xử lý: {', '.join(blocked[:5])}"
+            f"Không xóa được {len(blocked)} video đang xử lý hoặc cần đối soát: {', '.join(blocked[:5])}"
             + ("..." if len(blocked) > 5 else "")
             + ". Hãy bấm Dừng và chờ luồng hiện tại kết thúc rồi xóa lại.",
         )
@@ -1078,99 +1493,79 @@ def api_export_csv(project: str = "Default"):
 
 @app.post("/api/queue/import-csv")
 def api_import_csv(data: Dict[str, Any] = Body(...)):
-    import csv
-    import io
-    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
-    project_name = data.get("project_name") or "Default"
+    project_name = str(data.get("project_name") or "Default").strip() or "Default"
     csv_text = data.get("csv_text") or ""
-    if not csv_text.strip():
-        raise HTTPException(400, "Nội dung CSV không được để trống.")
-
-    f = io.StringIO(csv_text.lstrip("\ufeff").strip())
-    reader = csv.DictReader(f)
-    if not reader.fieldnames:
-        raise HTTPException(400, "CSV cần có dòng tiêu đề cột.")
-
-    def _source_key(value: Any) -> str:
-        raw = str(value or "").strip()
-        try:
-            parsed = urlsplit(raw)
-            if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-                return ""
-            query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
-            return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", query, ""))
-        except (TypeError, ValueError):
-            return ""
-
-    def _csv_int(row: Dict[str, Any], *names: str) -> int:
-        for n in names:
-            v = (str(row.get(n) or "")).strip()
-            if v:
-                try:
-                    return 1 if float(v) >= 1 else 0
-                except Exception:
-                    pass
-        return 0
-
+    preview_only = bool(data.get("preview"))
     conn = get_conn()
-    added = 0
-    skipped = 0
-    seen_urls = set()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        if preview_only:
+            conn.execute("BEGIN")
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+        existing_urls = {
+            normalize_source_url(row[0]) for row in conn.execute(
+                "SELECT source_url FROM video_queue WHERE project_name = ? AND COALESCE(source_url, '') != ''",
+                (project_name,),
+            ).fetchall() if normalize_source_url(row[0])
+        }
+        existing_groups = {
+            str(row[0]) for row in conn.execute("SELECT name FROM channel_groups").fetchall()
+        }
+        try:
+            preview = preview_csv_import(
+                csv_text,
+                existing_urls=existing_urls,
+                existing_groups=existing_groups,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        if preview_only:
+            conn.rollback()
+            return {"ok": True, "preview": True, **{k: v for k, v in preview.items() if k != "valid_rows"}}
+
         conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (project_name,))
-        existing_urls = conn.execute(
-            "SELECT source_url FROM video_queue WHERE project_name = ? AND COALESCE(source_url, '') != ''",
-            (project_name,),
-        ).fetchall()
-        seen_urls.update(key for row in existing_urls if (key := _source_key(row["source_url"])))
-
-        for row in reader:
-            url = row.get("Source_URL") or row.get("source_url") or row.get("URL") or row.get("url") or ""
-            title = (row.get("Title") or row.get("title") or "").strip()
-            if not title:
-                title = (Path(url).stem if url else "").strip()
-            source_key = _source_key(url)
-            if not source_key or not title:
-                skipped += 1
-                continue
-            if source_key in seen_urls:
-                skipped += 1
-                continue
-            seen_urls.add(source_key)
-            desc = row.get("Description") or row.get("description") or ""
-            tags = row.get("Tags") or row.get("tags") or ""
-            upload_to = row.get("Upload_To") or row.get("upload_to") or "Shorts"
-            render_mode = row.get("Render_Mode") or row.get("render_mode") or "shorts_9_16"
-            visibility = (row.get("Visibility") or row.get("visibility") or "public").lower()
-            schedule_time = (row.get("Schedule_Time") or row.get("schedule_time") or "").strip()
-            made_for_kids = _csv_int(row, "Made_For_Kids", "made_for_kids")
-            age_restriction = _csv_int(row, "Age_Restriction", "age_restriction")
-            altered_content = _csv_int(row, "Altered_Content", "altered_content")
-
+        added = 0
+        for row in preview["valid_rows"]:
+            item = row["data"]
+            groups = item["target_group_names"]
             conn.execute(
                 """
                 INSERT INTO video_queue (
                     project_name, source_type, platform, source_url, title, description, tags,
-                    upload_to, render_mode, visibility, schedule_time,
-                    made_for_kids, age_restriction, altered_content, emulate_mobile, status
-                ) VALUES (?, 'CSV', 'Custom', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Pending')
+                    upload_to, render_mode, resolution, visibility, schedule_time, is_premiere,
+                    made_for_kids, age_restriction, altered_content, emulate_mobile,
+                    target_type, target_group_name, target_group_names_json, group_schema_version, status
+                ) VALUES (?, 'CSV', 'Custom', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0,
+                          'GROUP', ?, ?, 1, 'Pending')
                 """,
                 (
-                    project_name, url, title, desc, tags, upload_to, render_mode,
-                    visibility, schedule_time, made_for_kids, age_restriction, altered_content,
+                    project_name, item["source_url"], item["title"], item["description"], item["tags"],
+                    item["upload_to"], item["render_mode"], item["resolution"], item["visibility"],
+                    item["schedule_time"], item["is_premiere"], item["made_for_kids"],
+                    item["age_restriction"], item["altered_content"], groups[0], serialize_group_names(groups),
                 ),
             )
             added += 1
         conn.commit()
+        skipped = preview["duplicate_count"] + preview["error_count"]
+        result = {"ok": True, "preview": False, "added": added, "skipped": skipped, **{
+            key: preview[key] for key in ("total_rows", "valid_count", "duplicate_count", "error_count", "rows")
+        }}
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    add_log("CSV", f"Đã nhập {added} video; bỏ qua {skipped} dòng thiếu/không hợp lệ/trùng từ [{project_name}].", "SUCCESS")
-    return {"ok": True, "added": added, "skipped": skipped}
+    add_log(
+        "CSV",
+        f"Nhập CSV [{project_name}]: thêm {result['added']}, trùng {result['duplicate_count']}, lỗi {result['error_count']} dòng.",
+        "SUCCESS" if result["added"] else "WARNING",
+    )
+    return result
 
 
 # ==========================================================
@@ -1188,6 +1583,7 @@ _EXCEL_FIELD_ALIASES = {
     "schedule_time": ("dat lich", "schedule", "schedule time", "schedule_time", "thoi gian dang", "len lich", "gio dang"),
     "target_profile_name": ("profile chrome", "profile", "chrome profile", "tai khoan chrome", "profile dang"),
     "channel": ("kenh youtube", "kenh", "channel", "channel id", "kenh dich", "tai khoan youtube", "youtube channel"),
+    "target_group_names": ("nhom kenh", "nhom dich", "target groups", "target_group_names", "groups"),
     "age_restriction": ("gioi han 18+", "18+", "age restriction", "age_restriction", "gioi han do tuoi", "gioi han nguoi xem"),
     "made_for_kids": ("danh cho tre em", "made for kids", "made_for_kids", "tre em", "mfk"),
     "altered_content": ("nhan ai", "altered content", "altered_content", "noi dung ai", "ai label"),
@@ -1209,6 +1605,7 @@ _EXCEL_COLUMN_DEFS = [
     ("schedule_time", "Đặt lịch", 20),
     ("target_profile_name", "Profile Chrome", 20),
     ("channel", "Kênh YouTube", 30),
+    ("target_group_names", "Nhóm kênh đích", 32),
     ("age_restriction", "Giới hạn 18+", 13),
     ("made_for_kids", "Dành cho trẻ em", 15),
     ("altered_content", "Nhãn AI", 11),
@@ -1295,7 +1692,9 @@ def _excel_datetime(value: Any) -> Optional[datetime]:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.replace(tzinfo=None, microsecond=0)
+        if value.tzinfo is not None:
+            value = value.astimezone(datetime.now().astimezone().tzinfo).replace(tzinfo=None)
+        return value.replace(microsecond=0)
     if isinstance(value, date):
         return datetime.combine(value, time(9, 0))
     if isinstance(value, (int, float)):
@@ -1308,7 +1707,9 @@ def _excel_datetime(value: Any) -> Optional[datetime]:
         return None
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return parsed.replace(tzinfo=None, microsecond=0)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(datetime.now().astimezone().tzinfo).replace(tzinfo=None)
+        return parsed.replace(microsecond=0)
     except Exception:
         pass
     for fmt in (
@@ -1499,6 +1900,8 @@ def api_export_excel(project: str = "Default", ids: str = ""):
             "schedule_time": item["schedule_time"] or "",
             "target_profile_name": item["target_profile_name"] or "",
             "channel": ch["name"] if ch else "",
+            "target_group_names": " | ".join(target_group_names(dict(item)))
+            if str(item.get("target_type") or "GROUP").upper() == "GROUP" else "",
             "age_restriction": item["age_restriction"] or 0,
             "made_for_kids": item["made_for_kids"] or 0,
             "altered_content": item["altered_content"] or 0,
@@ -1596,7 +1999,7 @@ def api_export_excel(project: str = "Default", ids: str = ""):
     )
 
 
-def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int]) -> Dict[str, Any]:
+def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int], preview_only: bool = False) -> Dict[str, Any]:
     """Toàn bộ phần nặng của import Excel (parse + ghép dòng + ghi DB) tách thành hàm sync
     để chạy trong threadpool — không giữ event loop khi xử lý file lớn (S4)."""
     import io
@@ -1650,6 +2053,7 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int])
 
     conn = get_conn()
     try:
+        conn.execute("BEGIN" if preview_only else "BEGIN IMMEDIATE")
         project_rows = conn.execute(
             "SELECT * FROM video_queue WHERE project_name = ? ORDER BY id ASC",
             (project_name,),
@@ -1674,8 +2078,9 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int])
                 profile_names.append(pname)
 
         warnings: List[str] = []
+        errors: List[str] = []
         updates_by_id: Dict[int, Dict[str, Any]] = {}
-        matched = 0
+        row_results: Dict[int, Dict[str, Any]] = {}
         has_any_id = any(row["id"] is not None for row in excel_rows)
 
         def warn(message: str):
@@ -1684,17 +2089,28 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int])
 
         if has_any_id:
             unmatched_without_id = 0
+            matched_ids = set()
             for row in excel_rows:
                 excel_id = row["id"]
                 if excel_id is None:
                     unmatched_without_id += 1
                     continue
                 if excel_id not in current_by_id:
-                    warn(f"Dòng {row['row']}: ID #{excel_id} không thuộc dự án [{project_name}] — bỏ qua.")
+                    message = f"ID #{excel_id} không thuộc dự án [{project_name}] — bỏ qua."
+                    warn(f"Dòng {row['row']}: {message}")
+                    row_results[row["row"]] = {"line": row["row"], "queue_id": excel_id, "state": "skipped", "reasons": [message], "warnings": []}
                     continue
                 if excel_id not in target_pool:
-                    warn(f"Dòng {row['row']}: ID #{excel_id} không nằm trong các dòng đã tích chọn — bỏ qua.")
+                    message = "ID không nằm trong các dòng đã tích chọn — bỏ qua."
+                    warn(f"Dòng {row['row']}: {message}")
+                    row_results[row["row"]] = {"line": row["row"], "queue_id": excel_id, "state": "skipped", "reasons": [message], "warnings": []}
                     continue
+                if excel_id in matched_ids:
+                    message = f"ID #{excel_id} bị lặp trong file Excel — chỉ cập nhật một lần."
+                    errors.append(f"Dòng {row['row']}: {message}")
+                    row_results[row["row"]] = {"line": row["row"], "queue_id": excel_id, "state": "error", "reasons": [message], "warnings": []}
+                    continue
+                matched_ids.add(excel_id)
                 row["_target_id"] = excel_id
             if unmatched_without_id:
                 warn(f"Có {unmatched_without_id} dòng thiếu ID nên không được ghép tự động — bỏ qua.")
@@ -1705,61 +2121,77 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int])
                     f"{len(excel_rows) - len(target_pool)} dòng cuối bị bỏ qua."
                 )
             for row, item_id in zip(excel_rows, target_pool):
-                row["_target_id"] = item_id
+                if row["row"] not in row_results:
+                    row["_target_id"] = item_id
 
-        now = datetime.now()
+        now = datetime.now().replace(microsecond=0)
         scheduled_entries = []
         for row in excel_rows:
             item_id = row.get("_target_id")
             if item_id is None:
+                row_results.setdefault(row["row"], {"line": row["row"], "queue_id": None, "state": "skipped", "reasons": ["Không ghép được dòng Excel với video trong dự án."], "warnings": []})
                 continue
-            matched += 1
             values = row["values"]
             current = current_by_id.get(item_id, {})
             updates: Dict[str, Any] = {}
+            row_errors: List[str] = []
+            row_warnings: List[str] = []
+
+            def row_error(message: str):
+                row_errors.append(message)
+                errors.append(f"Dòng {row['row']} (#{item_id}): {message}")
+
+            def row_warning(message: str):
+                row_warnings.append(message)
+                warn(f"Dòng {row['row']} (#{item_id}): {message}")
 
             title = values.get("title")
             if title is not None and str(title).strip() != "":
                 title_text = str(title).strip()
                 if len(title_text) > 100:
-                    warn(f"Dòng {row['row']}: tiêu đề dài {len(title_text)} ký tự, đã cắt còn 100 ký tự.")
-                    title_text = title_text[:100].rstrip()
+                    row_error(f"Tiêu đề dài {len(title_text)} ký tự, tối đa 100.")
                 updates["title"] = title_text
 
             description = values.get("description")
             if description is not None and str(description).strip() != "":
                 desc_text = str(description).strip()
                 if len(desc_text) > 5000:
-                    warn(f"Dòng {row['row']}: mô tả dài quá 5000 ký tự, đã cắt bớt.")
-                    desc_text = desc_text[:5000]
+                    row_error("Mô tả vượt quá 5000 ký tự.")
                 updates["description"] = desc_text
 
             tags = values.get("tags")
             if tags is not None and str(tags).strip() != "":
                 updates["tags"] = str(tags).strip()
 
+            upload_to_raw = values.get("upload_to")
             upload_to = _excel_map_choice(
-                values.get("upload_to"),
+                upload_to_raw,
                 {"shorts": "Shorts", "short": "Shorts", "shorts video": "Shorts",
                  "video": "Video", "video dai": "Video", "dai": "Video", "long": "Video"},
             )
             if upload_to:
                 updates["upload_to"] = upload_to
+            elif upload_to_raw not in (None, ""):
+                row_error(f"Định dạng video '{upload_to_raw}' không hợp lệ.")
 
-            render_mode = _excel_map_choice(values.get("render_mode"), _EXCEL_RENDER_MODES)
+            render_raw = values.get("render_mode")
+            render_mode = _excel_map_choice(render_raw, _EXCEL_RENDER_MODES)
             if render_mode:
                 updates["render_mode"] = render_mode
+            elif render_raw not in (None, ""):
+                row_error(f"Chế độ render '{render_raw}' không hợp lệ.")
 
-            resolution = _excel_map_choice(values.get("resolution"), _EXCEL_RESOLUTIONS)
+            resolution_raw = values.get("resolution")
+            resolution = _excel_map_choice(resolution_raw, _EXCEL_RESOLUTIONS)
             if resolution:
                 updates["resolution"] = resolution
+            elif resolution_raw not in (None, ""):
+                row_error(f"Độ phân giải '{resolution_raw}' không hợp lệ.")
 
             profile_raw = values.get("target_profile_name")
             profile_name = None
             if profile_raw is not None and str(profile_raw).strip() != "":
                 profile_name = _match_excel_profile(profile_raw, profile_names)
-                if not profile_name:
-                    warn(f"Dòng {row['row']}: không tìm thấy Profile Chrome '{profile_raw}' — bỏ qua cột Profile.")
 
             channel_raw = values.get("channel")
             channel_input_present = channel_raw is not None and str(channel_raw).strip() != ""
@@ -1767,97 +2199,142 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int])
             if channel_input_present:
                 channel, reason = _match_excel_channel(channel_raw, channels)
                 if not channel:
-                    warn(f"Dòng {row['row']}: {reason} — bỏ qua cột Kênh.")
+                    row_error(f"{reason}.")
+
+            groups_raw = values.get("target_group_names")
+            groups_input_present = groups_raw is not None and str(groups_raw).strip() != ""
+            groups = []
+            if groups_input_present:
+                try:
+                    groups = normalize_group_names(groups_raw)
+                    actual_groups = {str(r[0]).casefold(): str(r[0]) for r in conn.execute("SELECT name FROM channel_groups").fetchall()}
+                    missing = [name for name in groups if name.casefold() not in actual_groups]
+                    if missing:
+                        row_error("Nhóm không tồn tại: " + ", ".join(missing))
+                    else:
+                        groups = [actual_groups[name.casefold()] for name in groups]
+                except ValueError as exc:
+                    row_error(str(exc))
+
+            if channel_input_present and groups_input_present:
+                row_error("Chỉ chọn Kênh YouTube hoặc Nhóm kênh đích, không nhập đồng thời cả hai.")
 
             if channel:
                 channel_profile = (channel.get("profile_name") or "").strip()
                 if profile_name and channel_profile and _excel_key(profile_name) != _excel_key(channel_profile):
-                    warn(
-                        f"Dòng {row['row']}: Profile '{profile_name}' khác Profile của kênh "
-                        f"(dùng '{channel_profile}' để giữ cùng Proxy)."
-                    )
+                    row_warning(f"Profile '{profile_name}' khác Profile của kênh; dùng '{channel_profile}' theo cấu hình kênh.")
+                elif profile_raw and not profile_name:
+                    row_warning(f"Không khớp Profile '{profile_raw}'; giữ Profile gắn với kênh đích.")
                 updates["target_channel_id"] = int(channel["id"])
                 updates["target_type"] = "CHANNEL"
+                updates["target_group_name"] = ""
+                updates["target_group_names_json"] = "[]"
+                updates["group_schema_version"] = GROUP_SCHEMA_VERSION
+                updates["assigned_channel_id"] = None
+                updates["assigned_group_names_json"] = ""
                 if channel_profile:
                     updates["target_profile_name"] = channel_profile
                 elif profile_name:
                     updates["target_profile_name"] = profile_name
-            elif profile_name and not channel_input_present:
-                updates["target_profile_name"] = profile_name
+            elif groups_input_present and groups and not row_errors:
+                updates["target_type"] = "GROUP"
                 updates["target_channel_id"] = None
-                updates["target_type"] = "PROFILE"
-            elif profile_name and not current.get("target_channel_id"):
-                updates["target_profile_name"] = profile_name
+                updates["target_profile_name"] = ""
+                updates["target_group_name"] = groups[0]
+                updates["target_group_names_json"] = serialize_group_names(groups)
+                updates["group_schema_version"] = GROUP_SCHEMA_VERSION
+                updates["assigned_channel_id"] = None
+                updates["assigned_group_names_json"] = ""
+            elif profile_raw is not None and str(profile_raw).strip() != "" and not channel_input_present and not groups_input_present:
+                if not profile_name:
+                    row_error(f"Không tìm thấy Profile Chrome '{profile_raw}'.")
+                else:
+                    profile_channels = [c for c in channels if _excel_key(c.get("profile_name")) == _excel_key(profile_name)]
+                    if len(profile_channels) != 1:
+                        row_error(f"Profile '{profile_name}' phải có đúng một kênh YouTube; hiện có {len(profile_channels)}.")
+                    else:
+                        updates["target_profile_name"] = profile_name
+                        updates["target_channel_id"] = None
+                        updates["target_type"] = "PROFILE"
+                        updates["target_group_name"] = ""
+                        updates["target_group_names_json"] = "[]"
+                        updates["assigned_channel_id"] = None
+                        updates["assigned_group_names_json"] = ""
 
-            visibility = _excel_map_choice(values.get("visibility"), _EXCEL_VISIBILITY)
-            if values.get("visibility") not in (None, "") and not visibility:
-                warn(f"Dòng {row['row']}: chế độ đăng '{values.get('visibility')}' không hợp lệ — bỏ qua.")
+            visibility_raw = values.get("visibility")
+            visibility = _excel_map_choice(visibility_raw, _EXCEL_VISIBILITY)
+            if visibility_raw not in (None, "") and not visibility:
+                row_error(f"Chế độ đăng '{visibility_raw}' không hợp lệ.")
 
             schedule_raw = values.get("schedule_time")
             schedule_dt = _excel_datetime(schedule_raw) if schedule_raw not in (None, "") else None
             if schedule_raw not in (None, "") and schedule_dt is None:
-                warn(f"Dòng {row['row']}: giờ đặt lịch '{schedule_raw}' không đúng định dạng — bỏ qua.")
+                row_error(f"Giờ đặt lịch '{schedule_raw}' không đúng định dạng.")
             if schedule_dt and schedule_dt <= now:
-                warn(f"Dòng {row['row']}: giờ đặt lịch {schedule_dt:%Y-%m-%d %H:%M} đã qua — bỏ qua.")
-                schedule_dt = None
-
-            current_sched_dt = _excel_datetime(current.get("schedule_time"))
-            schedule_changed = schedule_dt is not None and current_sched_dt != schedule_dt
+                row_error(f"Giờ đặt lịch {schedule_dt:%Y-%m-%d %H:%M} đã qua.")
 
             if visibility == "schedule":
                 if schedule_dt:
                     updates["visibility"] = "schedule"
                     updates["schedule_time"] = schedule_dt.strftime("%Y-%m-%d %H:%M:%S")
+                elif not (str(current.get("schedule_time") or "").strip()):
+                    row_error("Chọn Lên lịch nhưng thiếu giờ đặt lịch.")
                 else:
-                    if current_sched_dt and current_sched_dt > now:
-                        updates["visibility"] = "schedule"
-                    else:
-                        updates["visibility"] = "schedule"
-                        updates["schedule_time"] = ""
-                        warn(
-                            f"Dòng {row['row']}: chọn Lên lịch nhưng thiếu giờ hợp lệ — "
-                            "video sẽ bị chặn khi chạy cho tới khi bổ sung giờ (không tự đăng Công khai)."
-                        )
-            elif visibility in ("public", "unlisted", "private"):
-                if schedule_changed:
                     updates["visibility"] = "schedule"
-                    updates["schedule_time"] = schedule_dt.strftime("%Y-%m-%d %H:%M:%S")
-                else:
-                    updates["visibility"] = visibility
-                    if schedule_dt or current.get("schedule_time"):
-                        updates["schedule_time"] = ""
-                        updates["is_premiere"] = 0
+            elif visibility in ("public", "unlisted", "private"):
+                if schedule_dt:
+                    row_error("Chế độ đăng ngay và giờ đặt lịch không thể cùng được chọn.")
+                updates["visibility"] = visibility
+                updates["schedule_time"] = ""
+                updates["is_premiere"] = 0
             elif schedule_dt:
                 updates["visibility"] = "schedule"
                 updates["schedule_time"] = schedule_dt.strftime("%Y-%m-%d %H:%M:%S")
-            elif visibility:
-                updates["visibility"] = visibility
 
             for field in ("age_restriction", "made_for_kids", "altered_content", "is_premiere", "emulate_mobile"):
-                parsed_bool = _excel_bool(values.get(field))
-                if parsed_bool is not None:
+                raw_bool = values.get(field)
+                parsed_bool = _excel_bool(raw_bool)
+                if raw_bool not in (None, "") and parsed_bool is None:
+                    row_error(f"Giá trị '{raw_bool}' ở cột {field} không phải 0/1 hoặc Có/Không.")
+                elif parsed_bool is not None:
                     updates[field] = parsed_bool
-
-            final_visibility = updates.get("visibility", (current.get("visibility") or "").lower())
-            final_schedule = updates.get("schedule_time", (current.get("schedule_time") or "").strip())
-            if updates.get("is_premiere") and final_visibility != "schedule" and not final_schedule:
-                warn(f"Dòng {row['row']}: Premiere chỉ áp dụng khi Lên lịch — đã tắt Premiere.")
-                updates["is_premiere"] = 0
 
             for field in ("cut_start", "cut_end"):
                 raw_cut = values.get(field)
                 if raw_cut is not None and str(raw_cut).strip() != "":
                     updates[field] = str(raw_cut).strip()
 
-            if str(current.get("status") or "") == "Completed":
-                warn(f"Dòng {row['row']} (#{item_id}): video đã đăng — thay đổi chỉ lưu trong hàng đợi, không sửa video trên YouTube.")
+            merged = dict(current)
+            merged.update(updates)
+            try:
+                metadata = validate_metadata_fields(merged)
+                final = validate_queue_fields(merged, now=now)
+                updates.update({key: final[key] for key in (
+                    "visibility", "schedule_time", "is_premiere", "made_for_kids", "age_restriction",
+                    "upload_to", "render_mode", "resolution",
+                )})
+                updates.update({key: metadata[key] for key in ("title", "description", "tags") if key in updates})
+            except ValueError as exc:
+                row_error(str(exc))
 
-            if updates:
+            if str(current.get("status") or "") == "Completed":
+                row_warning("Video đã đăng; thay đổi chỉ lưu trong hàng đợi, không sửa video trên YouTube.")
+
+            if row_errors:
+                row_results[row["row"]] = {"line": row["row"], "queue_id": item_id, "state": "error", "reasons": row_errors, "warnings": row_warnings}
+            elif updates:
+                updates = {key: value for key, value in updates.items() if current.get(key) != value}
+                if not updates:
+                    row_results[row["row"]] = {"line": row["row"], "queue_id": item_id, "state": "skipped", "reasons": ["Giá trị không thay đổi so với hàng đợi."], "warnings": row_warnings}
+                    continue
                 updates_by_id[item_id] = updates
-                if updates.get("schedule_time"):
+                row_results[row["row"]] = {"line": row["row"], "queue_id": item_id, "state": "valid", "reasons": [], "warnings": row_warnings, "changes": len(updates)}
+                if updates.get("schedule_time") and str(updates.get("visibility") or current.get("visibility")) == "schedule":
                     scheduled_entries.append(
                         (item_id, datetime.fromisoformat(updates["schedule_time"]))
                     )
+            else:
+                row_results[row["row"]] = {"line": row["row"], "queue_id": item_id, "state": "skipped", "reasons": ["Dòng không có ô nào cần cập nhật."], "warnings": row_warnings}
 
         adjusted = 0
         scheduled_entries.sort(key=lambda pair: pair[1])
@@ -1879,40 +2356,65 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int])
             "title", "description", "tags", "upload_to", "render_mode", "resolution",
             "visibility", "schedule_time", "target_profile_name", "target_channel_id",
             "target_type", "age_restriction", "made_for_kids", "altered_content",
-            "is_premiere", "cut_start", "cut_end", "emulate_mobile",
+            "is_premiere", "cut_start", "cut_end", "emulate_mobile", "target_group_name",
+            "target_group_names_json", "group_schema_version", "assigned_channel_id", "assigned_group_names_json",
         }
         updated = 0
         for item_id, item_updates in updates_by_id.items():
             safe_updates = {k: v for k, v in item_updates.items() if k in allowed_cols}
             if not safe_updates:
                 continue
-            cols = ", ".join(f"{k} = ?" for k in safe_updates)
-            conn.execute(
-                f"UPDATE video_queue SET {cols} WHERE id = ?",
-                list(safe_updates.values()) + [item_id],
+            destination_changed = any(k in safe_updates for k in (
+                "target_type", "target_channel_id", "target_profile_name", "target_group_name", "target_group_names_json"
+            ))
+            current = current_by_id[item_id]
+            _ensure_destination_not_active(current, destination_changed)
+            changed = {k: v for k, v in safe_updates.items() if current.get(k) != v}
+            if not changed:
+                continue
+            cols = ", ".join(f"{k} = ?" for k in changed)
+            cur = conn.execute(
+                f"UPDATE video_queue SET {cols} WHERE id = ? AND COALESCE(claim_token, '') = '' "
+                "AND status NOT LIKE 'Uploading%' AND status NOT LIKE 'Downloading%' "
+                "AND status NOT LIKE 'Rendering%' AND status NOT LIKE 'Đang đăng%'",
+                list(changed.values()) + [item_id],
             )
-            updated += 1
-        conn.commit()
+            if cur.rowcount != 1:
+                raise HTTPException(409, f"Video #{item_id} bắt đầu chạy trong lúc nhập Excel; đã hủy toàn bộ cập nhật.")
+            updated += cur.rowcount
+        if preview_only:
+            conn.rollback()
+            updated = len(updates_by_id)
+        else:
+            conn.commit()
     finally:
         conn.close()
 
-    skipped = len(excel_rows) - matched
-    add_log(
-        "Excel",
-        f"Đã nhập Excel cập nhật {updated}/{len(excel_rows)} dòng cho dự án [{project_name}]"
-        + (f", bỏ qua {skipped} dòng." if skipped else "."),
-        "SUCCESS" if updated else "WARNING",
-    )
-    return {
+    valid_count = sum(1 for result in row_results.values() if result["state"] == "valid")
+    skipped = sum(1 for result in row_results.values() if result["state"] == "skipped")
+    error_count = sum(1 for result in row_results.values() if result["state"] == "error")
+    result = {
         "ok": True,
+        "preview": bool(preview_only),
         "updated": updated,
-        "matched": matched,
+        "matched": valid_count,
         "skipped": skipped,
+        "error_count": error_count,
         "total_rows": len(excel_rows),
         "adjusted_schedules": adjusted,
         "warning_count": len(warnings),
-        "warnings": warnings[:30],
+        "warnings": warnings[:50],
+        "errors": errors[:100],
+        "rows": [row_results[key] for key in sorted(row_results)[:100]],
     }
+    if not preview_only:
+        add_log(
+            "Excel",
+            f"Đã nhập Excel cập nhật {updated}/{len(excel_rows)} dòng cho dự án [{project_name}], "
+            f"bỏ qua {skipped}, lỗi {error_count}.",
+            "SUCCESS" if updated else "WARNING",
+        )
+    return result
 
 
 @app.post("/api/queue/import-excel")
@@ -1920,6 +2422,7 @@ async def api_import_excel(
     file: UploadFile = File(...),
     project_name: str = Form("Default"),
     ids: str = Form(""),
+    preview_only: bool = Form(False),
 ):
     filename = (file.filename or "").strip()
     if filename.lower().endswith(".xls"):
@@ -1937,7 +2440,7 @@ async def api_import_excel(
     selected_ids = _parse_id_list(ids)
     # S4: parse openpyxl + xử lý tới 5000 dòng là CPU-bound — đẩy sang threadpool
     # để không đóng băng event loop (polling 2.5s của toàn dashboard bị khựng).
-    return await run_in_threadpool(_excel_import_worker, raw, project_name, selected_ids)
+    return await run_in_threadpool(_excel_import_worker, raw, project_name, selected_ids, preview_only)
 
 
 # ==========================================================
@@ -2002,6 +2505,177 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
 # ==========================================================
 # ĐIỀU KHIỂN PIPELINE (DOWNLOAD -> RENDER -> UPLOAD)
 # ==========================================================
+@app.post("/api/queue/{item_id}/manual-reupload")
+def api_manual_reupload(item_id: int, data: Dict[str, Any] = Body(...)):
+    """Ghi nhận quyết định đối soát hoặc cho phép đăng lại đúng một item."""
+    action = str(data.get("action") or "").strip().lower()
+    reason = str(data.get("reason") or "").strip()
+    if action not in ("reupload", "confirmed_published"):
+        raise HTTPException(400, "Thao tác phải là reupload hoặc confirmed_published.")
+    if len(reason) < 5 or len(reason) > 1000:
+        raise HTTPException(400, "Hãy nhập lý do đối soát từ 5 đến 1000 ký tự.")
+
+    published_url = str(data.get("published_url") or "").strip()
+    if action == "confirmed_published":
+        published_url = normalize_published_video_url(published_url)
+    if action == "confirmed_published" and not published_url:
+        raise HTTPException(400, "Cần nhập URL video YouTube hợp lệ để xác nhận đã đăng.")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
+        if not row:
+            conn.rollback()
+            raise HTTPException(404, "Không tìm thấy video trong hàng đợi.")
+        item = dict(row)
+        status = str(item.get("status") or "").strip()
+        if str(item.get("claim_token") or "").strip() or status.startswith(("Uploading", "Đang đăng", "Rendering", "Downloading")):
+            conn.rollback()
+            raise HTTPException(409, "Video đang được worker xử lý; hãy chờ worker kết thúc.")
+
+        reservations = conn.execute(
+            "SELECT content_key, channel_id, state FROM content_reservations WHERE queue_id = ?",
+            (item_id,),
+        ).fetchall()
+        if any(str(reservation["state"] or "") == "Active" for reservation in reservations):
+            conn.rollback()
+            raise HTTPException(409, "Reservation vẫn đang hoạt động; chưa thể thay đổi kết quả upload.")
+
+        channel_id = next((int(r["channel_id"]) for r in reservations), None)
+        if channel_id is None and item.get("target_channel_id"):
+            channel_id = int(item["target_channel_id"])
+        source_post_id = str(item.get("post_id") or "").strip()
+        if not source_post_id:
+            normalized_url = normalize_source_url(item.get("source_url"))
+            source_post_id = f"url:{normalized_url}" if normalized_url else f"queue:{item_id}"
+        content_key = str(item.get("content_key") or "").strip()
+        historical_channels = conn.execute(
+            "SELECT DISTINCT channel_id FROM published_history WHERE channel_id IS NOT NULL "
+            "AND (source_post_id = ? OR (? != '' AND content_key = ?))",
+            (source_post_id, content_key, content_key),
+        ).fetchall()
+        prior_channel_ids = {int(r["channel_id"]) for r in historical_channels}
+        normalized_source_url = normalize_source_url(item.get("source_url"))
+        if normalized_source_url:
+            legacy_url_rows = conn.execute(
+                "SELECT channel_id, source_url FROM published_history WHERE channel_id IS NOT NULL "
+                "AND COALESCE(source_url, '') != ''"
+            ).fetchall()
+            prior_channel_ids.update(
+                int(r["channel_id"])
+                for r in legacy_url_rows
+                if normalize_source_url(r["source_url"]) == normalized_source_url
+            )
+        if channel_id is None and len(prior_channel_ids) == 1:
+            channel_id = next(iter(prior_channel_ids))
+        if action == "reupload" and channel_id is None and len(prior_channel_ids) > 1:
+            conn.rollback()
+            raise HTTPException(
+                409,
+                "Video từng đăng lên nhiều kênh; hãy chọn một kênh cụ thể trước khi cho phép đăng lại.",
+            )
+
+        if action == "reupload":
+            if channel_id is None:
+                conn.rollback()
+                raise HTTPException(
+                    409,
+                    "Không xác định được kênh đích của lượt đăng lại. Hãy gán video vào một kênh cụ thể rồi thử lại.",
+                )
+            if status not in ("Completed", "NeedsReview") and not (item.get("published_url") or "").strip():
+                conn.rollback()
+                raise HTTPException(409, "Chỉ video đã đăng hoặc cần đối soát mới có thể được cho phép đăng lại.")
+            if status == "NeedsReview" and data.get("confirm_not_published") is not True:
+                conn.rollback()
+                raise HTTPException(400, "Video cần đối soát phải được xác nhận chưa đăng trước khi đăng lại.")
+            attempt_no = conn.execute(
+                "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM upload_attempts WHERE queue_id = ?",
+                (item_id,),
+            ).fetchone()[0]
+            cur = conn.execute(
+                "INSERT INTO upload_attempts "
+                "(queue_id, attempt_no, attempt_type, source_post_id, content_key, channel_id, "
+                "phase, outcome, reason, published_url) "
+                "VALUES (?, ?, 'manual_reupload', ?, ?, ?, 'Authorized', 'Authorized', ?, ?)",
+                (
+                    item_id,
+                    attempt_no,
+                    source_post_id,
+                    content_key,
+                    channel_id,
+                    reason,
+                    item.get("published_url") or "",
+                ),
+            )
+            conn.execute(
+                "DELETE FROM content_reservations WHERE queue_id = ? AND state = 'NeedsReview'",
+                (item_id,),
+            )
+            conn.execute(
+                "UPDATE video_queue SET status = 'Pending', published_url = '', error_message = ?, "
+                "manual_reupload_authorized = 1, manual_reupload_reason = ?, last_attempt_id = ?, "
+                "upload_progress = 0, target_type = CASE WHEN ? IS NOT NULL THEN 'CHANNEL' ELSE target_type END, "
+                "target_channel_id = COALESCE(?, target_channel_id) "
+                "WHERE id = ? AND COALESCE(claim_token, '') = ''",
+                (
+                    f"Đã được cho phép đăng lại theo quyết định người dùng: {reason}",
+                    reason,
+                    int(cur.lastrowid),
+                    channel_id,
+                    channel_id,
+                    item_id,
+                ),
+            )
+            conn.commit()
+            return {"ok": True, "message": "Đã ghi quyết định cho item này. Chọn riêng video đó rồi chạy pipeline.", "id": item_id}
+
+        if status != "NeedsReview":
+            conn.rollback()
+            raise HTTPException(409, "Chỉ video NeedsReview mới được xác nhận kết quả đã đăng.")
+        if channel_id is None:
+            conn.rollback()
+            raise HTTPException(409, "Không xác định được kênh đã đăng; hãy giữ NeedsReview để đối soát thêm.")
+        attempt_no = conn.execute(
+            "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM upload_attempts WHERE queue_id = ?",
+            (item_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT OR IGNORE INTO published_history "
+            "(source_post_id, source_url, channel_id, content_key, published_url) VALUES (?, ?, ?, ?, ?)",
+            (source_post_id, item.get("source_url") or "", channel_id, content_key, published_url),
+        )
+        conn.execute(
+            "UPDATE published_history SET "
+            "source_url = CASE WHEN COALESCE(source_url, '') = '' THEN ? ELSE source_url END, "
+            "content_key = CASE WHEN COALESCE(content_key, '') = '' THEN ? ELSE content_key END, "
+            "published_url = CASE WHEN COALESCE(published_url, '') = '' THEN ? ELSE published_url END "
+            "WHERE source_post_id = ? AND channel_id = ?",
+            (item.get("source_url") or "", content_key, published_url, source_post_id, channel_id),
+        )
+        review_attempt = conn.execute(
+            "INSERT INTO upload_attempts "
+            "(queue_id, attempt_no, attempt_type, source_post_id, content_key, channel_id, "
+            "phase, outcome, reason, published_url) "
+            "VALUES (?, ?, 'manual_review', ?, ?, ?, 'Resolved', 'ConfirmedPublished', ?, ?)",
+            (item_id, attempt_no, source_post_id, content_key, channel_id, reason, published_url),
+        )
+        conn.execute(
+            "UPDATE video_queue SET status = 'Completed', published_url = ?, error_message = '', "
+            "manual_reupload_authorized = 0, manual_reupload_reason = '', last_attempt_id = ? WHERE id = ?",
+            (published_url, int(review_attempt.lastrowid), item_id),
+        )
+        conn.execute("DELETE FROM content_reservations WHERE queue_id = ?", (item_id,))
+        conn.commit()
+        return {"ok": True, "message": "Đã ghi nhận video đã đăng và giữ lịch sử chống trùng.", "id": item_id}
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 @app.post("/api/pipeline/start")
 def api_start_pipeline(data: Dict[str, Any] = Body(...)):
     raw_ids = data.get("ids") or []
@@ -2027,6 +2701,17 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
         conn.close()
     by_id = {r["id"]: r for r in rows}
 
+    if force_reupload:
+        if any((by_id[item_id]["status"] or "").strip() == "NeedsReview" for item_id in ids if item_id in by_id):
+            raise HTTPException(
+                400,
+                "Video cần đối soát từng item trước khi đăng lại; hãy dùng nút 🔁 hoặc ✅ ở đúng dòng video.",
+            )
+        raise HTTPException(
+            400,
+            "Không hỗ trợ bỏ qua chống trùng cho cả batch. Hãy cho phép đăng lại từng item kèm lý do.",
+        )
+
     run_ids = []
     skipped = []
     for item_id in ids:
@@ -2039,10 +2724,10 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
         if do_up and status == "NeedsReview":
             skipped.append({"id": item_id, "title": row["title"] or f"#{item_id}", "reason": "cần đối soát YouTube trước khi chạy lại"})
             continue
-        if do_up and not force_reupload and (status == "Completed" or published):
+        if do_up and (status == "Completed" or published):
             skipped.append({"id": item_id, "title": row["title"] or f"#{item_id}", "reason": "đã đăng trước đó"})
             continue
-        if do_up and not force_reupload and (status.startswith("Uploading") or status.startswith("Đang đăng")):
+        if do_up and (status.startswith("Uploading") or status.startswith("Đang đăng")):
             skipped.append({"id": item_id, "title": row["title"] or f"#{item_id}", "reason": "đang/đã upload dở"})
             continue
         run_ids.append(item_id)
@@ -2055,11 +2740,33 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
             "Nếu thực sự muốn đăng lại video đã hoàn tất, hãy xác nhận 'Đăng lại' khi được hỏi.",
         )
 
-    result = pipeline_manager.start_batch(run_ids, do_dl, do_rd, do_up, force_reupload=force_reupload)
+    result = pipeline_manager.start_batch(run_ids, do_dl, do_rd, do_up, force_reupload=False)
     if skipped:
         result["skipped"] = skipped
         result["message"] = (result.get("message") or "") + f" Bỏ qua {len(skipped)} video đã đăng/đang upload dở."
     return result
+
+
+@app.post("/api/queue/preview-distribution")
+def api_preview_distribution(data: Dict[str, Any] = Body(...)):
+    raw_ids = data.get("ids") or []
+    if not raw_ids:
+        raise HTTPException(400, "Chọn ít nhất một video để xem trước phân phối.")
+    try:
+        ids = list(dict.fromkeys(int(value) for value in raw_ids))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Danh sách ID video không hợp lệ.")
+    items = pipeline_manager.preview_distribution(ids)
+    blocked = sum(bool(item.get("blocked")) for item in items)
+    warnings = sum(len(item.get("warnings") or []) for item in items)
+    return {
+        "ok": blocked == 0,
+        "items": items,
+        "total": len(items),
+        "blocked": blocked,
+        "warning_count": warnings,
+        "assignment_persists_on_retry": True,
+    }
 
 
 @app.post("/api/pipeline/stop")
@@ -2236,13 +2943,14 @@ def api_create_profile(data: Dict[str, Any] = Body(...)):
     )
     chk = conn.execute("SELECT id FROM youtube_channels WHERE profile_name = ?", (name,)).fetchone()
     if not chk:
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO youtube_channels (name, handle, group_name, upload_mode, profile_name, profile_path, proxy, emulate_mobile, status, note)
             VALUES (?, ?, 'Default', 'playwright', ?, ?, ?, 0, 'Ready', 'Kênh chính theo Profile')
             """,
             (f"YT - {name}", f"@{name.lower().replace(' ', '')}", name, p_path, proxy),
         )
+        set_channel_group_memberships(conn, int(cur.lastrowid), ["Mặc định"])
     conn.commit()
     conn.close()
     return {"ok": True, "name": name, "path": p_path}
@@ -2292,6 +3000,11 @@ def api_delete_profile(profile_name: str):
     if not row:
         conn.close()
         raise HTTPException(404, "Không tìm thấy Profile Chrome này.")
+    conn.execute(
+        "DELETE FROM channel_group_memberships WHERE channel_id IN "
+        "(SELECT id FROM youtube_channels WHERE profile_name = ?)",
+        (profile_name,),
+    )
     conn.execute("DELETE FROM youtube_channels WHERE profile_name = ?", (profile_name,))
     conn.execute("DELETE FROM chrome_profiles WHERE name = ?", (profile_name,))
     conn.commit()
@@ -2405,7 +3118,7 @@ def _upsert_profile_channels(
             )
             updated += 1
         else:
-            conn.execute(
+            cur = conn.execute(
                 """
                 INSERT INTO youtube_channels (
                     name, handle, email, channel_id, group_name, upload_mode, profile_name,
@@ -2414,6 +3127,7 @@ def _upsert_profile_channels(
                 """,
                 (ch_name, handle, email, channel_id, profile_name, prof_path, prof_proxy, new_status),
             )
+            set_channel_group_memberships(conn, int(cur.lastrowid), ["Mặc định"])
             added += 1
     return added, updated
 
@@ -2475,8 +3189,29 @@ def api_list_channels(profile: Optional[str] = None):
         rows = conn.execute("SELECT * FROM youtube_channels WHERE profile_name = ? ORDER BY id DESC", (profile,)).fetchall()
     else:
         rows = conn.execute("SELECT * FROM youtube_channels ORDER BY id DESC").fetchall()
+    ids = [int(row["id"]) for row in rows]
+    group_map: Dict[int, List[str]] = {channel_id: [] for channel_id in ids}
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        try:
+            membership_rows = conn.execute(
+                f"SELECT channel_id, group_name FROM channel_group_memberships "
+                f"WHERE channel_id IN ({marks}) ORDER BY sort_order ASC, group_name ASC",
+                ids,
+            ).fetchall()
+        except Exception:
+            membership_rows = []
+        for membership in membership_rows:
+            names = group_map.get(int(membership["channel_id"]))
+            if names is not None and membership["group_name"] not in names:
+                names.append(str(membership["group_name"]))
+    channels = []
+    for row in rows:
+        channel = public_channel(row)
+        channel["group_names"] = group_map.get(int(row["id"])) or [str(row["group_name"] or "Mặc định")]
+        channels.append(channel)
     conn.close()
-    return [public_channel(row) for row in rows]
+    return channels
 
 
 @app.post("/api/channels")
@@ -2516,7 +3251,10 @@ def api_create_channel(data: Dict[str, Any] = Body(...)):
         prof_path = str(candidate) if candidate.exists() else str(APP_PROFILES_DIR / prof_name)
 
     conn = get_conn()
-    conn.execute(
+    group_names = _validated_group_names(
+        conn, data.get("group_names"), legacy=data.get("group_name") or "", default="Mặc định"
+    )
+    cur = conn.execute(
         """
         INSERT INTO youtube_channels (
             name, channel_id, handle, group_name, upload_mode, profile_name,
@@ -2528,7 +3266,7 @@ def api_create_channel(data: Dict[str, Any] = Body(...)):
             name,
             data.get("channel_id") or "",
             data.get("handle") or "",
-            data.get("group_name") or "Mặc định",
+            group_names[0],
             "playwright" if is_antidetect else upload_mode,
             prof_name,
             prof_path,
@@ -2542,6 +3280,7 @@ def api_create_channel(data: Dict[str, Any] = Body(...)):
             data.get("note") or "",
         ),
     )
+    set_channel_group_memberships(conn, int(cur.lastrowid), group_names)
     conn.commit()
     conn.close()
     add_log("Channel", f"Đã thêm kênh YouTube: {name}", "SUCCESS", channel_name=name)
@@ -2586,6 +3325,16 @@ def api_update_channel(channel_id: int, data: Dict[str, Any] = Body(...)):
         conn.close()
         raise HTTPException(404, "Không tìm thấy kênh YouTube này.")
 
+    group_names = None
+    if "group_names" in data or "group_name" in data:
+        group_names = _validated_group_names(
+            conn,
+            data.get("group_names") if "group_names" in data else data.get("group_name"),
+            legacy=row["group_name"] or "",
+            default="Mặc định",
+        )
+        updates["group_name"] = group_names[0]
+
     # Đổi Profile: tự đồng bộ profile_path từ bảng chrome_profiles nếu người dùng không nhập đường dẫn mới
     if "profile_name" in updates and not updates.get("profile_path"):
         prof_name = updates["profile_name"]
@@ -2625,6 +3374,8 @@ def api_update_channel(channel_id: int, data: Dict[str, Any] = Body(...)):
 
     cols = ", ".join(f"{k} = ?" for k in updates.keys())
     conn.execute(f"UPDATE youtube_channels SET {cols} WHERE id = ?", list(updates.values()) + [channel_id])
+    if group_names is not None:
+        set_channel_group_memberships(conn, channel_id, group_names)
     conn.commit()
     conn.close()
     add_log("Channel", f"Đã cập nhật thông tin kênh YouTube #{channel_id}.", "INFO")
@@ -2634,6 +3385,7 @@ def api_update_channel(channel_id: int, data: Dict[str, Any] = Body(...)):
 @app.delete("/api/channels/{channel_id}")
 def api_delete_channel(channel_id: int):
     conn = get_conn()
+    conn.execute("DELETE FROM channel_group_memberships WHERE channel_id = ?", (channel_id,))
     conn.execute("DELETE FROM youtube_channels WHERE id = ?", (channel_id,))
     conn.commit()
     conn.close()
@@ -2697,24 +3449,121 @@ def api_check_channel_oauth(channel_id: int):
 @app.get("/api/groups")
 def api_list_groups():
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM channel_groups ORDER BY name ASC").fetchall()
+    rows = conn.execute(
+        "SELECT g.*, COUNT(m.channel_id) AS channel_count "
+        "FROM channel_groups g LEFT JOIN channel_group_memberships m ON m.group_name = g.name "
+        "GROUP BY g.name ORDER BY g.name ASC"
+    ).fetchall()
+    groups = []
+    for row in rows:
+        item = dict(row)
+        item["channel_ids"] = [
+            int(member[0]) for member in conn.execute(
+                "SELECT channel_id FROM channel_group_memberships WHERE group_name = ? "
+                "ORDER BY sort_order ASC, channel_id ASC",
+                (row["name"],),
+            ).fetchall()
+        ]
+        groups.append(item)
     conn.close()
-    return [dict(r) for r in rows]
+    return groups
 
 
 @app.post("/api/groups")
 def api_create_group(data: Dict[str, Any] = Body(...)):
     name = (data.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Tên nhóm không được để trống.")
+    if not name or len(name) > 80 or any(ch in name for ch in "\r\n\0"):
+        raise HTTPException(400, "Tên nhóm phải dài 1–80 ký tự và không chứa xuống dòng.")
     conn = get_conn()
     conn.execute(
-        "INSERT OR REPLACE INTO channel_groups (name, description) VALUES (?, ?)",
+        "INSERT INTO channel_groups (name, description) VALUES (?, ?) "
+        "ON CONFLICT(name) DO UPDATE SET description = excluded.description",
         (name, data.get("description") or ""),
     )
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+@app.put("/api/groups/{name}")
+def api_rename_group(name: str, data: Dict[str, Any] = Body(...)):
+    old_name = str(name or "").strip()
+    new_name = str(data.get("name") or "").strip()
+    if not new_name or len(new_name) > 80 or any(ch in new_name for ch in "\r\n\0"):
+        raise HTTPException(400, "Tên nhóm phải dài 1–80 ký tự và không chứa xuống dòng.")
+    if old_name == "Mặc định" and new_name != old_name:
+        raise HTTPException(400, "Không thể đổi tên nhóm mặc định.")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM channel_groups WHERE name = ?", (old_name,)).fetchone():
+            raise HTTPException(404, "Không tìm thấy nhóm kênh.")
+        if new_name != old_name and conn.execute(
+            "SELECT 1 FROM channel_groups WHERE name = ?", (new_name,)
+        ).fetchone():
+            raise HTTPException(409, "Tên nhóm mới đã được sử dụng.")
+        if new_name != old_name:
+            conn.execute(
+                "INSERT INTO channel_groups (name, description) VALUES (?, ?)",
+                (new_name, data.get("description") or ""),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO channel_group_memberships "
+                "(group_name, channel_id, sort_order, schema_version) "
+                "SELECT ?, channel_id, sort_order, schema_version FROM channel_group_memberships WHERE group_name = ?",
+                (new_name, old_name),
+            )
+            conn.execute("UPDATE youtube_channels SET group_name = ? WHERE group_name = ?", (new_name, old_name))
+            conn.execute("DELETE FROM channel_group_memberships WHERE group_name = ?", (old_name,))
+            conn.execute("DELETE FROM channel_groups WHERE name = ?", (old_name,))
+        else:
+            conn.execute(
+                "UPDATE channel_groups SET description = ? WHERE name = ?",
+                (data.get("description") or "", old_name),
+            )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"ok": True, "renamed": new_name != old_name, "stale_queue_targets_require_review": True}
+
+
+@app.delete("/api/groups/{name}")
+def api_delete_group(name: str):
+    group_name = str(name or "").strip()
+    if group_name == "Mặc định":
+        raise HTTPException(400, "Không thể xóa nhóm mặc định.")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM channel_groups WHERE name = ?", (group_name,)).fetchone():
+            raise HTTPException(404, "Không tìm thấy nhóm kênh.")
+        conn.execute("DELETE FROM channel_group_memberships WHERE group_name = ?", (group_name,))
+        conn.execute(
+            "UPDATE youtube_channels SET group_name = 'Mặc định' "
+            "WHERE group_name = ? AND NOT EXISTS ("
+            "SELECT 1 FROM channel_group_memberships m WHERE m.channel_id = youtube_channels.id)",
+            (group_name,),
+        )
+        conn.execute("UPDATE youtube_channels SET group_name = ("
+                     "SELECT m.group_name FROM channel_group_memberships m WHERE m.channel_id = youtube_channels.id "
+                     "ORDER BY m.sort_order, m.group_name LIMIT 1) WHERE group_name = ?", (group_name,))
+        conn.execute("DELETE FROM channel_groups WHERE name = ?", (group_name,))
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"ok": True, "queued_targets_require_review": True}
 
 
 # ==========================================================
@@ -2848,6 +3697,13 @@ def api_save_render_preset(data: Dict[str, Any] = Body(...)):
         raise HTTPException(400, "Tên preset không được để trống.")
     render_mode = data.get("render_mode") or "shorts_9_16"
     cfg = data.get("config") or {}
+    if not isinstance(cfg, dict):
+        raise HTTPException(400, "Cấu hình preset phải là một object JSON.")
+    if "speed" in cfg:
+        try:
+            cfg["speed"] = normalize_render_speed(cfg["speed"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     note = (data.get("note") or "").strip()
     conn = get_conn()
     conn.execute(
@@ -3037,6 +3893,35 @@ def api_get_settings():
     return public_settings(get_settings())
 
 
+@app.get("/api/storage/overview")
+def api_storage_overview(retention_days: int = DEFAULT_RETENTION_DAYS):
+    try:
+        return storage_overview(retention_days)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/storage/cleanup-preview")
+def api_storage_cleanup_preview(data: Dict[str, Any] = Body(...)):
+    try:
+        retention_days = int(data.get("retention_days", DEFAULT_RETENTION_DAYS))
+        return storage_overview(retention_days)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/storage/cleanup")
+def api_storage_cleanup(data: Dict[str, Any] = Body(...)):
+    artifact_ids = data.get("artifact_ids")
+    if not isinstance(artifact_ids, list):
+        raise HTTPException(400, "Danh sách artifact_ids phải là một mảng.")
+    try:
+        retention_days = int(data.get("retention_days", DEFAULT_RETENTION_DAYS))
+        return cleanup_managed_artifacts(artifact_ids, retention_days)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.post("/api/settings")
 def api_save_settings(data: Dict[str, Any] = Body(...)):
     payload = {
@@ -3044,6 +3929,13 @@ def api_save_settings(data: Dict[str, Any] = Body(...)):
         for key, value in data.items()
         if not (is_secret_setting_key(key) and not str(value or "").strip())
     }
+    if "download_cookies_file" in payload:
+        raw_cookie_path = str(payload.get("download_cookies_file") or "").strip()
+        if raw_cookie_path:
+            cookie_path = Path(raw_cookie_path).expanduser()
+            if not cookie_path.is_file():
+                raise HTTPException(400, "File cookies Netscape cấu hình cho yt-dlp không tồn tại.")
+            payload["download_cookies_file"] = str(cookie_path.resolve())
     save_settings(payload)
     add_log("Settings", "Đã lưu cấu hình hệ thống.", "SUCCESS")
     return {"ok": True}

@@ -1,12 +1,15 @@
 import base64
 import csv
 import json
+import os
 import re
 import shutil
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from content_identity import normalize_source_url
+from phase4_rules import GROUP_SCHEMA_VERSION, normalize_group_names, serialize_group_names
 
 from config import (
     APP_DATA_DIR,
@@ -124,6 +127,24 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS channel_group_memberships (
+            group_name TEXT NOT NULL,
+            channel_id INTEGER NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (group_name, channel_id)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_channel_group_memberships_channel ON channel_group_memberships(channel_id, sort_order)")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_schema_versions (
+            schema_key TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
     # 1.1 Bảng Quản Lý Chrome Profiles (Mỗi Profile có thể chứa nhiều Kênh YouTube con)
     cur.execute("""
@@ -230,6 +251,10 @@ def init_db():
             render_progress INTEGER DEFAULT 0,
             upload_progress INTEGER DEFAULT 0,
             status TEXT DEFAULT 'Pending',
+            content_key TEXT DEFAULT '',
+            manual_reupload_authorized INTEGER DEFAULT 0,
+            manual_reupload_reason TEXT DEFAULT '',
+            last_attempt_id INTEGER DEFAULT NULL,
             published_url TEXT DEFAULT '',
             error_message TEXT DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -270,9 +295,44 @@ def init_db():
             source_post_id TEXT NOT NULL,
             source_url TEXT DEFAULT '',
             channel_id INTEGER DEFAULT NULL,
+            content_key TEXT DEFAULT '',
             published_url TEXT DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(source_post_id, channel_id)
+        )
+    """)
+
+    # Reservation nguyên tử theo nội dung và kênh; hàng NeedsReview giữ chặn qua restart.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS content_reservations (
+            content_key TEXT NOT NULL,
+            channel_id INTEGER NOT NULL,
+            queue_id INTEGER NOT NULL,
+            claim_token TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'Active',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (content_key, channel_id)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS upload_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            queue_id INTEGER NOT NULL,
+            attempt_no INTEGER NOT NULL,
+            attempt_type TEXT NOT NULL DEFAULT 'upload',
+            source_post_id TEXT DEFAULT '',
+            content_key TEXT DEFAULT '',
+            channel_id INTEGER DEFAULT NULL,
+            phase TEXT DEFAULT 'Queued',
+            outcome TEXT DEFAULT 'InProgress',
+            reason TEXT DEFAULT '',
+            published_url TEXT DEFAULT '',
+            error_message TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(queue_id, attempt_no)
         )
     """)
 
@@ -308,6 +368,18 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS managed_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            owner_type TEXT DEFAULT '',
+            owner_id INTEGER DEFAULT NULL,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            registered_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_managed_artifacts_registered ON managed_artifacts(registered_at, kind)")
 
     # Tự động cập nhật cột mới (Migration an toàn không mất dữ liệu)
     def _add_col_if_missing(tbl, col, col_def):
@@ -329,7 +401,16 @@ def init_db():
     _add_col_if_missing("video_queue", "is_premiere", "INTEGER DEFAULT 0")
     _add_col_if_missing("video_queue", "visibility", "TEXT DEFAULT 'public'")
     _add_col_if_missing("video_queue", "schedule_time", "TEXT DEFAULT ''")
+    _add_col_if_missing("video_queue", "target_group_names_json", "TEXT DEFAULT ''")
+    _add_col_if_missing("video_queue", "group_schema_version", "INTEGER DEFAULT 1")
+    _add_col_if_missing("video_queue", "assigned_channel_id", "INTEGER DEFAULT NULL")
+    _add_col_if_missing("video_queue", "assigned_group_names_json", "TEXT DEFAULT ''")
     _add_col_if_missing("video_queue", "claim_token", "TEXT DEFAULT ''")
+    _add_col_if_missing("video_queue", "content_key", "TEXT DEFAULT ''")
+    _add_col_if_missing("video_queue", "manual_reupload_authorized", "INTEGER DEFAULT 0")
+    _add_col_if_missing("video_queue", "manual_reupload_reason", "TEXT DEFAULT ''")
+    _add_col_if_missing("video_queue", "last_attempt_id", "INTEGER DEFAULT NULL")
+    _add_col_if_missing("published_history", "content_key", "TEXT DEFAULT ''")
     _add_col_if_missing("chrome_profiles", "login_status", "TEXT DEFAULT ''")
     _add_col_if_missing("chrome_profiles", "last_login_check", "TEXT DEFAULT ''")
     _add_col_if_missing("chrome_profiles", "antidetect_profile_id", "TEXT DEFAULT ''")
@@ -357,11 +438,35 @@ def init_db():
     else:
         group_normalize_error = ""
 
+    try:
+        migrate_phase4_group_schema(conn, cur)
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+
     # Tăng tốc kiểm tra trùng post_id khi import lại cùng thư mục/nguồn
     try:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_video_queue_project_post "
             "ON video_queue(project_name, post_id)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_video_queue_project_content "
+            "ON video_queue(project_name, content_key) WHERE content_key != ''"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_reservations_queue "
+            "ON content_reservations(queue_id, state)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_upload_attempts_queue "
+            "ON upload_attempts(queue_id, attempt_no DESC)"
+        )
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_published_history_content_channel "
+            "ON published_history(content_key, channel_id) "
+            "WHERE content_key IS NOT NULL AND content_key != '' AND channel_id IS NOT NULL"
         )
     except Exception:
         pass
@@ -521,31 +626,39 @@ def export_all_tables_csv(target_dir: str, keep: int = 10) -> Dict[str, Any]:
 
 
 def run_housekeeping():
-    """Bảo trì định kỳ cho các phiên chạy 24/7: backup DB + cắt log + dọn lịch sử cũ."""
+    """Bảo trì định kỳ: backup DB và cắt log; giữ lịch sử đăng để chống trùng bền vững."""
     backup_database_on_startup()
     conn = get_conn()
     cur = conn.cursor()
     try:
         cur.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 5000)")
         log_deleted = cur.rowcount
-        cur.execute("DELETE FROM published_history WHERE created_at < datetime('now', '-90 days')")
-        hist_deleted = cur.rowcount
         conn.commit()
-        if log_deleted or hist_deleted:
-            add_log("Housekeeping", f"Đã dọn {log_deleted} log cũ và {hist_deleted} bản ghi lịch sử quá 90 ngày.", "INFO")
+        if log_deleted:
+            add_log("Housekeeping", f"Đã dọn {log_deleted} log cũ; lịch sử đăng được giữ để chống trùng lâu dài.", "INFO")
     except Exception as e:
         add_log("Housekeeping", f"Lỗi dọn dẹp dữ liệu định kỳ: {e}", "WARNING")
     finally:
         conn.close()
 
-    # Dọn file text watermark tạm quá 1 ngày tuổi (sinh ra khi render có chữ chạy / watermark chữ)
+    # Dọn riêng render_text đã đăng ký trong manifest, theo cùng bộ bảo vệ đường dẫn và queue refs.
     try:
-        import time
-        for f in APP_TEMP_DIR.glob("wmtext_*.txt"):
-            if f.stat().st_mtime < time.time() - 86400:
-                f.unlink()
-    except Exception:
-        pass
+        conn = get_conn()
+        try:
+            old_text_artifacts = [
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM managed_artifacts WHERE kind = 'render_text' "
+                    "AND registered_at < datetime('now', '-1 day')"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        if old_text_artifacts:
+            from storage_manager import cleanup_managed_artifacts
+            cleanup_managed_artifacts(old_text_artifacts, retention_days=1)
+    except Exception as e:
+        add_log("Storage", f"Không dọn được artifact text render cũ: {type(e).__name__}", "WARNING")
 
     # Export CSV toàn bộ DB ra thư mục ngoài nếu chủ tool đã cấu hình
     try:
@@ -561,6 +674,76 @@ def run_housekeeping():
             )
     except Exception as e:
         add_log("Housekeeping", f"Lỗi export CSV định kỳ: {e}", "WARNING")
+
+
+def content_identity_migration_report() -> Dict[str, int]:
+    """Read-only counts for legacy rows; never infers or fills uncertain identities."""
+    conn = get_conn()
+    try:
+        queue_rows = conn.execute(
+            "SELECT id, project_name, source_type, platform, post_id, source_url, "
+            "input_video_path, content_key FROM video_queue"
+        ).fetchall()
+        history_rows = conn.execute(
+            "SELECT source_post_id, source_url, channel_id, content_key FROM published_history"
+        ).fetchall()
+
+        source_keys = set()
+        duplicate_candidates = 0
+        file_hash_pending = missing_local_files = source_id_available = 0
+        invalid_source_url = missing_source_identity = 0
+        identified = 0
+        for row in queue_rows:
+            has_content_key = bool(str(row["content_key"] or "").strip())
+            if has_content_key:
+                identified += 1
+            source_type = str(row["source_type"] or "").lower()
+            platform = str(row["platform"] or "").lower()
+            is_local = source_type in ("file", "localfile") or platform in ("localfile", "localupload")
+            if is_local:
+                if has_content_key:
+                    continue
+                path = str(row["input_video_path"] or "").strip()
+                if path and Path(path).is_file():
+                    file_hash_pending += 1
+                else:
+                    missing_local_files += 1
+                continue
+
+            post_id = str(row["post_id"] or "").strip()
+            url_key = normalize_source_url(row["source_url"])
+            if post_id:
+                source_id_available += 1
+                dedupe_key = (row["project_name"], platform, post_id)
+            elif url_key:
+                dedupe_key = (row["project_name"], "url", url_key)
+            else:
+                if str(row["source_url"] or "").strip():
+                    invalid_source_url += 1
+                else:
+                    missing_source_identity += 1
+                continue
+            if dedupe_key in source_keys:
+                duplicate_candidates += 1
+            else:
+                source_keys.add(dedupe_key)
+
+        return {
+            "queue_total": len(queue_rows),
+            "queue_with_content_key": identified,
+            "local_file_hash_pending": file_hash_pending,
+            "missing_local_file": missing_local_files,
+            "source_id_available": source_id_available,
+            "invalid_source_url": invalid_source_url,
+            "missing_source_identity": missing_source_identity,
+            "queue_duplicate_candidates": duplicate_candidates,
+            "history_total": len(history_rows),
+            "history_missing_content_key": sum(not str(r["content_key"] or "").strip() for r in history_rows),
+            "history_missing_channel": sum(r["channel_id"] is None for r in history_rows),
+            "history_missing_source_id": sum(not str(r["source_post_id"] or "").strip() for r in history_rows),
+        }
+    finally:
+        conn.close()
 
 
 SECRET_CHANNEL_COLUMNS = {"oauth_token_json", "cookie"}
@@ -641,6 +824,51 @@ def add_log(module: str, message: str, status: str = "INFO", channel_name: str =
     conn.close()
 
 
+def register_managed_artifact(path: str, kind: str, owner_type: str = "", owner_id: Optional[int] = None) -> Optional[int]:
+    """Đăng ký một file do tool tạo; file nguồn người dùng không được gọi hàm này."""
+    raw = Path(str(path or "")).expanduser()
+    try:
+        if raw.is_symlink() or not raw.is_file():
+            return None
+        resolved = raw.resolve(strict=True)
+        canonical = os.path.normcase(str(resolved))
+        size_bytes = int(resolved.stat().st_size)
+    except (OSError, RuntimeError):
+        return None
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO managed_artifacts (path, kind, owner_type, owner_id, size_bytes)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(path) DO UPDATE SET kind=excluded.kind, owner_type=excluded.owner_type,
+                   owner_id=excluded.owner_id, size_bytes=excluded.size_bytes,
+                   registered_at=CURRENT_TIMESTAMP""",
+            (canonical, str(kind or "file"), str(owner_type or ""), owner_id, size_bytes),
+        )
+        row = conn.execute("SELECT id FROM managed_artifacts WHERE path = ?", (canonical,)).fetchone()
+        conn.commit()
+        return int(row["id"]) if row else None
+    finally:
+        conn.close()
+
+
+def get_managed_artifacts() -> List[Dict[str, Any]]:
+    conn = get_conn()
+    try:
+        return [dict(row) for row in conn.execute("SELECT * FROM managed_artifacts ORDER BY registered_at DESC, id DESC")]
+    finally:
+        conn.close()
+
+
+def remove_managed_artifact(artifact_id: int) -> None:
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM managed_artifacts WHERE id = ?", (int(artifact_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_settings() -> Dict[str, Any]:
     conn = get_conn()
     rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
@@ -701,6 +929,7 @@ def sync_from_dhb_facebook(initial_only: bool = False) -> Dict[str, int]:
         "instagram_cookie": dhb_cfg.get("Instagram_Cookie", ""),
         "facebook_cookie": dhb_cfg.get("Facebook_Cookie", ""),
         "download_resolution": dhb_cfg.get("Download_Resolution", "1080p FullHD"),
+        "download_cookies_file": "",
         "hide_browser": bool(dhb_cfg.get("HideBrowser", False)),
         "delete_temp_after_upload": bool(dhb_cfg.get("DeleteTemp", True)),
         "max_concurrent_threads": 2,
@@ -732,6 +961,7 @@ def sync_from_dhb_facebook(initial_only: bool = False) -> Dict[str, int]:
                         """,
                         (f"Kênh YouTube - {pname}", f"@{pname.lower().replace(' ', '')}", pname, str(pdir)),
                     )
+                    set_channel_group_memberships(conn, int(cur.lastrowid), ["Mặc định"])
                     stats["profiles"] += 1
 
     # Đảm bảo có cấu hình đăng Shorts mẫu
@@ -749,6 +979,101 @@ def sync_from_dhb_facebook(initial_only: bool = False) -> Dict[str, int]:
         "SUCCESS",
     )
     return stats
+
+
+def migrate_phase4_group_schema(conn, cur=None) -> Dict[str, int]:
+    """Backfill legacy single-group rows into the versioned membership schema."""
+    cur = cur or conn.cursor()
+    stats = {"groups_added": 0, "memberships_added": 0, "queue_rows_backfilled": 0}
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS channel_group_memberships (
+            group_name TEXT NOT NULL,
+            channel_id INTEGER NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (group_name, channel_id)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_channel_group_memberships_channel ON channel_group_memberships(channel_id, sort_order)")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_schema_versions (
+            schema_key TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    for name, definition in (
+        ("target_group_names_json", "TEXT DEFAULT ''"),
+        ("group_schema_version", "INTEGER DEFAULT 1"),
+        ("assigned_channel_id", "INTEGER DEFAULT NULL"),
+        ("assigned_group_names_json", "TEXT DEFAULT ''"),
+    ):
+        columns = {row[1] for row in cur.execute("PRAGMA table_info(video_queue)").fetchall()}
+        if name not in columns:
+            cur.execute(f"ALTER TABLE video_queue ADD COLUMN {name} {definition}")
+
+    cur.execute("""
+        INSERT OR IGNORE INTO channel_groups (name, description)
+        SELECT DISTINCT TRIM(group_name), '' FROM youtube_channels
+        WHERE COALESCE(TRIM(group_name), '') != ''
+    """)
+    stats["groups_added"] = max(0, cur.rowcount)
+    cur.execute("""
+        INSERT OR IGNORE INTO channel_group_memberships (group_name, channel_id, sort_order, schema_version)
+        SELECT TRIM(group_name), id, id, ? FROM youtube_channels
+        WHERE COALESCE(TRIM(group_name), '') != ''
+    """, (GROUP_SCHEMA_VERSION,))
+    stats["memberships_added"] = max(0, cur.rowcount)
+
+    rows = cur.execute(
+        "SELECT id, target_type, target_group_name, target_group_names_json, group_schema_version "
+        "FROM video_queue"
+    ).fetchall()
+    for row in rows:
+        if int(row[4] or 0) >= GROUP_SCHEMA_VERSION and str(row[3] or "").strip():
+            continue
+        legacy = row[2] or ""
+        is_group = str(row[1] or "GROUP").upper() == "GROUP"
+        names = normalize_group_names(
+            row[3],
+            legacy_name=legacy,
+            default="Mặc định" if is_group else None,
+        )
+        cur.execute(
+            "UPDATE video_queue SET target_group_names_json = ?, group_schema_version = ? WHERE id = ?",
+            (serialize_group_names(names), GROUP_SCHEMA_VERSION, row[0]),
+        )
+        stats["queue_rows_backfilled"] += 1
+
+    cur.execute(
+        "INSERT INTO app_schema_versions (schema_key, version, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+        "ON CONFLICT(schema_key) DO UPDATE SET version = excluded.version, updated_at = CURRENT_TIMESTAMP",
+        ("channel_group_memberships", GROUP_SCHEMA_VERSION),
+    )
+    return stats
+
+
+def set_channel_group_memberships(conn, channel_id: int, group_names: Any) -> List[str]:
+    """Replace memberships transactionally while retaining the legacy primary group."""
+    names = normalize_group_names(group_names, default="Mặc định")
+    placeholders = ",".join("?" for _ in names)
+    existing = {
+        str(row[0]) for row in conn.execute(
+            f"SELECT name FROM channel_groups WHERE name IN ({placeholders})", names
+        ).fetchall()
+    }
+    missing = [name for name in names if name not in existing]
+    if missing:
+        raise ValueError("Không tìm thấy nhóm kênh: " + ", ".join(missing))
+    conn.execute("DELETE FROM channel_group_memberships WHERE channel_id = ?", (int(channel_id),))
+    conn.executemany(
+        "INSERT INTO channel_group_memberships (group_name, channel_id, sort_order, schema_version) VALUES (?, ?, ?, ?)",
+        [(name, int(channel_id), idx, GROUP_SCHEMA_VERSION) for idx, name in enumerate(names)],
+    )
+    conn.execute("UPDATE youtube_channels SET group_name = ? WHERE id = ?", (names[0], int(channel_id)))
+    return names
 
 
 def get_all_profiles() -> List[Dict[str, Any]]:

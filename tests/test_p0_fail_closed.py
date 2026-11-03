@@ -119,6 +119,11 @@ class ChecksFailClosedTests(unittest.TestCase):
         self.assertTrue(yu.checks_report_safe("No issues found"))
         self.assertTrue(yu.checks_report_safe("Checks complete. No issues found"))
 
+    def test_processing_text_cannot_be_mistaken_for_safe(self):
+        state = yu.classify_checks_text("No issues found, but the video is still processing")
+        self.assertEqual(state["result"], "unknown")
+        self.assertFalse(yu.checks_report_safe("No issues found, but the video is still processing"))
+
     def test_violation_wins_over_safe_phrase(self):
         state = yu.classify_checks_text(
             "Checks complete. Copyright-protected content found. Blocked in some territories"
@@ -144,7 +149,7 @@ class FailClosedSourceTests(unittest.TestCase):
     def test_no_draft_delete_after_publish_click(self):
         self.assertIn("publish_clicked = True", self.uploader)
         self.assertIn("if publish_clicked:", self.uploader)
-        self.assertIn("elif draft_created and page is not None:", self.uploader)
+        self.assertIn("elif draft_created and page is not None and not draft_preserve_for_review:", self.uploader)
 
     def test_checks_must_be_confirmed_safe(self):
         self.assertIn("if not checks_safe_seen:", self.uploader)
@@ -152,8 +157,9 @@ class FailClosedSourceTests(unittest.TestCase):
 
     def test_age_restriction_is_fail_closed(self):
         self.assertNotIn("VIDEO_AGE_RESTRICTION_SELF", self.uploader)
-        self.assertIn('if metadata.get("age_restriction") and not age_confirmed:', self.uploader)
-        self.assertIn("raise RuntimeError(age_error)", self.uploader)
+        self.assertIn('page, age_radio, bool(metadata.get("age_restriction"))', self.uploader)
+        self.assertIn('age_group.wait_for(state="visible", timeout=10000)', self.uploader)
+        self.assertIn("raise RuntimeError(\n                        f\"Không xác nhận được lựa chọn Giới hạn độ tuổi", self.uploader)
 
     def test_pipeline_marks_uncertain_result_for_review(self):
         self.assertIn("elif result_unverified:", self.pipeline)

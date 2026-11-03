@@ -72,8 +72,14 @@ class RenderHangP0Tests(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="dhb_test_hang_"))
         old_out = render_engine.APP_OUTPUT_DIR
         old_dhb = render_engine.DHB_RENDER_DIR
+        old_db_path = database.APP_DB_PATH
+        old_data_dir = database.APP_DATA_DIR
         render_engine.APP_OUTPUT_DIR = tmp
         render_engine.DHB_RENDER_DIR = tmp
+        database.APP_DATA_DIR = tmp / "data"
+        database.APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        database.APP_DB_PATH = database.APP_DATA_DIR / "test.sqlite"
+        database.init_db()
         try:
             src, music = self._make_media(tmp)
             cfg = {
@@ -118,6 +124,8 @@ class RenderHangP0Tests(unittest.TestCase):
         finally:
             render_engine.APP_OUTPUT_DIR = old_out
             render_engine.DHB_RENDER_DIR = old_dhb
+            database.APP_DB_PATH = old_db_path
+            database.APP_DATA_DIR = old_data_dir
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_silent_plus_bg_music_shorts_terminates(self):
@@ -228,10 +236,11 @@ class DownloadStopTests(unittest.TestCase):
 
         try:
             t = threading.Thread(target=_run, daemon=True)
-            t.start()
-            time.sleep(3.0)
-            ev.set()
-            t.join(timeout=40)
+            with mock.patch.object(scanner_downloader, "get_settings", return_value={}):
+                t.start()
+                time.sleep(3.0)
+                ev.set()
+                t.join(timeout=40)
             self.assertFalse(t.is_alive(), "download_video không phản ứng với stop_event sau 40s.")
             self.assertIsInstance(box.get("error"), InterruptedError,
                                   f"Kỳ vọng InterruptedError, nhận: {box.get('error')!r}")

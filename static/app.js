@@ -36,6 +36,45 @@ let gApiToken = null;
 let gApiTokenPromise = null;
 let gLiveRefreshInFlight = false;
 
+function selectedMultiValues(selectEl) {
+  return selectEl ? Array.from(selectEl.selectedOptions || []).map(option => option.value).filter(Boolean) : [];
+}
+
+function groupNamesFromItem(item) {
+  let names = [];
+  try {
+    const raw = item && item.target_group_names_json;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw || '[]') : raw;
+    if (Array.isArray(parsed)) names = parsed.map(x => String(x || '').trim()).filter(Boolean);
+  } catch (_) {}
+  if (!names.length && item && item.target_group_name) names = [String(item.target_group_name).trim()];
+  return [...new Set(names)];
+}
+
+function setGroupSelectOptions(selectEl, groups, defaultGroup = false) {
+  if (!selectEl) return;
+  const prior = selectedMultiValues(selectEl);
+  const values = (groups || []).map(group => String(group.name || '')).filter(Boolean);
+  selectEl.innerHTML = values.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('');
+  const chosen = new Set(prior.filter(name => values.includes(name)));
+  if (!prior.length && defaultGroup && values.includes('Mặc định')) chosen.add('Mặc định');
+  Array.from(selectEl.options).forEach(option => { option.selected = chosen.has(option.value); });
+}
+
+function selectGroupValues(selectEl, names, availableGroups = gGroups) {
+  if (!selectEl) return;
+  const selected = [...new Set((names || []).map(name => String(name || '').trim()).filter(Boolean))];
+  const known = new Set((availableGroups || []).map(group => String(group.name || '')));
+  selected.filter(name => !known.has(name)).forEach(name => {
+    const option = document.createElement('option');
+    option.value = name;
+    option.textContent = `⚠️ ${name} (nhóm không còn tồn tại)`;
+    option.dataset.missing = 'true';
+    selectEl.appendChild(option);
+  });
+  Array.from(selectEl.options).forEach(option => { option.selected = selected.includes(option.value); });
+}
+
 function switchTab(tabId, btnEl) {
   document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
   document.querySelectorAll('.nav-tab').forEach(el => el.classList.remove('active'));
@@ -133,6 +172,11 @@ async function uploadVideoFiles(files) {
   const renderMode = document.getElementById('scan-render-mode').value || 'shorts_9_16';
   const res = document.getElementById('scan-resolution') ? document.getElementById('scan-resolution').value : '1080p';
   const vis = document.getElementById('scan-visibility') ? document.getElementById('scan-visibility').value : 'public';
+  const scheduleTime = vis === 'schedule' && document.getElementById('scan-sched-time')
+    ? document.getElementById('scan-sched-time').value : '';
+  const scheduleInterval = document.getElementById('scan-sched-interval')
+    ? parseInt(document.getElementById('scan-sched-interval').value || '60', 10) : 60;
+  const isPremiere = vis === 'schedule' && document.getElementById('scan-is-premiere')?.checked ? 1 : 0;
   const madeForKids = document.getElementById('scan-made-for-kids')
     ? parseInt(document.getElementById('scan-made-for-kids').value || '0', 10)
     : 0;
@@ -148,6 +192,10 @@ async function uploadVideoFiles(files) {
 
   if (madeForKids && ageRestriction) {
     alert('Không thể vừa chọn "Dành cho trẻ em" vừa đặt "Giới hạn trên 18 tuổi". Hãy chọn lại đối tượng người xem.');
+    return;
+  }
+  if (vis === 'schedule' && (!scheduleTime || new Date(scheduleTime) <= new Date())) {
+    alert('Thời gian lên lịch phải được nhập và ở tương lai.');
     return;
   }
 
@@ -167,6 +215,10 @@ async function uploadVideoFiles(files) {
   formData.append('render_mode', renderMode);
   formData.append('resolution', res);
   formData.append('visibility', vis);
+  formData.append('schedule_time', scheduleTime);
+  formData.append('schedule_interval_minutes', String(scheduleInterval));
+  formData.append('is_premiere', String(isPremiere));
+  formData.append('target_group_names', JSON.stringify(selectedMultiValues(document.getElementById('scan-group'))));
   formData.append('made_for_kids', String(madeForKids));
   formData.append('age_restriction', String(ageRestriction));
   formData.append('altered_content', String(alteredContent));
@@ -229,6 +281,11 @@ async function browseNativeFiles() {
   const renderMode = document.getElementById('scan-render-mode').value || 'shorts_9_16';
   const res = document.getElementById('scan-resolution') ? document.getElementById('scan-resolution').value : '1080p';
   const vis = document.getElementById('scan-visibility') ? document.getElementById('scan-visibility').value : 'public';
+  const scheduleTime = vis === 'schedule' && document.getElementById('scan-sched-time')
+    ? document.getElementById('scan-sched-time').value : '';
+  const scheduleInterval = document.getElementById('scan-sched-interval')
+    ? parseInt(document.getElementById('scan-sched-interval').value || '60', 10) : 60;
+  const isPremiere = vis === 'schedule' && document.getElementById('scan-is-premiere')?.checked ? 1 : 0;
 
   try {
     const r = await apiFetch('/api/browse-native-files', { method: 'POST' });
@@ -243,6 +300,13 @@ async function browseNativeFiles() {
         render_mode: renderMode,
         resolution: res,
         visibility: vis,
+        schedule_time: scheduleTime,
+        schedule_interval_minutes: scheduleInterval,
+        is_premiere: isPremiere,
+        made_for_kids: parseInt(document.getElementById('scan-made-for-kids')?.value || '0', 10),
+        age_restriction: parseInt(document.getElementById('scan-age-restriction')?.value || '0', 10),
+        altered_content: parseInt(document.getElementById('scan-altered-content')?.value || '0', 10),
+        target_group_names: selectedMultiValues(document.getElementById('scan-group')),
       }),
     });
 
@@ -366,6 +430,14 @@ async function bfAddPath(path, recursive) {
     render_mode: document.getElementById('scan-render-mode').value || 'shorts_9_16',
     resolution: document.getElementById('scan-resolution') ? document.getElementById('scan-resolution').value : '1080p',
     visibility: document.getElementById('scan-visibility') ? document.getElementById('scan-visibility').value : 'public',
+    schedule_time: document.getElementById('scan-visibility')?.value === 'schedule'
+      ? (document.getElementById('scan-sched-time')?.value || '') : '',
+    schedule_interval_minutes: parseInt(document.getElementById('scan-sched-interval')?.value || '60', 10),
+    is_premiere: document.getElementById('scan-visibility')?.value === 'schedule' && document.getElementById('scan-is-premiere')?.checked ? 1 : 0,
+    made_for_kids: parseInt(document.getElementById('scan-made-for-kids')?.value || '0', 10),
+    age_restriction: parseInt(document.getElementById('scan-age-restriction')?.value || '0', 10),
+    altered_content: parseInt(document.getElementById('scan-altered-content')?.value || '0', 10),
+    target_group_names: selectedMultiValues(document.getElementById('scan-group')),
     recursive: !!recursive,
   };
   try {
@@ -581,15 +653,18 @@ async function deleteCurrentProject() {
 
 async function loadGroups() {
   gGroups = await apiFetch('/api/groups');
-  const optsHtml = gGroups.map(g => `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)}</option>`).join('');
-  const scanGrp = document.getElementById('scan-group');
-  if (scanGrp) scanGrp.innerHTML = optsHtml;
-  const chGrp = document.getElementById('ch-group');
-  if (chGrp) chGrp.innerHTML = optsHtml;
+  setGroupSelectOptions(document.getElementById('scan-group'), gGroups, true);
+  setGroupSelectOptions(document.getElementById('ch-group'), gGroups, true);
+  setGroupSelectOptions(document.getElementById('ec-group'), gGroups, false);
+  setGroupSelectOptions(document.getElementById('ed-vid-groups'), gGroups, false);
   const monGrp = document.getElementById('mon-group');
-  if (monGrp) monGrp.innerHTML = optsHtml;
+  if (monGrp) {
+    const prior = monGrp.value;
+    monGrp.innerHTML = gGroups.map(g => `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)}</option>`).join('');
+    if (gGroups.some(g => g.name === prior)) monGrp.value = prior;
+  }
   const bulkGrp = document.getElementById('bulk-group');
-  if (bulkGrp) bulkGrp.innerHTML = `<option value="">-- Giữ nguyên nhóm --</option>` + optsHtml;
+  if (bulkGrp) setGroupSelectOptions(bulkGrp, gGroups, false);
 }
 
 async function loadProfiles() {
@@ -882,7 +957,7 @@ async function onModalProfileChange() {
   const chSel = document.getElementById('ed-vid-channel');
   if (!profName) {
     chSel.innerHTML = `<option value="">-- Theo nhóm mặc định --</option>` +
-      gChannels.map(c => `<option value="${c.id}">${escapeHtml(c.name)} (${escapeHtml(c.group_name)})</option>`).join('');
+      gChannels.map(c => `<option value="${c.id}">${escapeHtml(c.name)} (${escapeHtml((c.group_names || [c.group_name]).filter(Boolean).join(', '))}</option>`).join('');
     return;
   }
   try {
@@ -962,7 +1037,7 @@ function renderChannelTable(list) {
       <tr>
         <td>#${c.id}</td>
         <td><b>${escapeHtml(c.name)}</b><br/><span style="color:var(--text-muted);font-size:11px">${escapeHtml(c.handle || '')}</span>${c.email ? `<br/><span style="color:var(--text-muted);font-size:10.5px">📧 ${escapeHtml(c.email)}</span>` : ''}${c.channel_id ? `<br/><span style="color:var(--text-muted);font-size:10.5px">🆔 ${escapeHtml(c.channel_id)}</span>` : '<br/><span class="badge badge-err" style="font-size:10px;" title="Bắt buộc có Channel ID để xác minh đúng kênh trước khi đăng">⚠️ Thiếu Channel ID</span>'}</td>
-        <td><span class="badge badge-video">${escapeHtml(c.group_name)}</span></td>
+        <td><span class="badge badge-video">${escapeHtml((c.group_names || [c.group_name]).filter(Boolean).join(', '))}</span></td>
         <td>${c.upload_mode === 'youtube_api' ? '🔑 YouTube API v3' : '🌐 Playwright Studio'}</td>
         <td style="font-size:11.5px;color:#38bdf8;"><b>👤 ${escapeHtml(c.profile_name || 'Mặc định')}</b></td>
         <td>${stBadge}</td>
@@ -979,7 +1054,7 @@ function renderChannelTable(list) {
 
 async function loadChannels() {
   gChannels = await apiFetch('/api/channels');
-  const allChOpts = gChannels.map(c => `<option value="${c.id}">${escapeHtml(c.name)} (${escapeHtml(c.group_name)})${c.channel_id ? '' : ' ⚠️ thiếu Channel ID'}</option>`).join('');
+  const allChOpts = gChannels.map(c => `<option value="${c.id}">${escapeHtml(c.name)} (${escapeHtml((c.group_names || [c.group_name]).filter(Boolean).join(', '))})${c.channel_id ? '' : ' ⚠️ thiếu Channel ID'}</option>`).join('');
   const chOpts = `<option value="">-- Chia đều theo Nhóm Kênh --</option>` + allChOpts;
   const bulkCh = document.getElementById('bulk-channel');
   if (bulkCh) bulkCh.innerHTML = `<option value="">-- Giữ nguyên kênh --</option>` + allChOpts;
@@ -1004,10 +1079,12 @@ async function openChannelBrowser(channelId) {
 }
 
 async function addChannel() {
+  const groupNames = selectedMultiValues(document.getElementById('ch-group'));
   const payload = {
     name: document.getElementById('ch-name').value,
     handle: document.getElementById('ch-handle').value,
-    group_name: document.getElementById('ch-group').value,
+    group_name: groupNames[0] || 'Mặc định',
+    group_names: groupNames.length ? groupNames : ['Mặc định'],
     upload_mode: document.getElementById('ch-mode').value,
     profile_name: document.getElementById('ch-prof-name').value,
     profile_path: document.getElementById('ch-prof-path').value,
@@ -1215,11 +1292,8 @@ async function openChannelEdit(id) {
 
   const grpEl = document.getElementById('ec-group');
   if (grpEl) {
-    const groups = (gGroups || []).map(g => g.name);
-    if (c.group_name && !groups.includes(c.group_name)) groups.unshift(c.group_name);
-    if (!groups.length) groups.push('Mặc định');
-    grpEl.innerHTML = groups.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('');
-    grpEl.value = c.group_name || groups[0];
+    setGroupSelectOptions(grpEl, gGroups, false);
+    selectGroupValues(grpEl, c.group_names && c.group_names.length ? c.group_names : [c.group_name || 'Mặc định']);
   }
   const catEl = document.getElementById('ec-category');
   if (catEl) {
@@ -1306,7 +1380,8 @@ async function saveChannelEdit() {
     handle: document.getElementById('ec-handle').value.trim(),
     channel_id: document.getElementById('ec-channel-id').value.trim(),
     email: document.getElementById('ec-email').value.trim(),
-    group_name: document.getElementById('ec-group').value,
+    group_name: selectedMultiValues(document.getElementById('ec-group'))[0] || 'Mặc định',
+    group_names: selectedMultiValues(document.getElementById('ec-group')),
     upload_mode: document.getElementById('ec-mode').value,
     profile_name: document.getElementById('ec-profile-name').value.trim(),
     profile_path: document.getElementById('ec-profile-path').value.trim(),
@@ -1342,6 +1417,37 @@ async function addGroup() {
   await apiFetch('/api/groups', { method: 'POST', body: JSON.stringify({ name }) });
   document.getElementById('grp-new-name').value = '';
   await loadGroups();
+}
+
+async function renameGroup() {
+  const choices = (gGroups || []).map(group => group.name).filter(name => name !== 'Mặc định');
+  if (!choices.length) return alert('Chưa có nhóm nào có thể đổi tên.');
+  const oldName = prompt(`Nhập chính xác tên nhóm cần đổi tên:\n${choices.join('\n')}`);
+  if (!oldName || !choices.includes(oldName.trim())) return;
+  const newName = prompt(`Tên mới cho nhóm "${oldName.trim()}":`, oldName.trim());
+  if (!newName || !newName.trim()) return;
+  try {
+    await apiFetch(`/api/groups/${encodeURIComponent(oldName.trim())}`, {
+      method: 'PUT', body: JSON.stringify({ name: newName.trim() }),
+    });
+    await loadGroups();
+    await loadChannels();
+    showToast('Đã đổi tên nhóm. Video còn trỏ tới tên cũ sẽ cần chọn lại đích.', 'warning');
+  } catch (e) { alert('Lỗi đổi tên nhóm: ' + e.message); }
+}
+
+async function deleteGroup() {
+  const choices = (gGroups || []).map(group => group.name).filter(name => name !== 'Mặc định');
+  if (!choices.length) return alert('Chưa có nhóm nào có thể xóa.');
+  const name = prompt(`Nhập chính xác tên nhóm cần xóa:\n${choices.join('\n')}`);
+  if (!name || !choices.includes(name.trim())) return;
+  if (!confirm(`Xóa nhóm "${name.trim()}"? Video đang chờ trỏ tới nhóm này sẽ cần chọn lại đích trước khi chạy.`)) return;
+  try {
+    await apiFetch(`/api/groups/${encodeURIComponent(name.trim())}`, { method: 'DELETE' });
+    await loadGroups();
+    await loadChannels();
+    showToast('Đã xóa nhóm. Video còn trỏ tới nhóm này sẽ cần chọn lại đích.', 'warning');
+  } catch (e) { alert('Lỗi xóa nhóm: ' + e.message); }
 }
 
 const RUNNABLE_QUEUE_PREFIXES = ['pending', 'downloaded', 'rendered', 'downloading', 'rendering', 'chờ giãn cách'];
@@ -1412,9 +1518,11 @@ async function loadQueue(preserveSelection = false) {
   tbody.innerHTML = items.map(item => {
     const checked = gSelectedIds.has(item.id) ? 'checked' : '';
     let profLabel = item.target_profile_name ? `👤 ${escapeHtml(item.target_profile_name)}` : '';
-    let chLabel = item.target_channel_id && chMap[item.target_channel_id]
+    let chLabel = item.assigned_channel_id && chMap[item.assigned_channel_id]
+      ? `📺 ${escapeHtml(chMap[item.assigned_channel_id].name)} (đã chốt)`
+      : item.target_channel_id && chMap[item.target_channel_id]
       ? `📺 ${escapeHtml(chMap[item.target_channel_id].name)}`
-      : `📂 Nhóm: ${escapeHtml(item.target_group_name || 'Mặc định')}`;
+      : `📂 Nhóm: ${escapeHtml(groupNamesFromItem(item).join(' + ') || item.target_group_name || 'Mặc định')}`;
 
     let statusBadge = `<span class="badge badge-wait">${escapeHtml(item.status)}</span>`;
     if (item.status === 'Completed') {
@@ -1516,6 +1624,8 @@ async function loadQueue(preserveSelection = false) {
           <div style="display:flex; gap:4px; align-items:center;">
             <button class="btn btn-accent btn-sm" onclick="openPreviewModal(${item.id})" title="Xem thử video trực tiếp">▶️</button>
             <button class="btn btn-outline btn-sm" onclick="openEditModal(${item.id})" title="Chỉnh sửa chi tiết tiêu đề, mô tả, chất lượng...">✏️</button>
+            ${item.status === 'Completed' ? `<button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'reupload')" title="Ghi lý do và cho phép đăng lại riêng video này">🔁</button>` : ''}
+            ${item.status === 'NeedsReview' ? `<button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'reupload')" title="Xác nhận chưa đăng rồi cho phép chạy lại video này">🔁</button><button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'confirmed_published')" title="Xác nhận đã đăng và lưu URL vào lịch sử">✅</button>` : ''}
           </div>
         </td>
       </tr>
@@ -1615,7 +1725,7 @@ async function scanAndAddVideos() {
       upload_to: document.getElementById('scan-upload-to').value,
       resolution: document.getElementById('scan-resolution') ? document.getElementById('scan-resolution').value : '1080p',
       render_mode: document.getElementById('scan-render-mode').value,
-      target_group_name: document.getElementById('scan-group').value || 'Mặc định',
+      target_group_names: selectedMultiValues(document.getElementById('scan-group')),
       emulate_mobile: document.getElementById('scan-mobile') ? document.getElementById('scan-mobile').checked : false,
       visibility: visVal,
       made_for_kids: document.getElementById('scan-made-for-kids') ? parseInt(document.getElementById('scan-made-for-kids').value || '0', 10) : 0,
@@ -1655,7 +1765,7 @@ async function applyBulkConfig() {
   const updates = {};
   const profVal = document.getElementById('bulk-profile') ? document.getElementById('bulk-profile').value : '';
   const chVal = document.getElementById('bulk-channel') ? document.getElementById('bulk-channel').value : '';
-  const grpVal = document.getElementById('bulk-group') ? document.getElementById('bulk-group').value : '';
+  const grpVals = selectedMultiValues(document.getElementById('bulk-group'));
   const optVal = document.getElementById('bulk-option-group') ? document.getElementById('bulk-option-group').value : '';
   const resVal = document.getElementById('bulk-res') ? document.getElementById('bulk-res').value : '';
   const rdVal = document.getElementById('bulk-render') ? document.getElementById('bulk-render').value : '';
@@ -1689,11 +1799,11 @@ async function applyBulkConfig() {
     const pickedChannel = gChannels.find(c => c.id === chId);
     if (pickedChannel && pickedChannel.profile_name) updates.target_profile_name = pickedChannel.profile_name;
     else if (profVal) updates.target_profile_name = profVal;
-  } else if (grpVal) {
+  } else if (grpVals.length) {
     updates.target_type = 'GROUP';
-    updates.target_group_name = grpVal;
+    updates.target_group_names = grpVals;
     updates.target_channel_id = null;
-    if (profVal) updates.target_profile_name = profVal;
+    updates.target_profile_name = '';
   } else if (profVal) {
     updates.target_profile_name = profVal;
     updates.target_channel_id = null;
@@ -1769,13 +1879,38 @@ async function openEditModal(id) {
 
   const edProf = document.getElementById('ed-vid-profile');
   if (edProf) {
-    edProf.value = item.target_profile_name || '';
+    const profileValue = String(item.target_profile_name || '');
+    if (profileValue && !Array.from(edProf.options).some(option => option.value === profileValue)) {
+      const missing = document.createElement('option');
+      missing.value = profileValue;
+      missing.textContent = `⚠️ ${profileValue} (Profile không còn trong danh sách)`;
+      missing.dataset.missing = 'true';
+      edProf.appendChild(missing);
+    }
+    edProf.value = profileValue;
   }
 
   await onModalProfileChange();
+  const groupSelect = document.getElementById('ed-vid-groups');
+  if (groupSelect) {
+    selectGroupValues(
+      groupSelect,
+      String(item.target_type || '').toUpperCase() === 'GROUP' ? groupNamesFromItem(item) : [],
+    );
+  }
   if (item.target_channel_id) {
     const chSel = document.getElementById('ed-vid-channel');
-    if (chSel) chSel.value = item.target_channel_id;
+    if (chSel) {
+      const idValue = String(item.target_channel_id);
+      if (!Array.from(chSel.options).some(option => option.value === idValue)) {
+        const missing = document.createElement('option');
+        missing.value = idValue;
+        missing.textContent = `⚠️ Kênh #${idValue} (không còn trong danh sách)`;
+        missing.dataset.missing = 'true';
+        chSel.appendChild(missing);
+      }
+      chSel.value = idValue;
+    }
   }
 
   document.getElementById('modal-edit-video').style.display = 'flex';
@@ -1792,6 +1927,7 @@ async function saveEditModal() {
   const schedVal = document.getElementById('ed-vid-schedule-time') ? document.getElementById('ed-vid-schedule-time').value : '';
   const visVal = document.getElementById('ed-vid-visibility') ? document.getElementById('ed-vid-visibility').value : 'public';
   const isSchedule = visVal === 'schedule';
+  const groupNames = selectedMultiValues(document.getElementById('ed-vid-groups'));
 
   if (isSchedule && !schedVal) {
     alert('Bạn đã chọn "Lên lịch phát hành" nhưng chưa nhập thời gian.');
@@ -1808,8 +1944,6 @@ async function saveEditModal() {
     description: document.getElementById('ed-vid-desc').value.trim(),
     resolution: document.getElementById('ed-vid-res').value,
     render_mode: document.getElementById('ed-vid-render').value,
-    target_channel_id: chVal ? parseInt(chVal, 10) : null,
-    target_profile_name: profVal || null,
     option_group_id: document.getElementById('ed-vid-option-group') && document.getElementById('ed-vid-option-group').value
       ? parseInt(document.getElementById('ed-vid-option-group').value, 10)
       : null,
@@ -1823,6 +1957,14 @@ async function saveEditModal() {
     schedule_time: isSchedule && schedVal ? schedVal.replace('T', ' ') + (schedVal.length === 16 ? ':00' : '') : '',
     is_premiere: isSchedule && document.getElementById('ed-vid-is-premiere') ? (document.getElementById('ed-vid-is-premiere').checked ? 1 : 0) : 0,
   };
+  if (chVal) {
+    payload.target_channel_id = parseInt(chVal, 10);
+    payload.target_profile_name = profVal || '';
+  } else if (groupNames.length) {
+    payload.target_group_names = groupNames;
+  } else if (profVal) {
+    payload.target_profile_name = profVal;
+  }
 
   try {
     await apiFetch('/api/queue/edit-metadata', {
@@ -1964,6 +2106,39 @@ async function deleteSelectedQueue() {
   await loadQueue();
 }
 
+async function manualReuploadQueueItem(itemId, action) {
+  const item = gQueueItems.find(row => Number(row.id) === Number(itemId));
+  if (!item) return;
+
+  const reason = prompt('Nhập lý do/ghi chú đối soát (bắt buộc, tối thiểu 5 ký tự):');
+  if (!reason || reason.trim().length < 5) return;
+
+  const payload = { action, reason: reason.trim() };
+  if (action === 'reupload') {
+    if (item.status === 'NeedsReview') {
+      if (!confirm('Bạn đã kiểm tra YouTube Studio và xác nhận lượt trước CHƯA đăng video này?')) return;
+      payload.confirm_not_published = true;
+    } else if (!confirm('Cho phép đăng lại riêng video này? Thao tác có thể tạo video trùng trên kênh.')) {
+      return;
+    }
+  } else {
+    const url = prompt('Dán URL video đã xác minh trên YouTube:');
+    if (!url || !url.trim()) return;
+    payload.published_url = url.trim();
+  }
+
+  try {
+    const result = await apiFetch(`/api/queue/${itemId}/manual-reupload`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    showToast(result.message || 'Đã lưu quyết định cho video.', 'success');
+    await loadQueue(true);
+  } catch (e) {
+    alert('Không thể lưu quyết định: ' + e.message);
+  }
+}
+
 function exportExcel() {
   const proj = document.getElementById('sel-project').value || 'Default';
   const ids = Array.from(gSelectedIds);
@@ -1986,17 +2161,41 @@ async function handleImportExcel(event) {
 
   const proj = document.getElementById('sel-project').value || 'Default';
   const selected = Array.from(gSelectedIds);
-  const formData = new FormData();
-  formData.append('file', file);
-  formData.append('project_name', proj);
-  if (selected.length) formData.append('ids', selected.join(','));
+  const sendImport = (previewOnly) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('project_name', proj);
+    formData.append('preview_only', previewOnly ? 'true' : 'false');
+    if (selected.length) formData.append('ids', selected.join(','));
+    return apiFetch('/api/queue/import-excel', { method: 'POST', body: formData });
+  };
+
+  const describePreview = (data) => {
+    const lines = [
+      `Dự kiến cập nhật: ${data.matched || 0} dòng`,
+      `Bỏ qua: ${data.skipped || 0} dòng`,
+      `Lỗi: ${data.error_count || 0} dòng`,
+    ];
+    (data.rows || []).filter(row => row.state === 'error' || row.state === 'skipped').slice(0, 8).forEach(row => {
+      lines.push(`Dòng ${row.line}: ${(row.reasons || []).join('; ')}`);
+    });
+    if ((data.rows || []).length > 8) lines.push('… xem trước tối đa 8 dòng có vấn đề.');
+    if (data.warnings && data.warnings.length) lines.push('', 'Cảnh báo:', ...data.warnings.slice(0, 5));
+    return lines.join('\n');
+  };
 
   try {
+    showToast('⏳ Đang kiểm tra trước file Excel...', 'info');
+    const preview = await sendImport(true);
+    const summary = describePreview(preview);
+    if (!(preview.matched > 0) || !confirm(`${summary}\n\nÁp dụng các dòng hợp lệ?`)) return;
+
     showToast('⏳ Đang nhập Excel...', 'info');
-    const data = await apiFetch('/api/queue/import-excel', { method: 'POST', body: formData });
+    const data = await sendImport(false);
 
     let msg = `✅ Đã cập nhật ${data.updated || 0}/${data.total_rows || 0} dòng Excel vào dự án [${proj}].`;
     if (data.skipped) msg += `\nBỏ qua ${data.skipped} dòng không khớp.`;
+    if (data.error_count) msg += `\nCó ${data.error_count} dòng lỗi, không được áp dụng.`;
     if (data.adjusted_schedules) msg += `\n⏰ Đã tự dời ${data.adjusted_schedules} lịch để giãn cách tối thiểu 30 phút.`;
     if (data.warnings && data.warnings.length) {
       msg += '\n\n⚠️ Lưu ý:\n' + data.warnings.slice(0, 8).map(w => `• ${w}`).join('\n');
@@ -2033,11 +2232,22 @@ async function handleImportCsv(event) {
   reader.onload = async (e) => {
     try {
       const csvText = e.target.result;
-      const res = await apiFetch('/api/queue/import-csv', {
+      const sendImport = (preview) => apiFetch('/api/queue/import-csv', {
         method: 'POST',
-        body: JSON.stringify({ project_name: proj, csv_text: csvText }),
+        body: JSON.stringify({ project_name: proj, csv_text: csvText, preview }),
       });
-      alert(`Đã nhập thành công ${res.added || 0} video từ file CSV vào dự án [${proj}].`);
+      const preview = await sendImport(true);
+      const lines = [
+        `Hợp lệ: ${preview.valid_count || 0}`,
+        `Trùng: ${preview.duplicate_count || 0}`,
+        `Lỗi: ${preview.error_count || 0}`,
+      ];
+      (preview.rows || []).filter(row => row.state !== 'valid').slice(0, 8).forEach(row => {
+        lines.push(`Dòng ${row.line}: ${(row.reasons || []).join('; ')}`);
+      });
+      if (!(preview.valid_count > 0) || !confirm(`${lines.join('\n')}\n\nNhập các dòng hợp lệ?`)) return;
+      const res = await sendImport(false);
+      alert(`Đã nhập ${res.added || 0} video, trùng ${res.duplicate_count || 0}, lỗi ${res.error_count || 0} dòng trong dự án [${proj}].`);
       await loadProjects();
       await loadQueue();
     } catch (err) {
@@ -2061,9 +2271,11 @@ function findChannelIdBlockers(ids, forceReupload) {
     const prof = String(c.profile_name || '');
     if (!byProfile.has(prof)) byProfile.set(prof, []);
     byProfile.get(prof).push(c);
-    const grp = String(c.group_name || '');
-    if (!byGroup.has(grp)) byGroup.set(grp, []);
-    byGroup.get(grp).push(c);
+    (c.group_names || [c.group_name]).filter(Boolean).forEach(grp => {
+      const name = String(grp || '');
+      if (!byGroup.has(name)) byGroup.set(name, []);
+      byGroup.get(name).push(c);
+    });
   });
   // Backend quay vòng theo ORDER BY id ASC; /api/channels trả id DESC nên phải sắp lại.
   [byProfile, byGroup].forEach(m => m.forEach(list => list.sort((a, b) => Number(a.id) - Number(b.id))));
@@ -2079,14 +2291,21 @@ function findChannelIdBlockers(ids, forceReupload) {
     if (!forceReupload && (status.startsWith('Uploading') || status.startsWith('Đang đăng'))) return;
 
     let target = null;
-    if (item.target_channel_id) {
+    if (item.assigned_channel_id) {
+      target = byId.get(Number(item.assigned_channel_id)) || null;
+    } else if (item.target_channel_id) {
       target = byId.get(Number(item.target_channel_id)) || null;
     } else if (String(item.target_profile_name || '').trim()) {
       const list = byProfile.get(String(item.target_profile_name).trim()) || [];
       if (list.length === 1) target = list[0];
     } else {
-      const group = String(item.target_group_name || '').trim() || 'Mặc định';
-      const list = byGroup.get(group) || [];
+      const groups = groupNamesFromItem(item);
+      const list = [];
+      const seen = new Set();
+      groups.forEach(group => (byGroup.get(group) || []).forEach(channel => {
+        if (!seen.has(Number(channel.id))) { seen.add(Number(channel.id)); list.push(channel); }
+      }));
+      list.sort((a, b) => Number(a.id) - Number(b.id));
       if (list.length) {
         const key = Number(item.id);
         target = list[(Number.isFinite(key) ? Math.abs(key) : 0) % list.length];
@@ -2114,31 +2333,32 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
     if (!confirm(`Bạn chưa chọn video nào. Hệ thống sẽ chạy TẤT CẢ ${ids.length} video đang hiển thị. Tiếp tục?`)) return;
   }
 
-  let forceReupload = false;
   if (doUpload) {
     const published = gQueueItems.filter(v => ids.includes(v.id)
       && (v.status === 'Completed' || (v.published_url || '').trim()));
     if (published.length > 0) {
-      forceReupload = confirm(
-        `${published.length} video trong lựa chọn đã đăng hoặc đã hoàn tất.\n\n` +
-        `OK = ĐĂNG LẠI các video này (có thể tạo video trùng trên kênh)\n` +
-        `Cancel = Bỏ qua các video đã đăng, chỉ chạy video còn lại`
-      );
-    }
-    const channelIdBlockers = findChannelIdBlockers(ids, forceReupload);
-    if (channelIdBlockers.length) {
-      const lines = channelIdBlockers.slice(0, 6).map(b =>
-        `• #${b.item.id}${b.item.title ? ` "${b.item.title}"` : ''} → kênh "${b.target.name}"`
-      );
-      if (channelIdBlockers.length > 6) lines.push(`… và ${channelIdBlockers.length - 6} video khác.`);
       alert(
-        `⛔ Chưa thể bắt đầu: kênh đích thiếu Channel ID.\n\n${lines.join('\n')}\n\n` +
-        `Hệ thống bắt buộc phải có Channel ID để xác minh đúng kênh trước khi đăng (fail-closed).\n` +
-        `Hãy bấm "🔄 Quét Kênh" hoặc nhập Channel ID trong tab "Quản Lý Kênh & Profile Chrome", rồi chạy lại.`
+        `${published.length} video đã đăng cần được cho phép đăng lại riêng từng dòng bằng nút 🔁. ` +
+        `Các video đó sẽ bị bỏ qua trong lượt chạy này.`
       );
+      const publishedIds = new Set(published.map(v => Number(v.id)));
+      ids = ids.filter(id => !publishedIds.has(Number(id)));
+      if (!ids.length) return;
+    }
+    try {
+      const preview = await apiFetch('/api/queue/preview-distribution', {
+        method: 'POST', body: JSON.stringify({ ids }),
+      });
+      const previewText = formatDistributionPreview(preview);
+      if (preview.blocked) {
+        alert(`⛔ Có ${preview.blocked} video chưa đủ điều kiện. Sửa các dòng bị chặn rồi xem lại preview.\n\n${previewText}`);
+        return;
+      }
+      if (!confirm(`Preview phân phối trước khi chạy:\n\n${previewText}\n\nXác nhận dùng đúng các kênh và lịch này?`)) return;
+    } catch (e) {
+      alert('Không xem được preview phân phối: ' + e.message);
       return;
     }
-    if (!confirm(`Bắt đầu xử lý và đăng ${ids.length} video?`)) return;
   }
 
   try {
@@ -2149,7 +2369,7 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
         do_download: doDownload,
         do_render: doRender,
         do_upload: doUpload,
-        force_reupload: forceReupload,
+        force_reupload: false,
       }),
     });
     if (!res.ok) {
@@ -2162,6 +2382,33 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
   } catch (e) {
     alert('Lỗi khởi chạy: ' + e.message);
   }
+}
+
+function formatDistributionPreview(preview) {
+  const rows = (preview && preview.items) || [];
+  const lines = rows.slice(0, 30).map(item => {
+    const target = item.channel_name ? `${item.channel_name} (#${item.channel_id})` : 'chưa có kênh';
+    const groups = item.groups && item.groups.length ? ` · nhóm ${item.groups.join(' + ')}` : '';
+    const schedule = item.visibility === 'schedule' ? ` · ⏰ ${item.schedule_time || 'thiếu lịch'}` : ` · ${item.visibility}`;
+    const prefix = item.blocked ? '⛔' : '•';
+    const suffix = [...(item.reasons || []), ...(item.warnings || []).map(w => `cảnh báo: ${w}`)];
+    return `${prefix} #${item.id} ${item.title || ''} → ${target}${groups}${schedule}${suffix.length ? `\n    ${suffix.join('; ')}` : ''}`;
+  });
+  if (rows.length > 30) lines.push(`… còn ${rows.length - 30} video.`);
+  return lines.join('\n');
+}
+
+async function previewSelectedDistribution() {
+  const ids = gSelectedIds.size
+    ? Array.from(gSelectedIds)
+    : Array.from(document.querySelectorAll('.row-chk')).map(cb => parseInt(cb.getAttribute('data-id'), 10)).filter(Number.isFinite);
+  if (!ids.length) return alert('Chưa có video nào để preview.');
+  try {
+    const preview = await apiFetch('/api/queue/preview-distribution', {
+      method: 'POST', body: JSON.stringify({ ids }),
+    });
+    alert(`Preview ${preview.total} video · bị chặn ${preview.blocked} · cảnh báo ${preview.warning_count}:\n\n${formatDistributionPreview(preview)}`);
+  } catch (e) { alert('Không xem được preview: ' + e.message); }
 }
 
 async function stopPipeline() {
@@ -2267,9 +2514,11 @@ async function applyRenderStudioToSelected() {
     alert('Chưa có video nào trong dự án để áp dụng.');
     return;
   }
+  const renderSpeed = readRenderSpeedOrAlert();
+  if (renderSpeed === null) return;
   const mode = document.getElementById('rc-mode').value;
   const cfg = {
-    speed: parseFloat(document.getElementById('rc-speed').value || '1.0'),
+    speed: renderSpeed,
     volume: parseFloat(document.getElementById('rc-volume').value || '1.0'),
     brightness: parseFloat(document.getElementById('rc-brightness').value || '0.0'),
     bg_video_name: document.getElementById('rc-bg-video').value,
@@ -2453,9 +2702,11 @@ async function saveRenderPreset() {
     alert('Nhập tên preset trước khi lưu!');
     return;
   }
+  const renderSpeed = readRenderSpeedOrAlert();
+  if (renderSpeed === null) return;
   const mode = document.getElementById('rc-mode').value;
   const cfg = {
-    speed: parseFloat(document.getElementById('rc-speed').value || '1.0'),
+    speed: renderSpeed,
     volume: parseFloat(document.getElementById('rc-volume').value || '1.0'),
     brightness: parseFloat(document.getElementById('rc-brightness').value || '0.0'),
     bg_video_name: document.getElementById('rc-bg-video').value,
@@ -2635,10 +2886,12 @@ async function loadAppSettings() {
   document.getElementById('set-max-uploads').value = s.max_uploads_per_run !== undefined ? s.max_uploads_per_run : 0;
   document.getElementById('set-thumb-source').value = s.thumbnail_source || 'reup';
   document.getElementById('set-tiktok-res').value = s.download_resolution_tiktok || '720p';
+  document.getElementById('set-download-cookies').value = s.download_cookies_file || '';
   document.getElementById('set-hide-browser').checked = !!s.hide_browser;
   document.getElementById('set-del-temp').checked = s.delete_temp_after_upload !== false;
   document.getElementById('set-external-backup-dir').value = s.external_backup_dir || '';
   document.getElementById('set-external-backup-keep').value = s.external_backup_keep || 10;
+  await loadStorageOverview();
 }
 
 async function saveAppSettings() {
@@ -2652,6 +2905,7 @@ async function saveAppSettings() {
     max_uploads_per_run: parseInt(document.getElementById('set-max-uploads').value || '0', 10),
     thumbnail_source: document.getElementById('set-thumb-source').value || 'reup',
     download_resolution_tiktok: document.getElementById('set-tiktok-res').value || '720p',
+    download_cookies_file: document.getElementById('set-download-cookies').value.trim(),
     hide_browser: document.getElementById('set-hide-browser').checked,
     delete_temp_after_upload: document.getElementById('set-del-temp').checked,
     external_backup_dir: document.getElementById('set-external-backup-dir').value.trim(),
@@ -2670,6 +2924,131 @@ async function saveAppSettings() {
   await apiFetch('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
   await loadAppSettings();
   alert('Đã lưu cấu hình hệ thống thành công!');
+}
+
+function readRenderSpeedOrAlert() {
+  const speed = Number(document.getElementById('rc-speed').value || '1.0');
+  if (!Number.isFinite(speed) || speed < 0.5 || speed > 2.0) {
+    alert('Tốc độ render phải nằm trong khoảng 0.5–2.0 để giữ đồng bộ âm thanh và video.');
+    return null;
+  }
+  return speed;
+}
+
+function storageFormatBytes(value) {
+  let bytes = Math.max(0, Number(value) || 0);
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let unit = 0;
+  while (bytes >= 1024 && unit < units.length - 1) {
+    bytes /= 1024;
+    unit += 1;
+  }
+  return `${bytes.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+}
+
+function storageRetentionDays() {
+  const days = Number(document.getElementById('storage-retention-days')?.value || 30);
+  return Number.isInteger(days) ? Math.max(1, Math.min(365, days)) : 30;
+}
+
+function renderStorageSummary(data) {
+  const summary = document.getElementById('storage-summary');
+  if (!summary) return;
+  summary.textContent = `Còn trống: ${storageFormatBytes(data.free_bytes)} · ` +
+    `Temp: ${storageFormatBytes(data.temp?.bytes)} (${data.temp?.files || 0} file) · ` +
+    `Output: ${storageFormatBytes(data.output?.bytes)} (${data.output?.files || 0} file) · ` +
+    `Có thể xem xét: ${data.candidate_count || 0} file / ${storageFormatBytes(data.candidate_bytes)} · ` +
+    `Được giữ vì hàng đợi đang tham chiếu: ${data.protected_references || 0} · ` +
+    `Log: ${data.logs_count || 0}/${data.logs_retained_limit || 5000} dòng (giới hạn bảo trì)`;
+}
+
+function updateStorageCleanupButton() {
+  const button = document.getElementById('storage-cleanup-button');
+  if (button) button.disabled = !document.querySelector('#storage-preview input[type="checkbox"]:checked');
+}
+
+function renderStorageCandidates(data) {
+  const host = document.getElementById('storage-preview');
+  if (!host) return;
+  host.replaceChildren();
+  if (!data.candidates?.length) {
+    const note = document.createElement('div');
+    note.className = 'form-group';
+    note.textContent = 'Không có artifact đủ tuổi đang chờ dọn; file chưa có manifest không được đưa vào danh sách.';
+    host.appendChild(note);
+    updateStorageCleanupButton();
+    return;
+  }
+  const table = document.createElement('table');
+  const head = document.createElement('thead');
+  const headerRow = document.createElement('tr');
+  ['Chọn', 'Tên file', 'Loại', 'Đăng ký lúc', 'Dung lượng'].forEach(label => {
+    const th = document.createElement('th');
+    th.textContent = label;
+    headerRow.appendChild(th);
+  });
+  head.appendChild(headerRow);
+  table.appendChild(head);
+  const body = document.createElement('tbody');
+  data.candidates.forEach(item => {
+    const row = document.createElement('tr');
+    const selectCell = document.createElement('td');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.dataset.artifactId = String(item.id);
+    checkbox.addEventListener('change', updateStorageCleanupButton);
+    selectCell.appendChild(checkbox);
+    row.appendChild(selectCell);
+    [item.name, item.kind, item.registered_at, storageFormatBytes(item.size_bytes)].forEach(value => {
+      const cell = document.createElement('td');
+      cell.textContent = String(value ?? '');
+      row.appendChild(cell);
+    });
+    body.appendChild(row);
+  });
+  table.appendChild(body);
+  host.appendChild(table);
+  updateStorageCleanupButton();
+}
+
+async function loadStorageOverview() {
+  try {
+    const days = storageRetentionDays();
+    document.getElementById('storage-retention-days').value = String(days);
+    const data = await apiFetch(`/api/storage/overview?retention_days=${days}`);
+    renderStorageSummary(data);
+  } catch (e) {
+    const summary = document.getElementById('storage-summary');
+    if (summary) summary.textContent = `Không đọc được thông tin dung lượng: ${e.message}`;
+  }
+}
+
+async function previewStorageCleanup() {
+  try {
+    const data = await apiFetch('/api/storage/cleanup-preview', {
+      method: 'POST', body: JSON.stringify({ retention_days: storageRetentionDays() }),
+    });
+    renderStorageSummary(data);
+    renderStorageCandidates(data);
+  } catch (e) {
+    alert(`Không tạo được bản xem trước dọn file: ${e.message}`);
+  }
+}
+
+async function cleanupSelectedStorage() {
+  const selected = [...document.querySelectorAll('#storage-preview input[type="checkbox"]:checked')];
+  const artifactIds = selected.map(input => Number(input.dataset.artifactId)).filter(Number.isInteger);
+  if (!artifactIds.length) return;
+  if (!confirm(`Dọn ${artifactIds.length} artifact đã chọn? Các đường dẫn và hàng đợi sẽ được kiểm tra lại trước khi xóa.`)) return;
+  try {
+    const result = await apiFetch('/api/storage/cleanup', {
+      method: 'POST', body: JSON.stringify({ artifact_ids: artifactIds, retention_days: storageRetentionDays() }),
+    });
+    alert(`Đã dọn ${result.deleted_count} file (${storageFormatBytes(result.deleted_bytes)}). Bị giữ lại: ${result.skipped.length}.`);
+    await previewStorageCleanup();
+  } catch (e) {
+    alert(`Dọn artifact thất bại: ${e.message}`);
+  }
 }
 
 async function exportBackupNow() {

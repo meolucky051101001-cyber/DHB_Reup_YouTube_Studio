@@ -1,9 +1,15 @@
 import hashlib
+import base64
 import json
+import math
 import os
+import queue
 import re
 import subprocess
+import sys
 import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, List, Any, Optional
@@ -21,6 +27,11 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".m4v"}
 
 # Giới hạn số ffprobe chạy song song để không nghẽn đĩa/CPU khi quét thư mục lớn
 PROBE_MAX_WORKERS = max(1, min(8, os.cpu_count() or 4))
+DOWNLOAD_TIMEOUT_SEC = 30 * 60
+
+
+class VideoProbeError(RuntimeError):
+    """Probe không thể chứng minh file là video hợp lệ."""
 
 
 def detect_platform(url: str) -> str:
@@ -58,16 +69,15 @@ def format_duration(seconds: Optional[float]) -> str:
 
 def probe_video_info(file_path: str) -> Dict[str, Any]:
     """Đọc thời lượng, độ phân giải của file video bằng ffprobe.exe."""
-    info = {"duration": "00:00:00", "seconds": 0.0, "width": 0, "height": 0, "has_audio": False}
-    if not file_path or not os.path.exists(file_path):
-        # Mặc định giả định có tiếng để không làm thay đổi hành vi render khi chưa probe được
-        info["has_audio"] = True
-        return info
+    path = str(file_path or "").strip()
+    label = os.path.basename(path) or "(không có đường dẫn)"
+    if not path or not os.path.isfile(path):
+        raise VideoProbeError(f"Không tìm thấy file video để probe: {label}")
     try:
         cmd = [
             FFPROBE_EXE,
             "-v",
-            "quiet",
+            "error",
             "-print_format",
             "json",
             "-show_format",
@@ -81,21 +91,57 @@ def probe_video_info(file_path: str) -> Dict[str, Any]:
             encoding="utf-8",
             errors="ignore",
             timeout=15,
+            shell=False,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
-        data = json.loads(proc.stdout or "{}")
-        dur = float(data.get("format", {}).get("duration", 0.0) or 0.0)
-        info["seconds"] = dur
-        info["duration"] = format_duration(dur)
-        for st in data.get("streams", []):
-            if st.get("codec_type") == "video":
-                info["width"] = int(st.get("width", 0) or 0)
-                info["height"] = int(st.get("height", 0) or 0)
-            elif st.get("codec_type") == "audio":
-                info["has_audio"] = True
-    except Exception:
-        pass
-    return info
+    except subprocess.TimeoutExpired as exc:
+        raise VideoProbeError(f"ffprobe quá thời hạn 15 giây khi đọc '{label}'.") from exc
+    except OSError as exc:
+        raise VideoProbeError(f"Không chạy được ffprobe cho '{label}': {exc}") from exc
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip()[-500:]
+        raise VideoProbeError(
+            f"ffprobe thất bại cho '{label}' (mã {proc.returncode})"
+            + (f": {detail}" if detail else ".")
+        )
+    try:
+        data = json.loads(proc.stdout or "")
+    except (TypeError, ValueError) as exc:
+        raise VideoProbeError(f"ffprobe trả JSON không hợp lệ cho '{label}'.") from exc
+
+    streams = data.get("streams")
+    streams = streams if isinstance(streams, list) else []
+    video_streams = [st for st in streams if isinstance(st, dict) and st.get("codec_type") == "video"]
+    if not video_streams:
+        raise VideoProbeError(f"File '{label}' không có video stream.")
+    video = video_streams[0]
+    try:
+        width = int(video.get("width", 0) or 0)
+        height = int(video.get("height", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise VideoProbeError(f"ffprobe trả kích thước video không hợp lệ cho '{label}'.") from exc
+    if width <= 0 or height <= 0:
+        raise VideoProbeError(f"Video stream trong '{label}' thiếu kích thước hợp lệ.")
+
+    raw_duration = (data.get("format") or {}).get("duration")
+    if raw_duration in (None, ""):
+        raw_duration = video.get("duration")
+    try:
+        seconds = float(raw_duration)
+    except (TypeError, ValueError) as exc:
+        raise VideoProbeError(f"Không xác định được thời lượng video trong '{label}'.") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise VideoProbeError(f"Thời lượng video trong '{label}' không hợp lệ ({raw_duration!r}).")
+
+    return {
+        "duration": format_duration(seconds),
+        "seconds": seconds,
+        "width": width,
+        "height": height,
+        "has_audio": any(isinstance(st, dict) and st.get("codec_type") == "audio" for st in streams),
+        "has_video": True,
+    }
 
 
 def probe_video_infos(file_paths: List[str], max_workers: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
@@ -299,11 +345,94 @@ def _height_cap(res_str: str) -> int:
     return 1080
 
 
+def _run_yt_dlp_worker(payload: Dict[str, Any], progress_callback, stop_event, started_at: float) -> Dict[str, Any]:
+    """Chạy yt-dlp trong process riêng để Dừng/timeout giết được FFmpeg ghép luồng bên dưới."""
+    encoded = base64.urlsafe_b64encode(json.dumps(payload, ensure_ascii=True).encode("utf-8")).decode("ascii")
+    worker_script = str(Path(__file__).with_name("download_worker.py"))
+    proc = subprocess.Popen(
+        [sys.executable, worker_script, encoded],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        shell=False,
+        creationflags=subprocess.CREATE_NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if os.name == "nt" else 0,
+        start_new_session=(os.name != "nt"),
+    )
+    lines: queue.Queue = queue.Queue(maxsize=20)
+    reader_done = threading.Event()
+
+    def _read_output():
+        try:
+            if proc.stdout:
+                for line in proc.stdout:
+                    try:
+                        lines.put_nowait(line)
+                    except queue.Full:
+                        try:
+                            lines.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            lines.put_nowait(line)
+                        except queue.Full:
+                            pass
+        finally:
+            reader_done.set()
+
+    reader = threading.Thread(target=_read_output, daemon=True, name="DHB-Downloader-Output")
+    result = None
+    worker_error = None
+    reader.start()
+    try:
+        while proc.poll() is None or not reader_done.is_set():
+            if stop_event is not None and stop_event.is_set():
+                _terminate_download_process(proc)
+                raise InterruptedError("Người dùng đã dừng tải video.")
+            if time.monotonic() - started_at > DOWNLOAD_TIMEOUT_SEC:
+                _terminate_download_process(proc)
+                raise TimeoutError(f"Tải video vượt quá {DOWNLOAD_TIMEOUT_SEC // 60} phút; đã dừng cây tiến trình.")
+            try:
+                line = lines.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                message = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if message.get("status") == "progress" and progress_callback:
+                progress_callback(int(message.get("percent") or 0), str(message.get("message") or "Đang tải..."))
+            elif message.get("status") == "done":
+                result = message
+            elif message.get("status") == "error":
+                worker_error = f"{message.get('error_type') or 'DownloadError'}: {message.get('error') or 'yt-dlp thất bại.'}"
+        proc.wait(timeout=5)
+        if proc.returncode != 0 or not result:
+            detail = worker_error or f"yt-dlp worker thoát với mã {proc.returncode} mà không trả file."
+            raise RuntimeError(detail)
+        return result
+    except BaseException:
+        if proc.poll() is None:
+            _terminate_download_process(proc)
+        raise
+    finally:
+        if proc.stdout:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+        reader.join(timeout=1.0)
+
+
 def download_video(
     source_url: str,
     post_id: str = "",
     progress_callback: Optional[Callable[[int, str], None]] = None,
     stop_event: Optional[threading.Event] = None,
+    owner_id: Optional[int] = None,
 ) -> Dict[str, str]:
     """
     Tải video và thumbnail về thư mục temp (kết hợp yt-dlp và youtube-dl.exe của DHB).
@@ -325,8 +454,47 @@ def download_video(
             "duration": probe["duration"],
         }
 
+    from storage_manager import MIN_DOWNLOAD_HEADROOM_BYTES, ensure_disk_space
+    ensure_disk_space(APP_TEMP_DIR, MIN_DOWNLOAD_HEADROOM_BYTES, "tải video")
+
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", post_id) or hashlib.md5(source_url.encode("utf-8")).hexdigest()[:12]
-    out_template = str(APP_TEMP_DIR / f"dl_{safe_id}.%(ext)s")
+    job_prefix = f"dl_{uuid.uuid4().hex}"
+    out_template = str(APP_TEMP_DIR / f"{job_prefix}.%(ext)s")
+
+    def _owned_files():
+        root = APP_TEMP_DIR.resolve()
+        for candidate in APP_TEMP_DIR.glob(f"{job_prefix}.*"):
+            try:
+                if candidate.parent.resolve() == root and candidate.is_file():
+                    yield candidate
+            except OSError:
+                continue
+
+    def _cleanup_owned_files():
+        for candidate in list(_owned_files()):
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _cleanup_owned_partials():
+        for candidate in list(_owned_files()):
+            if candidate.name.casefold().endswith((".part", ".ytdl", ".temp")):
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _register_download_artifacts(video_path: str, thumbnail_path: str):
+        if owner_id is None:
+            return
+        from database import register_managed_artifact
+        try:
+            register_managed_artifact(video_path, "download", "queue", int(owner_id))
+            if thumbnail_path:
+                register_managed_artifact(thumbnail_path, "download_thumbnail", "queue", int(owner_id))
+        except Exception as exc:
+            add_log("Storage", f"Không ghi được manifest cho file tải của queue #{owner_id}; file được giữ lại ({type(exc).__name__}).", "WARNING")
 
     # Độ phân giải tải theo nền tảng (học download_Resolution_TikTok của DHB): TikTok/Douyin mặc định 720p
     u = (source_url or "").lower()
@@ -335,65 +503,68 @@ def download_video(
     else:
         height_cap = _height_cap(str(get_settings().get("download_resolution", "1080p FullHD") or "1080p"))
 
-    def _hook(d):
-        if stop_event is not None and stop_event.is_set():
-            raise InterruptedError("Người dùng đã bấm Dừng khi đang tải video.")
-        if d.get("status") == "downloading" and progress_callback:
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            downloaded = d.get("downloaded_bytes") or 0
-            if total > 0:
-                pct = min(99, int(downloaded * 100 / total))
-                progress_callback(pct, f"Đang tải... {pct}%")
-        elif d.get("status") == "finished" and progress_callback:
-            progress_callback(99, "Đang ghép luồng video/audio...")
-
-    ydl_opts = {
-        "outtmpl": out_template,
-        "format": f"bestvideo[height<={height_cap}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height_cap}][ext=mp4]/best",
-        "merge_output_format": "mp4",
-        "ffmpeg_location": str(Path(FFMPEG_EXE).parent),
-        "writethumbnail": True,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [_hook],
-    }
+    started_at = time.monotonic()
+    cookies_file = str(get_settings().get("download_cookies_file") or "").strip()
+    if cookies_file:
+        cookie_path = Path(cookies_file).expanduser()
+        if not cookie_path.is_file():
+            raise FileNotFoundError("File cookies Netscape cấu hình cho yt-dlp không tồn tại.")
+        cookies_file = str(cookie_path.resolve())
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(source_url, download=True)
-            if stop_event is not None and stop_event.is_set():
-                raise InterruptedError("Đã dừng ngay sau khi tải xong luồng video.")
-            downloaded_file = ydl.prepare_filename(info)
-            mp4_candidate = Path(downloaded_file).with_suffix(".mp4")
-            if mp4_candidate.exists():
-                downloaded_file = str(mp4_candidate)
+        result = _run_yt_dlp_worker(
+            {
+                "source_url": source_url,
+                "out_template": out_template,
+                "format": f"bestvideo[height<={height_cap}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height_cap}][ext=mp4]/best",
+                "ffmpeg_location": str(Path(FFMPEG_EXE).parent),
+                "cookies_file": cookies_file,
+                "timeout_sec": DOWNLOAD_TIMEOUT_SEC,
+            },
+            progress_callback,
+            stop_event,
+            started_at,
+        )
+        downloaded = Path(str(result.get("video_path") or ""))
+        owned = {os.path.normcase(str(candidate.resolve(strict=True))) for candidate in _owned_files()}
+        downloaded_canonical = os.path.normcase(str(downloaded.resolve(strict=True)))
+        if downloaded_canonical not in owned or downloaded.suffix.lower() not in VIDEO_EXTENSIONS:
+            raise RuntimeError("yt-dlp trả đường dẫn file không thuộc artifact của job.")
+        downloaded_file = str(downloaded)
+        if not os.path.isfile(downloaded_file) or os.path.getsize(downloaded_file) <= 0:
+            raise RuntimeError("yt-dlp không tạo được file video hoàn chỉnh.")
 
-            # Tìm thumbnail nếu có
-            thumb_path = ""
-            for ext in (".jpg", ".webp", ".png"):
-                t_cand = Path(downloaded_file).with_suffix(ext)
-                if t_cand.exists():
-                    thumb_path = str(t_cand)
-                    break
+        thumb_path = ""
+        for ext in (".jpg", ".jpeg", ".webp", ".png"):
+            t_cand = downloaded.with_suffix(ext)
+            if t_cand.is_file():
+                thumb_path = str(t_cand)
+                break
 
-            probe = probe_video_info(downloaded_file)
-            if progress_callback:
-                progress_callback(100, "Tải hoàn tất")
-            return {
-                "video_path": downloaded_file,
-                "thumbnail_path": thumb_path,
-                "title": info.get("title") or safe_id,
-                "duration": probe["duration"],
-            }
+        probe = probe_video_info(downloaded_file)
+        _cleanup_owned_partials()
+        _register_download_artifacts(downloaded_file, thumb_path)
+        if progress_callback:
+            progress_callback(100, "Tải hoàn tất")
+        return {
+            "video_path": downloaded_file,
+            "thumbnail_path": thumb_path,
+            "title": result.get("title") or safe_id,
+            "duration": probe["duration"],
+        }
     except InterruptedError:
         # Dừng theo yêu cầu người dùng — KHÔNG được rơi xuống nhánh fallback youtube-dl.
+        _cleanup_owned_files()
         raise
     except Exception as first_err:
         if stop_event is not None and stop_event.is_set():
             # Lỗi do người dùng bấm Dừng trong lúc tải (hook raise) — coi như ngắt, không fallback.
+            _cleanup_owned_files()
             raise InterruptedError("Đã dừng trong khi tải video.") from first_err
+        # Dọn riêng phần dở của lượt yt-dlp trước khi thử fallback.
+        _cleanup_owned_files()
         # Fallback sang youtube-dl.exe tại C:\DHB Reup Facebook\youtube-dl.exe
-        out_mp4 = str(APP_TEMP_DIR / f"dl_{safe_id}.mp4")
+        fallback_template = str(APP_TEMP_DIR / f"{job_prefix}.%(ext)s")
         cmd = [
             YTDL_EXE,
             "--ffmpeg-location",
@@ -402,35 +573,100 @@ def download_video(
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "--merge-output-format",
             "mp4",
+            "--socket-timeout",
+            "30",
+            "--retries",
+            "3",
+            "--fragment-retries",
+            "3",
+            "--extractor-retries",
+            "2",
             "-o",
-            out_mp4,
+            fallback_template,
             source_url,
         ]
+        if cookies_file:
+            cmd[-1:-1] = ["--cookies", str(Path(cookies_file).expanduser().resolve())]
         if stop_event is not None and stop_event.is_set():
             raise InterruptedError("Đã dừng trong khi tải video.")
+        proc = None
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                # youtube-dl.exe cũ không có cơ chế ngắt — chặn trên bằng timeout cứng.
-                timeout=1800,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+                creationflags=subprocess.CREATE_NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                if os.name == "nt" else 0,
+                start_new_session=(os.name != "nt"),
             )
-        except subprocess.TimeoutExpired as timeout_err:
-            raise RuntimeError(
-                f"youtube-dl.exe vượt quá 30 phút không xong — đã hủy tải từ {source_url}."
-            ) from timeout_err
-        if proc.returncode == 0 and os.path.exists(out_mp4):
-            probe = probe_video_info(out_mp4)
-            if progress_callback:
-                progress_callback(100, "Tải hoàn tất (DHB youtube-dl)")
-            return {
-                "video_path": out_mp4,
-                "thumbnail_path": "",
-                "title": safe_id,
-                "duration": probe["duration"],
-            }
-        raise RuntimeError(f"Không thể tải video từ {source_url}: {first_err}")
+            while proc.poll() is None:
+                if stop_event is not None and stop_event.is_set():
+                    _terminate_download_process(proc)
+                    raise InterruptedError("Người dùng đã dừng tải bằng youtube-dl.")
+                if time.monotonic() - started_at > DOWNLOAD_TIMEOUT_SEC:
+                    _terminate_download_process(proc)
+                    raise TimeoutError("youtube-dl.exe vượt quá 30 phút; đã dừng tiến trình tải.")
+                time.sleep(0.25)
+            if proc.returncode == 0:
+                candidates = sorted(
+                    (p for p in _owned_files() if p.suffix.lower() in VIDEO_EXTENSIONS and not p.name.endswith(".part")),
+                    key=lambda p: (p.suffix.lower() != ".mp4", p.name.casefold()),
+                )
+                for candidate in candidates:
+                    if candidate.stat().st_size <= 0:
+                        continue
+                    probe = probe_video_info(str(candidate))
+                    _cleanup_owned_partials()
+                    _register_download_artifacts(str(candidate), "")
+                    if progress_callback:
+                        progress_callback(100, "Tải hoàn tất (DHB youtube-dl)")
+                    return {
+                        "video_path": str(candidate),
+                        "thumbnail_path": "",
+                        "title": safe_id,
+                        "duration": probe["duration"],
+                    }
+            raise RuntimeError(f"youtube-dl.exe kết thúc với mã {proc.returncode} hoặc không tạo video hợp lệ.")
+        except InterruptedError:
+            _cleanup_owned_files()
+            raise
+        except Exception as fallback_err:
+            _cleanup_owned_files()
+            raise RuntimeError(f"Không thể tải video: yt-dlp: {first_err}; fallback: {fallback_err}") from fallback_err
+        except BaseException:
+            _cleanup_owned_files()
+            raise
+        finally:
+            if proc is not None and proc.poll() is None:
+                _terminate_download_process(proc)
+
+
+def _terminate_download_process(proc: subprocess.Popen, timeout: float = 5.0):
+    """Dừng và reap youtube-dl cùng tiến trình con của job."""
+    if proc.poll() is None and os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                shell=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+    if proc.poll() is None and os.name != "nt":
+        try:
+            os.killpg(proc.pid, 9)
+        except Exception:
+            pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=timeout)
+    except Exception:
+        pass

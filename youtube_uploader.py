@@ -1,4 +1,5 @@
 import json
+import ipaddress
 import os
 import re
 import subprocess
@@ -7,7 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, parse_qs
 import requests
 
 from config import (
@@ -45,10 +46,43 @@ def _get_antidetect_lock(profile_id: str) -> threading.Lock:
 
 
 def _channel_antidetect_id(channel: Dict[str, Any]) -> str:
+    declared_id = str(channel.get("antidetect_profile_id") or "").strip()
+    profile_path = str(channel.get("profile_path") or "").strip()
+    profile_source = str(channel.get("profile_source") or channel.get("source") or "").strip().lower()
+    declared_antidetect = bool(
+        declared_id or profile_path.lower().startswith("antidetect://") or profile_source == "antidetect"
+    )
+    profile_name = str(channel.get("profile_name") or "").strip()
+    profile_path_id = (
+        profile_path[len("antidetect://"):].split("/", 1)[0].strip()
+        if profile_path.lower().startswith("antidetect://")
+        else ""
+    )
+    if (
+        profile_name
+        and not declared_id
+        and not profile_path_id
+        and not profile_path.lower().startswith("antidetect://")
+    ):
+        try:
+            from database import get_profile_binding
+            binding = get_profile_binding(profile_name) or {}
+            declared_antidetect = declared_antidetect or (
+                str(binding.get("source") or "").strip().lower() == "antidetect"
+                or bool(str(binding.get("antidetect_profile_id") or "").strip())
+            )
+        except Exception:
+            if declared_antidetect:
+                raise
     try:
-        return resolve_antidetect_profile_id(channel)
-    except Exception:
+        resolved = str(resolve_antidetect_profile_id(channel) or "").strip()
+    except Exception as exc:
+        if declared_antidetect:
+            raise RuntimeError(f"Không xác định được ID Profile Antidetect; đã dừng để không chuyển sang Chrome local: {exc}") from exc
         return ""
+    if declared_antidetect and not resolved:
+        raise RuntimeError("Profile Antidetect chưa có ID liên kết; đã dừng để không chuyển sang Chrome local.")
+    return resolved
 
 
 def _log_optional_step_failure(step: str, err: Exception, channel: Dict[str, Any], metadata: Dict[str, Any]):
@@ -220,7 +254,8 @@ def open_profile_for_login(channel: Dict[str, Any]) -> Dict[str, Any]:
     ad_id = _channel_antidetect_id(channel)
     if ad_id:
         try:
-            res = AntidetectClient().open_login(ad_id)
+            with _get_antidetect_lock(ad_id):
+                res = AntidetectClient().open_login(ad_id)
         except Exception as e:
             add_log(
                 "Browser",
@@ -246,7 +281,7 @@ def open_profile_for_login(channel: Dict[str, Any]) -> Dict[str, Any]:
             ),
         }
 
-    if str(channel.get("profile_path") or "").startswith("antidetect://"):
+    if str(channel.get("profile_path") or "").lower().startswith("antidetect://"):
         raise RuntimeError(
             f"Profile '{prof_name}' được đánh dấu thuộc Antidetect nhưng chưa có ID liên kết. "
             "Hãy bấm 'Đồng Bộ Antidetect' trong tab Quản Lý Kênh rồi thử lại."
@@ -259,39 +294,43 @@ def open_profile_for_login(channel: Dict[str, Any]) -> Dict[str, Any]:
     if not chrome_exe:
         raise RuntimeError("Không tìm thấy Google Chrome trên hệ thống.")
 
-    proxy_val = (channel.get("proxy") or "").strip()
-    p_parts = proxy_val.split(":") if proxy_val else []
+    proxy_config = _parse_channel_proxy(channel)
 
     # Nếu Proxy có xác thực User/Password (4 thành phần), mở qua Playwright để xác thực tự động không bị lỗi mạng
-    if len(p_parts) >= 4:
+    if proxy_config and proxy_config["username"]:
         def _launch_playwright_login():
             from playwright.sync_api import sync_playwright
             try:
-                with sync_playwright() as p:
-                    ctx = p.chromium.launch_persistent_context(
-                        user_data_dir=prof_path,
-                        executable_path=chrome_exe,
-                        headless=False,
-                        args=["--disable-blink-features=AutomationControlled", "--no-first-run", "--no-default-browser-check"],
-                        ignore_default_args=["--enable-automation"],
-                        proxy={
-                            "server": f"http://{p_parts[0]}:{p_parts[1]}",
-                            "username": p_parts[2],
-                            "password": p_parts[3],
-                        },
-                        viewport={"width": 1366, "height": 768},
-                    )
-                    page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                    page.add_init_script(STEALTH_JS)
-                    page.goto("https://studio.youtube.com")
-                    try:
-                        page.wait_for_event("close", timeout=0)
-                    except Exception:
-                        pass
-                    try:
-                        ctx.close()
-                    except Exception as close_err:
-                        _log_optional_step_failure("đóng Chrome sau khi mở đăng nhập", close_err, channel, {})
+                with _get_profile_lock(prof_path):
+                    with sync_playwright() as p:
+                        ctx = _launch_persistent_context_guarded(
+                            p,
+                            {
+                                "user_data_dir": prof_path,
+                                "executable_path": chrome_exe,
+                                "headless": False,
+                                "args": ["--disable-blink-features=AutomationControlled", "--no-first-run", "--no-default-browser-check"],
+                                "ignore_default_args": ["--enable-automation"],
+                                "proxy": {
+                                    "server": f"http://{proxy_config['host']}:{proxy_config['port']}",
+                                    "username": proxy_config["username"],
+                                    "password": proxy_config["password"],
+                                },
+                                "viewport": {"width": 1366, "height": 768},
+                            },
+                            prof_name,
+                        )
+                        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                        page.add_init_script(STEALTH_JS)
+                        page.goto("https://studio.youtube.com")
+                        try:
+                            page.wait_for_event("close", timeout=0)
+                        except Exception:
+                            pass
+                        try:
+                            ctx.close()
+                        except Exception as close_err:
+                            _log_optional_step_failure("đóng Chrome sau khi mở đăng nhập", close_err, channel, {})
             except Exception as e:
                 add_log(
                     "Browser",
@@ -314,9 +353,10 @@ def open_profile_for_login(channel: Dict[str, Any]) -> Dict[str, Any]:
         "--disable-blink-features=AutomationControlled",
         "https://studio.youtube.com",
     ]
-    if len(p_parts) == 2:
-        args.insert(-1, f"--proxy-server=http://{p_parts[0]}:{p_parts[1]}")
-    subprocess.Popen(args)
+    if proxy_config:
+        args.insert(-1, f"--proxy-server=http://{proxy_config['host']}:{proxy_config['port']}")
+    with _get_profile_lock(prof_path):
+        subprocess.Popen(args)
     add_log("Browser", f"Đã mở Chrome Profile '{prof_name}' tại studio.youtube.com", "INFO", channel.get("name", ""))
     return {"ok": True, "profile_path": prof_path, "message": f"Đã mở Chrome Profile: {prof_name}"}
 
@@ -640,6 +680,65 @@ def _is_radio_checked(radio) -> bool:
         return False
 
 
+def _set_radio_and_verify(page, radio, expected: bool, label: str):
+    """Click a metadata radio when needed and wait for its selected DOM state."""
+    if radio.count() == 0 or not radio.is_visible():
+        raise RuntimeError(f"Không tìm thấy lựa chọn '{label}' trên YouTube Studio.")
+    try:
+        current = radio.get_attribute("aria-checked")
+        current_state = current.lower() == "true" if current is not None else None
+    except Exception:
+        current_state = None
+    if current_state is not bool(expected):
+        human_move_and_click(page, radio, delay_after=0)
+    try:
+        handle = radio.element_handle()
+        if handle is None:
+            raise RuntimeError("DOM control không còn tồn tại sau thao tác.")
+        page.wait_for_function(
+            """({el, expected}) => {
+                if (!el || !el.isConnected) return false;
+                const raw = el.getAttribute('aria-checked');
+                if (raw !== null) return (raw.toLowerCase() === 'true') === expected;
+                if ('checked' in el) return !!el.checked === expected;
+                return false;
+            }""",
+            arg={"el": handle, "expected": bool(expected)},
+            timeout=5000,
+            polling="raf",
+        )
+    except Exception as exc:
+        state = _is_radio_checked(radio)
+        if state != bool(expected):
+            raise RuntimeError(f"Chưa xác minh được lựa chọn '{label}' trên YouTube Studio.") from exc
+
+
+def _schedule_values_match(date_value: str, time_value: str, expected) -> bool:
+    """Compare Studio's read-back values with the requested local schedule."""
+    date_value = str(date_value or "").strip()
+    time_value = str(time_value or "").strip()
+    parsed_date = None
+    for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%b %d, %Y", "%B %d, %Y", "%Y-%m-%d"):
+        try:
+            parsed_date = datetime.strptime(date_value, fmt).date()
+            break
+        except ValueError:
+            continue
+    if parsed_date is None:
+        try:
+            parsed_date = datetime.fromisoformat(date_value).date()
+        except ValueError:
+            return False
+    parsed_time = None
+    for fmt in ("%H:%M", "%I:%M %p", "%I:%M%p"):
+        try:
+            parsed_time = datetime.strptime(time_value, fmt).time()
+            break
+        except ValueError:
+            continue
+    return bool(parsed_time and parsed_date == expected.date() and parsed_time.hour == expected.hour and parsed_time.minute == expected.minute)
+
+
 def _verify_studio_channel_id(active: Dict[str, str], channel: Dict[str, Any]):
     expected = (channel.get("channel_id") or "").strip()
     actual = (active.get("channel_id") or "").strip()
@@ -955,7 +1054,7 @@ def probe_profile_login(
     Luôn chạy định danh Windows Desktop nguyên bản (không ép Mobile UA) để đồng nhất fingerprint.
     Profile Antidetect được kiểm tra qua CDP trên chính trình duyệt do Antidetect quản lý.
     """
-    if not antidetect_profile_id and str(prof_path or "").startswith("antidetect://"):
+    if not antidetect_profile_id and str(prof_path or "").lower().startswith("antidetect://"):
         antidetect_profile_id = str(prof_path).split("antidetect://", 1)[1].split("/", 1)[0].strip()
     if antidetect_profile_id:
         return _probe_antidetect_login(antidetect_profile_id, grab_channels=grab_channels)
@@ -988,17 +1087,16 @@ def probe_profile_login(
         "viewport": {"width": 1366, "height": 768},
         "executable_path": chrome_exe,
     }
-    proxy_val = (proxy or "").strip()
-    if proxy_val:
-        p_parts = proxy_val.split(":")
-        if len(p_parts) == 2:
-            ctx_kwargs["proxy"] = {"server": f"http://{p_parts[0]}:{p_parts[1]}"}
-        elif len(p_parts) >= 4:
-            ctx_kwargs["proxy"] = {
-                "server": f"http://{p_parts[0]}:{p_parts[1]}",
-                "username": p_parts[2],
-                "password": p_parts[3],
-            }
+    proxy_config = _parse_channel_proxy({"proxy": proxy})
+    if proxy_config:
+        ctx_kwargs["proxy"] = {
+            "server": f"http://{proxy_config['host']}:{proxy_config['port']}"
+        }
+        if proxy_config["username"]:
+            ctx_kwargs["proxy"].update({
+                "username": proxy_config["username"],
+                "password": proxy_config["password"],
+            })
 
     prof_name = Path(prof_path).name
     prof_lock = _get_profile_lock(prof_path)
@@ -1135,23 +1233,54 @@ def get_oauth_token_local_status(channel: Dict[str, Any]) -> Dict[str, Any]:
     return status
 
 
-def _proxy_url_from_channel(channel: Dict[str, Any]) -> str:
-    """Chuyển proxy IP:PORT[:USER:PASS] của kênh thành URL cho requests (đồng bộ với Playwright)."""
-    raw = (channel.get("proxy") or "").strip()
+def _parse_channel_proxy(channel: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Parse the documented HOST:PORT[:USER:PASS] form or fail closed."""
+    raw = str(channel.get("proxy") or "").strip()
     if not raw:
-        return ""
+        return None
     parts = raw.split(":")
     if len(parts) not in (2, 4):
-        raise ValueError(
-            f"Proxy của kênh không đúng định dạng IP:PORT hoặc IP:PORT:USER:PASS: '{raw}'."
-        )
-    host, port = parts[0].strip(), parts[1].strip()
-    if not host or not port:
-        raise ValueError(f"Proxy của kênh thiếu host hoặc port: '{raw}'.")
-    auth = ""
+        raise ValueError("Proxy không đúng định dạng HOST:PORT hoặc HOST:PORT:USER:PASS.")
+    host, raw_port = parts[0].strip(), parts[1].strip()
+    if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        raise ValueError("Host proxy không hợp lệ; proxy IPv6 hoặc ký tự lạ chưa được hỗ trợ.")
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Port proxy phải là số từ 1 đến 65535.") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("Port proxy phải là số từ 1 đến 65535.")
+    try:
+        host = ipaddress.ip_address(host).compressed
+    except ValueError:
+        try:
+            host = host.encode("idna").decode("ascii").lower().rstrip(".")
+        except UnicodeError as exc:
+            raise ValueError("Host proxy không hợp lệ.") from exc
+        if (
+            not host
+            or len(host) > 253
+            or any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
+                   for label in host.split("."))
+        ):
+            raise ValueError("Host proxy không hợp lệ.")
+    username = password = ""
     if len(parts) == 4:
-        auth = f"{quote(parts[2], safe='')}:{quote(parts[3], safe='')}@"
-    return f"http://{auth}{host}:{port}"
+        username, password = parts[2].strip(), parts[3].strip()
+        if not username or not password:
+            raise ValueError("Proxy có xác thực phải có đủ username và password.")
+    return {"host": host, "port": port, "username": username, "password": password}
+
+
+def _proxy_url_from_channel(channel: Dict[str, Any]) -> str:
+    """Chuyển proxy kênh thành URL requests; cấu hình sai không được bỏ qua."""
+    parsed = _parse_channel_proxy(channel)
+    if not parsed:
+        return ""
+    auth = ""
+    if parsed["username"]:
+        auth = f"{quote(parsed['username'], safe='')}:{quote(parsed['password'], safe='')}@"
+    return f"http://{auth}{parsed['host']}:{parsed['port']}"
 
 
 def _http_session_for_channel(channel: Dict[str, Any]) -> requests.Session:
@@ -1295,6 +1424,157 @@ def _fetch_oauth_channel_identity(access_token: str, session: Optional[requests.
     }
 
 
+def _read_resumable_offset(response, file_size: int) -> int:
+    """Return the first byte not confirmed stored by a 308 response."""
+    value = str(response.headers.get("Range") or "").strip()
+    if not value:
+        return 0
+    match = re.fullmatch(r"bytes\s*=\s*(\d+)-(\d+)", value, flags=re.IGNORECASE)
+    if not match:
+        raise RuntimeError(f"YouTube trả Range không hợp lệ cho phiên resumable: {value!r}")
+    first, last = (int(match.group(1)), int(match.group(2)))
+    if first != 0 or last < first or last >= file_size:
+        raise RuntimeError(f"YouTube trả Range ngoài kích thước file: {value!r}")
+    return last + 1
+
+
+def _query_resumable_upload_status(http, upload_url: str, access_token: str, file_size: int):
+    """Ask YouTube which bytes it stored; this is required after an ambiguous PUT."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Length": "0",
+        "Content-Range": f"bytes */{file_size}",
+    }
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = http.put(upload_url, headers=headers, data=b"", timeout=30)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(min(8, 2 ** (attempt + 1)))
+                continue
+            raise RuntimeError(f"Không truy vấn được trạng thái phiên resumable: {exc}") from exc
+        if response.status_code in (200, 201):
+            video_id = str((response.json() or {}).get("id") or "").strip()
+            if not video_id:
+                raise RuntimeError("YouTube xác nhận phiên đã hoàn tất nhưng không trả Video ID.")
+            return {"offset": file_size, "video_id": video_id}
+        if response.status_code == 308:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    time.sleep(min(60, max(0, int(retry_after))))
+                except (TypeError, ValueError):
+                    pass
+            return {"offset": _read_resumable_offset(response, file_size), "video_id": ""}
+        if response.status_code in (500, 502, 503, 504) and attempt < 2:
+            time.sleep(min(8, 2 ** (attempt + 1)))
+            continue
+        if response.status_code in (404, 410):
+            raise RuntimeError(
+                "Phiên resumable đã hết hạn hoặc không còn tồn tại. Không tự tạo phiên upload mới "
+                "vì chưa thể loại trừ khả năng video đã được nhận; hãy đối soát YouTube Studio."
+            )
+        raise RuntimeError(
+            f"Không xác định được trạng thái phiên resumable ({response.status_code}): {response.text}"
+        )
+    raise RuntimeError(f"Không xác định được trạng thái phiên resumable: {last_error or 'lỗi máy chủ'}")
+
+
+def _verify_api_video(http, video_id: str, access_token: str, metadata: Dict[str, Any], progress_callback=None):
+    """Wait for API processing and read back the audience/visibility/schedule fields."""
+    try:
+        timeout_seconds = int(get_settings().get("youtube_processing_timeout_seconds", 900) or 900)
+    except (TypeError, ValueError):
+        timeout_seconds = 900
+    timeout_seconds = max(30, min(3600, timeout_seconds))
+    deadline = time.monotonic() + timeout_seconds
+    delay = 2
+    while True:
+        try:
+            response = http.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={"part": "status,processingDetails", "id": video_id},
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=30,
+            )
+        except (requests.ConnectionError, requests.Timeout):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Hết thời gian xác minh xử lý video qua YouTube API sau lỗi mạng.")
+            time.sleep(min(delay, max(1, int(deadline - time.monotonic()))))
+            delay = min(30, delay * 2)
+            continue
+        if response.status_code in (429, 500, 502, 503, 504):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Hết thời gian xác minh xử lý video qua YouTube API ({response.status_code}).")
+            retry_after = response.headers.get("Retry-After")
+            try:
+                wait_seconds = min(60, max(1, int(retry_after))) if retry_after else delay
+            except (TypeError, ValueError):
+                wait_seconds = delay
+            time.sleep(wait_seconds)
+            delay = min(30, delay * 2)
+            continue
+        if response.status_code != 200:
+            raise RuntimeError(f"Không đọc lại được video sau upload ({response.status_code}): {response.text}")
+        items = (response.json() or {}).get("items") or []
+        item = next((candidate for candidate in items if str(candidate.get("id") or "") == video_id), None)
+        if not item:
+            raise RuntimeError("YouTube chưa trả video ID vừa tạo khi đọc lại; cần đối soát kết quả upload.")
+        status = item.get("status") or {}
+        upload_status = str(status.get("uploadStatus") or "").lower()
+        processing_status = str((item.get("processingDetails") or {}).get("processingStatus") or "").lower()
+        if upload_status in {"failed", "rejected", "deleted"} or processing_status in {"failed", "terminated"}:
+            raise RuntimeError(
+                f"YouTube không xử lý xong video (uploadStatus={upload_status or 'unknown'}, "
+                f"processingStatus={processing_status or 'unknown'})."
+            )
+        if (
+            (processing_status == "processing" or upload_status == "uploaded")
+            and processing_status != "succeeded"
+            and upload_status != "processed"
+        ):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"YouTube vẫn đang xử lý video sau {timeout_seconds}s.")
+            if progress_callback:
+                progress_callback(96, "YouTube đang xử lý video sau khi chuyển file hoàn tất...")
+            time.sleep(min(delay, max(1, int(deadline - time.monotonic()))))
+            delay = min(30, delay * 2)
+            continue
+        if upload_status != "processed" and processing_status != "succeeded":
+            raise RuntimeError(
+                f"Chưa xác định được trạng thái xử lý cuối của video "
+                f"(uploadStatus={upload_status or 'missing'}, processingStatus={processing_status or 'missing'})."
+            )
+
+        expected_privacy = "private" if metadata.get("privacy_status") == "schedule" else metadata.get("privacy_status")
+        if str(status.get("privacyStatus") or "").lower() != expected_privacy:
+            raise RuntimeError("Visibility đọc lại từ YouTube không khớp giá trị đã yêu cầu.")
+        if "selfDeclaredMadeForKids" not in status:
+            raise RuntimeError("YouTube không trả lại trạng thái Dành cho trẻ em để xác minh.")
+        if "containsSyntheticMedia" not in status:
+            raise RuntimeError("YouTube không trả lại nhãn nội dung AI để xác minh.")
+        if bool(status.get("selfDeclaredMadeForKids")) != bool(metadata.get("made_for_kids")):
+            raise RuntimeError("Thiết lập Dành cho trẻ em đọc lại từ YouTube không khớp giá trị đã yêu cầu.")
+        if bool(status.get("containsSyntheticMedia")) != bool(metadata.get("altered_content")):
+            raise RuntimeError("Nhãn nội dung AI đọc lại từ YouTube không khớp giá trị đã yêu cầu.")
+        if metadata.get("privacy_status") == "schedule":
+            raw_publish_at = str(status.get("publishAt") or "").strip()
+            if not raw_publish_at:
+                raise RuntimeError("YouTube không trả lại thời gian công bố đã hẹn.")
+            try:
+                actual_publish_at = datetime.fromisoformat(raw_publish_at.replace("Z", "+00:00"))
+                expected_publish_at = datetime.fromisoformat(
+                    str(metadata.get("schedule_time") or "").replace(" ", "T")
+                ).astimezone()
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Không đọc/so sánh được thời gian hẹn từ YouTube.") from exc
+            if abs(actual_publish_at.timestamp() - expected_publish_at.timestamp()) > 60:
+                raise RuntimeError("Thời gian công bố đọc lại từ YouTube không khớp lịch đã yêu cầu.")
+        return item
+
+
 def _upload_via_youtube_api_with_session(
     video_path: str,
     metadata: Dict[str, Any],
@@ -1313,10 +1593,12 @@ def _upload_via_youtube_api_with_session(
             "Hãy dùng phương thức Playwright Studio cho video này."
         )
 
+    file_size = os.path.getsize(video_path)
+    if file_size <= 0:
+        raise RuntimeError("File video rỗng, không thể khởi tạo YouTube resumable upload.")
     http = session or requests.Session()
     oauth_data = _parse_oauth_payload(channel.get("oauth_token_json") or "")
     access_token = _refresh_google_access_token(oauth_data, session=http)
-    file_size = os.path.getsize(video_path)
 
     # XÁC MINH KÊNH: YouTube Data API không cho chọn kênh con khi upload — token chính là kênh nhận video.
     identity = _fetch_oauth_channel_identity(access_token, session=http)
@@ -1344,6 +1626,7 @@ def _upload_via_youtube_api_with_session(
         },
         "status": {
             "selfDeclaredMadeForKids": metadata["made_for_kids"],
+            "containsSyntheticMedia": metadata["altered_content"],
         },
     }
 
@@ -1389,57 +1672,117 @@ def _upload_via_youtube_api_with_session(
     upload_url = init_resp.headers.get("Location")
     if not upload_url:
         raise RuntimeError("Không nhận được Location URL từ YouTube Resumable Upload.")
+    upload_location = urlsplit(upload_url)
+    upload_host = (upload_location.hostname or "").lower().rstrip(".")
+    try:
+        upload_port = upload_location.port
+    except ValueError as exc:
+        raise RuntimeError("Location của phiên resumable có port không hợp lệ.") from exc
+    if (
+        upload_location.scheme.lower() != "https"
+        or upload_location.username
+        or upload_location.password
+        or upload_port not in (None, 443)
+        or not (upload_host == "googleapis.com" or upload_host.endswith(".googleapis.com"))
+    ):
+        raise RuntimeError("Location của phiên resumable không thuộc HTTPS Google APIs; đã dừng để bảo vệ OAuth token.")
 
     video_id = ""
     with open(video_path, "rb") as f:
         offset = 0
         while offset < file_size:
+            f.seek(offset)
             chunk = f.read(CHUNK_SIZE)
-            chunk_len = len(chunk)
-            end_byte = offset + chunk_len - 1
-            put_headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Length": str(chunk_len),
-                "Content-Type": "video/mp4",
-                "Content-Range": f"bytes {offset}-{end_byte}/{file_size}",
-            }
-
-            max_retries = 5
-            put_resp = None
-            for attempt in range(max_retries):
+            if not chunk:
+                raise RuntimeError(f"Không đọc được dữ liệu tại offset {offset} trong file upload.")
+            request_resolved = False
+            for attempt in range(5):
+                request_error = None
+                end_byte = offset + len(chunk) - 1
+                put_headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Length": str(len(chunk)),
+                    "Content-Type": "video/mp4",
+                    "Content-Range": f"bytes {offset}-{end_byte}/{file_size}",
+                }
                 try:
                     put_resp = http.put(upload_url, headers=put_headers, data=chunk, timeout=120)
-                    if put_resp.status_code in (200, 201, 308):
-                        break
-                    if put_resp.status_code in (500, 502, 503, 504):
-                        sleep_time = min(30, 2 ** (attempt + 1))
-                        time.sleep(sleep_time)
-                        continue
-                    break
                 except (requests.ConnectionError, requests.Timeout) as net_err:
-                    if attempt < max_retries - 1:
-                        sleep_time = min(30, 2 ** (attempt + 1))
-                        time.sleep(sleep_time)
+                    request_error = net_err
+                    put_resp = None
+                if put_resp is None or put_resp.status_code in (500, 502, 503, 504):
+                    # A PUT can be accepted even when its response is lost or 5xx.
+                    # Query the server before deciding whether any bytes may be resent.
+                    state = _query_resumable_upload_status(http, upload_url, access_token, file_size)
+                    if state["video_id"]:
+                        video_id = state["video_id"]
+                        request_resolved = True
+                        break
+                    if state["offset"] < offset:
+                        raise RuntimeError(
+                            f"Offset YouTube bị lùi từ {offset} về {state['offset']}; dừng để tránh gửi sai dữ liệu."
+                        )
+                    if state["offset"] > offset:
+                        offset = state["offset"]
+                        request_resolved = True
+                        break
+                    if attempt < 4:
+                        time.sleep(min(30, 2 ** (attempt + 1)))
+                    elif request_error:
+                        raise RuntimeError(
+                            f"Lỗi mạng khi tải lên YouTube chunk {offset}; server xác nhận chưa nhận thêm byte: {request_error}"
+                        ) from request_error
                     else:
-                        raise RuntimeError(f"Lỗi mạng khi tải lên YouTube chunk {offset}: {net_err}")
+                        raise RuntimeError(
+                            f"YouTube tiếp tục lỗi máy chủ khi gửi chunk {offset} "
+                            f"({put_resp.status_code if put_resp is not None else 'không rõ'}); server xác nhận chưa nhận thêm byte."
+                        )
+                    continue
 
-            if put_resp is None:
-                raise RuntimeError(f"Không nhận được phản hồi từ YouTube tại offset {offset}")
-
-            if put_resp.status_code in (200, 201):
-                res_json = put_resp.json()
-                video_id = res_json.get("id", "")
+                if put_resp.status_code in (200, 201):
+                    video_id = str((put_resp.json() or {}).get("id") or "").strip()
+                    if not video_id:
+                        raise RuntimeError("YouTube hoàn tất PUT nhưng không trả Video ID.")
+                    request_resolved = True
+                    break
+                if put_resp.status_code == 308:
+                    accepted_offset = _read_resumable_offset(put_resp, file_size)
+                    if accepted_offset < offset:
+                        raise RuntimeError(
+                            f"Offset YouTube bị lùi từ {offset} về {accepted_offset}; dừng để tránh gửi sai dữ liệu."
+                        )
+                    if accepted_offset > offset:
+                        offset = accepted_offset
+                        request_resolved = True
+                        break
+                    if attempt < 4:
+                        time.sleep(min(30, 2 ** (attempt + 1)))
+                    continue
+                raise RuntimeError(
+                    f"Lỗi khi đẩy dữ liệu video ({put_resp.status_code}): {put_resp.text}"
+                )
+            if video_id:
                 break
-            elif put_resp.status_code == 308:
-                offset += chunk_len
-                pct = min(95, int(offset * 100 / file_size))
-                if progress_callback:
-                    progress_callback(pct, f"Đang tải lên YouTube API... {pct}%")
-            else:
-                raise RuntimeError(f"Lỗi khi đẩy dữ liệu video ({put_resp.status_code}): {put_resp.text}")
+            if not request_resolved:
+                raise RuntimeError(f"Phiên resumable không tiến triển sau 5 lần thử tại offset {offset}.")
+            pct = min(95, int(offset * 100 / file_size))
+            if progress_callback:
+                progress_callback(pct, f"Đang chuyển file lên YouTube API... {pct}%")
+            if offset == file_size and not video_id:
+                state = _query_resumable_upload_status(http, upload_url, access_token, file_size)
+                video_id = state["video_id"]
+                if not video_id:
+                    raise RuntimeError("YouTube đã nhận toàn bộ file nhưng chưa xác nhận hoàn tất phiên upload.")
 
     if not video_id:
         raise RuntimeError("Không lấy được Video ID sau khi tải lên.")
+    verified_url = normalize_published_video_url(f"https://youtu.be/{video_id}")
+    if not verified_url:
+        raise RuntimeError("YouTube trả Video ID không đúng định dạng video 11 ký tự.")
+
+    if progress_callback:
+        progress_callback(96, "Đã chuyển file xong; đang chờ YouTube xử lý và đọc lại metadata...")
+    _verify_api_video(http, video_id, access_token, metadata, progress_callback=progress_callback)
 
     if thumbnail_path and os.path.exists(thumbnail_path):
         try:
@@ -1473,7 +1816,7 @@ def _upload_via_youtube_api_with_session(
 
     if progress_callback:
         progress_callback(100, "Đăng thành công qua YouTube API")
-    return f"https://youtu.be/{video_id}"
+    return verified_url
 
 
 def upload_via_youtube_api(
@@ -1747,15 +2090,32 @@ _CHECKS_SOFT_KEYWORDS = [
     "para kazanılamıyor", "sınırlı reklamlar", "tüm reklamverenler için uygun değil",
 ]
 
+_CHECKS_PROCESSING_KEYWORDS = [
+    "still processing", "currently processing", "processing your video", "processing will begin",
+    "processing video", "checks are in progress", "checking your video", "checking for issues",
+    "video is uploading", "uploading video", "đang xử lý", "vẫn đang xử lý", "đang kiểm tra",
+    "đang tải lên", "đang quét",
+]
+
 
 def checks_report_safe(raw_text: str) -> bool:
     """True khi YouTube Studio báo kiểm tra xong và không có vấn đề (đa ngôn ngữ)."""
     text = (raw_text or "").lower()
+    if any(k in text for k in _CHECKS_PROCESSING_KEYWORDS):
+        return False
     return any(k in text for k in _CHECKS_SAFE_KEYWORDS)
 
 
+def _read_checks_text(page) -> str:
+    """Read only the visible Checks panel; never infer its result from page-wide text."""
+    checks_container = page.locator("ytcp-uploads-checks, #checks-content, div[test-id='checks-content']").first
+    if checks_container.count() == 0 or not checks_container.is_visible():
+        raise RuntimeError("Không tìm thấy vùng Checks đang hiển thị.")
+    return (checks_container.inner_text() or "").lower()
+
+
 def classify_checks_text(raw_text: str) -> Dict[str, Any]:
-    """Phân loại văn bản bước Checks thành: an toàn / vi phạm (chặn) / cảnh báo mềm (vẫn đăng)."""
+    """Phân loại Checks thành an toàn, vi phạm rõ hoặc chưa xác định."""
     text = (raw_text or "").lower()
     # Cảnh báo vi phạm phải thắng câu "Checks complete"/"No issues found" đi kèm:
     # bỏ các cụm an toàn trước khi dò vi phạm để "Checks complete. Copyright-protected content found"
@@ -1765,17 +2125,25 @@ def classify_checks_text(raw_text: str) -> Dict[str, Any]:
         stripped = stripped.replace(safe_kw, " ")
     for vk in _CHECKS_VIOLATION_KEYWORDS:
         if vk in stripped:
-            return {"has_violation": True, "reason": f"Phát hiện cảnh báo: {vk.title()}", "soft_warning": ""}
+            return {
+                "result": "violation",
+                "has_violation": True,
+                "reason": f"Phát hiện cảnh báo: {vk.title()}",
+                "soft_warning": "",
+            }
+    if any(k in text for k in _CHECKS_PROCESSING_KEYWORDS):
+        return {"result": "unknown", "has_violation": False, "reason": "", "soft_warning": ""}
     if checks_report_safe(text):
-        return {"has_violation": False, "reason": "", "soft_warning": ""}
+        return {"result": "safe", "has_violation": False, "reason": "", "soft_warning": ""}
     for sk in _CHECKS_SOFT_KEYWORDS:
         if sk in text:
             return {
+                "result": "unknown",
                 "has_violation": False,
                 "reason": "",
                 "soft_warning": f"Cảnh báo không chặn đăng (kiếm tiền/quảng cáo): {sk}",
             }
-    return {"has_violation": False, "reason": "", "soft_warning": ""}
+    return {"result": "unknown", "has_violation": False, "reason": "", "soft_warning": ""}
 
 
 def check_copyright_and_violations(page) -> Dict[str, Any]:
@@ -1785,12 +2153,12 @@ def check_copyright_and_violations(page) -> Dict[str, Any]:
     - has_violation (CẢNH BÁO BẢN QUYỀN / BỊ CHẶN): tự động hủy và xóa nháp để bảo vệ kênh.
     - soft_warning (KHÔNG ĐỦ ĐIỀU KIỆN KIẾM TIỀN / HẠN CHẾ QUẢNG CÁO): chỉ ghi log, vẫn đăng bình thường.
     """
-    state: Dict[str, Any] = {"has_violation": False, "reason": "", "soft_warning": "", "probe_error": ""}
+    state: Dict[str, Any] = {
+        "result": "unknown", "has_violation": False, "reason": "", "soft_warning": "", "probe_error": ""
+    }
 
     try:
-        checks_container = page.locator("ytcp-uploads-checks, #checks-content, div[test-id='checks-content']").first
-        scope = checks_container if (checks_container.count() > 0 and checks_container.is_visible()) else page
-        raw_text = (scope.inner_text() or "").lower()
+        raw_text = _read_checks_text(page)
         state = classify_checks_text(raw_text)
         state["probe_error"] = ""
         if state["has_violation"]:
@@ -1827,57 +2195,99 @@ def check_copyright_and_violations(page) -> Dict[str, Any]:
     return state
 
 
-_PUBLISHED_VIDEO_URL_RE = re.compile(
-    r"https?://(?:www\.|m\.)?(?:youtu\.be/|youtube\.com/(?:watch\?(?:[^#\s]*&)?v=|shorts/|live/))"
-    r"([A-Za-z0-9_-]{11})",
-    re.IGNORECASE,
-)
-
-
 def normalize_published_video_url(raw: str) -> str:
-    """Chuẩn hóa URL YouTube về dạng https://youtu.be/<id>; trả rỗng nếu không phải URL video."""
-    match = _PUBLISHED_VIDEO_URL_RE.search((raw or "").strip())
-    if not match:
+    """Validate a real YouTube video URL by parsed host, path, and 11-char ID."""
+    try:
+        parts = urlsplit(str(raw or "").strip())
+        if parts.scheme.lower() not in ("http", "https") or parts.username or parts.password:
+            return ""
+        port = parts.port
+        if port is not None and port != (443 if parts.scheme.lower() == "https" else 80):
+            return ""
+        host = (parts.hostname or "").lower().rstrip(".")
+        if host not in {"youtu.be", "www.youtu.be", "youtube.com", "www.youtube.com", "m.youtube.com"}:
+            return ""
+        video_id = ""
+        path_parts = [part for part in parts.path.split("/") if part]
+        if host.endswith("youtu.be"):
+            if len(path_parts) == 1:
+                video_id = path_parts[0]
+        elif path_parts == ["watch"]:
+            values = parse_qs(parts.query, keep_blank_values=True).get("v", [])
+            if len(values) == 1:
+                video_id = values[0]
+        elif len(path_parts) == 2 and path_parts[0].lower() in {"shorts", "live", "embed"}:
+            video_id = path_parts[1]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id or ""):
+            return ""
+    except (TypeError, ValueError):
         return ""
-    return f"https://youtu.be/{match.group(1)}"
+    return f"https://youtu.be/{video_id}"
 
 
-def extract_published_video_url(page) -> str:
+def extract_published_video_url(page, previous_url: str = "") -> str:
     """Đọc URL video thật từ hộp thoại chia sẻ / liên kết video của YouTube Studio."""
     selectors = [
-        "ytcp-video-share-dialog input#share-url",
-        "ytcp-video-share-dialog input[value*='youtu']",
-        "ytcp-video-share-dialog a[href*='youtu']",
-        "ytcp-video-share-dialog a[href*='youtube']",
-        "a.ytcp-video-info[href*='youtu']",
-        "ytcp-video-info a[href*='youtu']",
-        "span.video-url-fadeable a",
+        "input#share-url",
+        "input[value*='youtu']",
+        "a[href*='youtu']",
+        "a[href*='youtube']",
     ]
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() == 0:
-                continue
-            candidates = []
-            try:
-                candidates.append(loc.input_value())
-            except Exception:
-                pass
-            for attr in ("value", "href"):
+    try:
+        dialog = page.locator("ytcp-video-share-dialog").first
+        if dialog.count() > 0 and dialog.is_visible():
+            for sel in selectors:
                 try:
-                    candidates.append(loc.get_attribute(attr) or "")
+                    loc = dialog.locator(sel).first
+                    if loc.count() == 0 or not loc.is_visible():
+                        continue
+                    candidates = []
+                    try:
+                        candidates.append(loc.input_value())
+                    except Exception:
+                        pass
+                    for attr in ("value", "href"):
+                        try:
+                            candidates.append(loc.get_attribute(attr) or "")
+                        except Exception:
+                            pass
+                    try:
+                        candidates.append(loc.inner_text() or "")
+                    except Exception:
+                        pass
+                    for candidate in candidates:
+                        url = normalize_published_video_url(candidate)
+                        if url:
+                            return url
                 except Exception:
-                    pass
-            try:
-                candidates.append(loc.inner_text() or "")
-            except Exception:
-                pass
-            for raw in candidates:
-                url = normalize_published_video_url(raw)
-                if url:
-                    return url
-        except Exception:
-            continue
+                    continue
+    except Exception:
+        pass
+
+    # After a completed publish, Studio may route to the edit page instead of
+    # showing its share dialog. Accept only an ID in this current Studio URL.
+    try:
+        parts = urlsplit(str(page.url or ""))
+        host = (parts.hostname or "").lower().rstrip(".")
+        if (
+            host in {"studio.youtube.com", "youtube.com", "www.youtube.com"}
+            and str(page.url or "") != str(previous_url or "")
+        ):
+            query = parse_qs(parts.query)
+            for key in ("videoId", "video_id", "v"):
+                values = query.get(key, [])
+                if len(values) == 1:
+                    url = normalize_published_video_url(f"https://youtu.be/{values[0]}")
+                    if url:
+                        return url
+            path_parts = [part for part in parts.path.split("/") if part]
+            for index, part in enumerate(path_parts[:-1]):
+                if part.lower() in {"video", "videos"}:
+                    url = normalize_published_video_url(f"https://youtu.be/{path_parts[index + 1]}")
+                    if url:
+                        return url
+    except Exception:
+        pass
     return ""
 
 
@@ -2044,17 +2454,16 @@ class _StudioBrowserSession:
                 "device_scale_factor": 1.0,
             })
 
-        proxy_val = (self.channel.get("proxy") or "").strip()
-        if proxy_val:
-            p_parts = proxy_val.split(":")
-            if len(p_parts) == 2:
-                ctx_kwargs["proxy"] = {"server": f"http://{p_parts[0]}:{p_parts[1]}"}
-            elif len(p_parts) >= 4:
-                ctx_kwargs["proxy"] = {
-                    "server": f"http://{p_parts[0]}:{p_parts[1]}",
-                    "username": p_parts[2],
-                    "password": p_parts[3],
-                }
+        proxy_config = _parse_channel_proxy(self.channel)
+        if proxy_config:
+            ctx_kwargs["proxy"] = {
+                "server": f"http://{proxy_config['host']}:{proxy_config['port']}"
+            }
+            if proxy_config["username"]:
+                ctx_kwargs["proxy"].update({
+                    "username": proxy_config["username"],
+                    "password": proxy_config["password"],
+                })
 
         if self.chrome_exe:
             ctx_kwargs["executable_path"] = self.chrome_exe
@@ -2112,7 +2521,7 @@ def upload_via_playwright_studio(
     prof_name = channel.get("profile_name") or f"channel_{channel.get('id', 'default')}"
     prof_path = channel.get("profile_path") or str(APP_PROFILES_DIR / prof_name)
     ad_id = _channel_antidetect_id(channel)
-    if not ad_id and str(prof_path).startswith("antidetect://"):
+    if not ad_id and str(prof_path).lower().startswith("antidetect://"):
         raise RuntimeError(
             f"Profile '{prof_name}' được đánh dấu thuộc Antidetect nhưng chưa có ID liên kết. "
             "Hãy bấm 'Đồng Bộ Antidetect' trong tab Quản Lý Kênh rồi thử lại."
@@ -2149,12 +2558,13 @@ def upload_via_playwright_studio(
             init_scripts = browser_session.init_scripts
             draft_created = False
             publish_clicked = False
+            draft_preserve_for_review = False
+            checks_safe_seen = False
             try:
                 if progress_callback:
                     progress_callback(20, f"Đang mở YouTube Studio ({'📱 Giả lập Điện thoại' if is_mobile_mode else '💻 Máy tính'})...")
 
                 page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(3000)
 
                 try:
                     cont_btn = page.locator(
@@ -2164,7 +2574,6 @@ def upload_via_playwright_studio(
                     ).first
                     if cont_btn.count() > 0 and cont_btn.is_visible():
                         cont_btn.click()
-                        page.wait_for_timeout(3000)
                 except Exception as cont_err:
                     _log_optional_step_failure("bấm Continue to Studio", cont_err, channel, metadata)
 
@@ -2195,33 +2604,27 @@ def upload_via_playwright_studio(
                 if progress_callback:
                     progress_callback(30, "Mở hộp thoại tải video lên...")
 
-                # Mô phỏng người thật: Dừng ngẫu nhiên và lướt chuột nhẹ qua bảng Dashboard Studio trước khi bấm Tạo
-                try:
-                    import random
-                    page.mouse.move(random.randint(300, 650), random.randint(180, 400), steps=random.randint(14, 22))
-                    page.wait_for_timeout(random.randint(1200, 2200))
-                except Exception:
-                    pass
-
                 create_btn = page.locator("#create-icon, ytcp-button#create-icon, [aria-label*='Create' i], [aria-label*='Tạo' i]").first
-                if create_btn.count() > 0:
-                    human_move_and_click(page, create_btn, delay_after=1000)
-                    upload_menu = page.locator("#text-item-0, tp-yt-paper-item:has-text('Upload'), tp-yt-paper-item:has-text('Tải video')").first
-                    if upload_menu.count() > 0:
-                        human_move_and_click(page, upload_menu, delay_after=1200)
+                create_btn.wait_for(state="visible", timeout=30000)
+                human_move_and_click(page, create_btn, delay_after=0)
+                upload_menu = page.locator(
+                    "#text-item-0, tp-yt-paper-item:has-text('Upload'), tp-yt-paper-item:has-text('Tải video')"
+                ).first
+                upload_menu.wait_for(state="visible", timeout=10000)
+                human_move_and_click(page, upload_menu, delay_after=0)
 
                 file_input = page.locator("input[type='file']").first
+                file_input.wait_for(state="attached", timeout=15000)
                 file_input.set_input_files(video_path, timeout=30000)
                 draft_created = True
-                page.wait_for_timeout(2500)
+                if progress_callback:
+                    progress_callback(40, "Đang chuyển file lên YouTube Studio...")
 
                 if progress_callback:
                     progress_callback(45, "Đang điền Tiêu đề, Mô tả (Mô phỏng gõ phím người thật)...")
 
-                page.wait_for_selector("#title-textarea #textbox, #textbox[aria-label]", timeout=30000)
-                page.wait_for_timeout(2000)
-
                 title_box = page.locator("#title-textarea #textbox, #textbox").first
+                title_box.wait_for(state="visible", timeout=120000)
                 simulate_human_type(page, title_box, metadata["title"], is_long_text=False)
 
                 desc_box = page.locator("#description-textarea #textbox").first
@@ -2245,14 +2648,9 @@ def upload_via_playwright_studio(
                         "tp-yt-paper-radio-button:has-text('No, it\\'s not made for kids'), "
                         "tp-yt-paper-radio-button:has-text('Không, nội dung này không dành cho trẻ em')"
                     ).first
-                if mfk_radio.count() > 0:
-                    human_move_and_click(page, mfk_radio, delay_after=600)
-                    try:
-                        if (mfk_radio.get_attribute("aria-checked") or "").lower() != "true":
-                            mfk_radio.click(force=True)
-                            page.wait_for_timeout(600)
-                    except Exception as mfk_err:
-                        _log_optional_step_failure("xác nhận đối tượng trẻ em", mfk_err, channel, metadata)
+                _set_radio_and_verify(
+                    page, mfk_radio, bool(metadata.get("made_for_kids")), "Dành cho trẻ em"
+                )
 
                 # Mở rộng phần "Hiển thị thêm" (Show more) TRƯỚC để nhìn thấy mục Giới hạn độ tuổi & Nhãn AI
                 human_scroll(page, delta_y=300)
@@ -2260,7 +2658,6 @@ def upload_via_playwright_studio(
                 if toggle_more.count() > 0 and toggle_more.is_visible():
                     human_move_and_click(page, toggle_more, delay_after=900)
 
-                age_confirmed = False
                 try:
                     human_scroll(page, delta_y=220)
                     age_section = page.locator(
@@ -2277,41 +2674,25 @@ def upload_via_playwright_studio(
                     if age_section.count() > 0 and (not age_visible or age_group.get_attribute("hidden") is not None):
                         human_move_and_click(page, age_section, delay_after=700)
 
+                    age_group.wait_for(state="visible", timeout=10000)
+
                     if metadata.get("age_restriction"):
-                        age_radio = page.locator(
-                            "tp-yt-paper-radio-button[name='VIDEO_AGE_RESTRICTION_RESTRICTED'], "
-                            "tp-yt-paper-radio-button:has-text('Yes, restrict my video'), "
-                            "tp-yt-paper-radio-button:has-text('Có, giới hạn video')"
+                        age_radio = age_group.locator(
+                            "tp-yt-paper-radio-button[name='VIDEO_AGE_RESTRICTION_RESTRICTED']"
                         ).first
                     else:
-                        age_radio = page.locator(
+                        age_radio = age_group.locator(
                             "tp-yt-paper-radio-button[name='VIDEO_AGE_RESTRICTION_NONE'], "
-                            "tp-yt-paper-radio-button[name='VIDEO_AGE_RESTRICTION_NOT_RESTRICTED'], "
-                            "tp-yt-paper-radio-button:has-text('No, don\\'t restrict'), "
-                            "tp-yt-paper-radio-button:has-text('Không, đừng giới hạn')"
+                            "tp-yt-paper-radio-button[name='VIDEO_AGE_RESTRICTION_NOT_RESTRICTED']"
                         ).first
-                    if age_radio.count() > 0 and age_radio.is_visible():
-                        human_move_and_click(page, age_radio, delay_after=500)
-                        if (age_radio.get_attribute("aria-checked") or "").lower() != "true":
-                            age_radio.click(force=True)
-                            page.wait_for_timeout(600)
-                        age_confirmed = (age_radio.get_attribute("aria-checked") or "").lower() == "true"
+                    _set_radio_and_verify(
+                        page, age_radio, bool(metadata.get("age_restriction")), "Giới hạn độ tuổi"
+                    )
                 except Exception as age_err:
-                    _log_optional_step_failure("thiết lập giới hạn độ tuổi", age_err, channel, metadata)
-
-                if metadata.get("age_restriction") and not age_confirmed:
-                    age_error = (
-                        "Không xác nhận được tuỳ chọn giới hạn độ tuổi 18+ trên YouTube Studio. "
-                        "Đã dừng trước khi đăng để tránh video sai độ tuổi."
-                    )
-                    add_log(
-                        "Upload",
-                        f"🛑 {age_error}",
-                        "ERROR",
-                        channel_name=channel.get("name", ""),
-                        video_title=metadata.get("title", ""),
-                    )
-                    raise RuntimeError(age_error)
+                    raise RuntimeError(
+                        f"Không xác nhận được lựa chọn Giới hạn độ tuổi trên Studio: {age_err}. "
+                        "Đã dừng trước khi gửi đăng."
+                    ) from age_err
 
                 if thumbnail_path and os.path.exists(thumbnail_path):
                     try:
@@ -2322,16 +2703,18 @@ def upload_via_playwright_studio(
                     except Exception as thumb_err:
                         _log_optional_step_failure("tải thumbnail", thumb_err, channel, metadata)
 
-                try:
-                    human_scroll(page, delta_y=220)
-                    if metadata.get("altered_content"):
-                        alt_radio = page.locator("tp-yt-paper-radio-button[name='VIDEO_ALTERED_CONTENT_YES'], tp-yt-paper-radio-button:has-text('Yes'), tp-yt-paper-radio-button:has-text('Có')").first
-                    else:
-                        alt_radio = page.locator("tp-yt-paper-radio-button[name='VIDEO_ALTERED_CONTENT_NO'], tp-yt-paper-radio-button:has-text('No'), tp-yt-paper-radio-button:has-text('Không')").first
-                    if alt_radio.count() > 0 and alt_radio.is_visible():
-                        human_move_and_click(page, alt_radio, delay_after=500)
-                except Exception as alt_err:
-                    _log_optional_step_failure("chọn nhãn nội dung AI", alt_err, channel, metadata)
+                human_scroll(page, delta_y=220)
+                if metadata.get("altered_content"):
+                    alt_radio = page.locator(
+                        "tp-yt-paper-radio-button[name='VIDEO_ALTERED_CONTENT_YES']"
+                    ).first
+                else:
+                    alt_radio = page.locator(
+                        "tp-yt-paper-radio-button[name='VIDEO_ALTERED_CONTENT_NO']"
+                    ).first
+                _set_radio_and_verify(
+                    page, alt_radio, bool(metadata.get("altered_content")), "Nhãn nội dung AI"
+                )
 
                 if metadata["tags"]:
                     tags_input = page.locator("input[aria-label*='Tags' i], input[aria-label*='Thẻ' i], #text-input").first
@@ -2360,16 +2743,44 @@ def upload_via_playwright_studio(
                     progress_callback(75, "Đang ở Bước Kiểm Duyệt (Checks) - Theo dõi quét bản quyền Content ID...")
 
                 max_checks_wait = max(30, int(settings.get("checks_timeout_seconds", 120) or 120))
-                start_wait = time.time()
+                start_wait = time.monotonic()
+                checks_deadline = start_wait + max_checks_wait
                 soft_warning_note = ""
                 soft_warned = False
-                checks_safe_seen = False
                 last_checks_text = ""
                 last_probe_error = ""
 
-                while time.time() - start_wait < max_checks_wait:
-                    page.wait_for_timeout(3000)
-                    elapsed = int(time.time() - start_wait)
+                while time.monotonic() < checks_deadline:
+                    elapsed = int(time.monotonic() - start_wait)
+                    wait_slice_ms = max(1, min(5000, int((checks_deadline - time.monotonic()) * 1000)))
+                    try:
+                        page.wait_for_function(
+                            """({safe, violation, processing}) => {
+                                const el = document.querySelector(
+                                    'ytcp-uploads-checks, #checks-content, div[test-id="checks-content"]'
+                                );
+                                if (!el || !el.getClientRects().length) return false;
+                                const text = (el.innerText || '').toLowerCase();
+                                return (safe.some(value => text.includes(value))
+                                    && !processing.some(value => text.includes(value)))
+                                    || violation.some(value => text.includes(value));
+                            }""",
+                            arg={
+                                "safe": _CHECKS_SAFE_KEYWORDS,
+                                "violation": _CHECKS_VIOLATION_KEYWORDS,
+                                "processing": _CHECKS_PROCESSING_KEYWORDS,
+                            },
+                            timeout=wait_slice_ms,
+                            polling="mutation",
+                        )
+                    except Exception as wait_err:
+                        if time.monotonic() >= checks_deadline:
+                            last_probe_error = str(wait_err)
+                            break
+                        cur_pct = min(84, 75 + int(elapsed * 9 / max_checks_wait))
+                        if progress_callback:
+                            progress_callback(cur_pct, f"YouTube đang chạy Checks... ({elapsed}s)")
+                        continue
 
                     chk = check_copyright_and_violations(page)
                     if chk.get("probe_error"):
@@ -2407,19 +2818,12 @@ def upload_via_playwright_studio(
                             progress_callback(80, f"⚠️ {soft_warning_note} — tiếp tục đăng...")
 
                     try:
-                        checks_container = page.locator("ytcp-uploads-checks, #checks-content, div[test-id='checks-content']").first
-                        scope = checks_container if (checks_container.count() > 0 and checks_container.is_visible()) else page
-                        last_checks_text = (scope.inner_text() or "").lower()
-
+                        last_checks_text = _read_checks_text(page)
                         if checks_report_safe(last_checks_text):
                             checks_safe_seen = True
                             break
                     except Exception as read_err:
                         last_probe_error = str(read_err)
-
-                    cur_pct = min(84, 75 + int(elapsed * 9 / max_checks_wait))
-                    if progress_callback:
-                        progress_callback(cur_pct, f"Đang kiểm duyệt bản quyền Content ID... ({elapsed}s)")
 
                 final_chk = check_copyright_and_violations(page)
                 if final_chk["has_violation"]:
@@ -2440,14 +2844,13 @@ def upload_via_playwright_studio(
                 if not checks_safe_seen:
                     # Đọc lại lần cuối: YouTube có thể vừa hiện "No issues found" ngay sát hạn chờ.
                     try:
-                        checks_container = page.locator("ytcp-uploads-checks, #checks-content, div[test-id='checks-content']").first
-                        scope = checks_container if (checks_container.count() > 0 and checks_container.is_visible()) else page
-                        last_checks_text = (scope.inner_text() or "").lower()
+                        last_checks_text = _read_checks_text(page)
                         checks_safe_seen = checks_report_safe(last_checks_text)
                     except Exception as read_err:
                         last_probe_error = str(read_err)
 
                 if not checks_safe_seen:
+                    draft_preserve_for_review = True
                     checks_error = (
                         f"Không xác nhận được kết quả kiểm duyệt an toàn sau {max_checks_wait}s "
                         "(YouTube chưa báo hoàn tất hoặc nội dung trạng thái không xác định). "
@@ -2477,13 +2880,11 @@ def upload_via_playwright_studio(
                 if progress_callback:
                     progress_callback(85, "Kiểm duyệt an toàn (No issues found) ✔️. Chuyển sang bước Khả năng hiển thị...")
 
-                page.wait_for_timeout(1000)
                 next_btn = page.locator("#next-button").first
                 if next_btn.count() > 0 and next_btn.is_visible():
-                    human_move_and_click(page, next_btn, delay_after=1800)
+                    human_move_and_click(page, next_btn, delay_after=0)
 
                 privacy_status = metadata["privacy_status"]
-                page.wait_for_timeout(1400)
 
                 if privacy_status == "schedule":
                     sched_str = (metadata.get("schedule_time") or "").strip()
@@ -2503,7 +2904,7 @@ def upload_via_playwright_studio(
                         raise RuntimeError(
                             "Không tìm thấy tuỳ chọn Lên lịch trên YouTube Studio. Đã dừng để tránh đăng Công khai nhầm."
                         )
-                    human_move_and_click(page, sched_radio, delay_after=1500)
+                    _set_radio_and_verify(page, sched_radio, True, "Lên lịch")
 
                     try:
                         from datetime import datetime
@@ -2539,17 +2940,18 @@ def upload_via_playwright_studio(
                             raise RuntimeError("Ô ngày đăng bị trống sau khi điền.")
                         if not (time_input.input_value() or "").strip():
                             raise RuntimeError("Ô giờ đăng bị trống sau khi điền.")
+                        if not _schedule_values_match(
+                            date_input.input_value(), time_input.input_value(), dt_obj
+                        ):
+                            raise RuntimeError(
+                                "Giờ/ngày đọc lại từ YouTube Studio không khớp lịch đã yêu cầu."
+                            )
                     except RuntimeError:
                         raise
                     except Exception as sched_err:
                         raise RuntimeError(
                             f"Không điền được ngày giờ hẹn lịch ({sched_str}): {sched_err}. "
                             "Đã dừng để tránh đăng sai giờ hoặc đăng Công khai nhầm."
-                        )
-
-                    if not _is_radio_checked(sched_radio):
-                        raise RuntimeError(
-                            "Chưa xác nhận được tuỳ chọn Lên lịch trên Studio. Đã dừng để tránh đăng Công khai nhầm."
                         )
 
                     if metadata.get("is_premiere"):
@@ -2580,13 +2982,7 @@ def upload_via_playwright_studio(
                             f"Không tìm thấy tuỳ chọn hiển thị {radio_name} trên Studio. "
                             "Đã dừng để tránh đăng sai trạng thái."
                         )
-                    human_move_and_click(page, vis_radio, delay_after=1200)
-
-                    if not _is_radio_checked(vis_radio):
-                        raise RuntimeError(
-                            f"Chưa xác nhận được trạng thái hiển thị {radio_name} trên Studio. "
-                            "Đã dừng để tránh đăng sai trạng thái."
-                        )
+                    _set_radio_and_verify(page, vis_radio, True, f"Hiển thị {radio_name}")
 
                     if radio_name == "PUBLIC" and metadata.get("is_premiere"):
                         prem_inst = page.locator(
@@ -2600,25 +2996,34 @@ def upload_via_playwright_studio(
                 video_url = ""
 
                 # Bấm nút Xuất bản / Lên lịch / Lưu
-                page.wait_for_timeout(2000)
                 done_btn = page.locator(
                     "#done-button, ytcp-button#done-button, ytcp-button:has-text('Publish'), "
                     "ytcp-button:has-text('Schedule'), ytcp-button:has-text('Save'), "
                     "ytcp-button:has-text('Lưu'), ytcp-button:has-text('Xuất bản')"
                 ).first
-                human_move_and_click(page, done_btn, delay_after=3000)
-                # Từ đây video đã được gửi đăng: TUYỆT ĐỐI không tự xóa nháp nếu bước sau lỗi.
+                done_btn.wait_for(state="visible", timeout=15000)
+                if not done_btn.is_enabled():
+                    raise RuntimeError("Nút Xuất bản/Lên lịch chưa sẵn sàng trên YouTube Studio.")
+                studio_url_before_publish = str(page.url or "")
+                if progress_callback:
+                    progress_callback(92, "Đang gửi yêu cầu Xuất bản/Lên lịch lên YouTube Studio...")
+                # Mark intent before dispatch: Playwright can lose the connection
+                # after the click was sent but before it reports success.
                 publish_clicked = True
+                human_move_and_click(page, done_btn, delay_after=3000)
+                # Từ đây video có thể đã được gửi đăng: TUYỆT ĐỐI không tự xóa nháp.
 
                 # Chờ hộp thoại chia sẻ để lấy URL video THẬT làm bằng chứng đăng thành công.
                 try:
                     share_dialog = page.locator("ytcp-video-share-dialog").first
                     share_dialog.wait_for(state="visible", timeout=20000)
-                    page.wait_for_timeout(1500)
                 except Exception as dialog_err:
                     _log_optional_step_failure("chờ hộp thoại chia sẻ sau khi đăng", dialog_err, channel, metadata)
 
-                verified_url = extract_published_video_url(page) or video_url
+                if progress_callback:
+                    progress_callback(96, "Đã gửi yêu cầu; đang xác minh URL video từ Studio...")
+
+                verified_url = extract_published_video_url(page, studio_url_before_publish) or video_url
 
                 # Đóng hộp thoại xác nhận hoàn tất của Studio để Cookie phiên kịp đồng bộ
                 try:
@@ -2628,17 +3033,12 @@ def upload_via_playwright_studio(
                         "ytcp-button#close-icon-button"
                     ).first
                     close_share_dialog.wait_for(state="visible", timeout=15000)
-                    page.wait_for_timeout(1500)
-                    human_move_and_click(page, close_share_dialog, delay_after=1500)
+                    human_move_and_click(page, close_share_dialog, delay_after=0)
                 except Exception as dialog_err:
                     _log_optional_step_failure("đóng hộp thoại xác nhận đăng", dialog_err, channel, metadata)
-                    page.wait_for_timeout(5000)
-
-                # Chờ thêm 2 giây ở trang Dashboard Studio để hoàn tất các request xoay vòng Token (SIDCC)
-                page.wait_for_timeout(2000)
 
                 if not verified_url:
-                    verified_url = extract_published_video_url(page)
+                    verified_url = extract_published_video_url(page, studio_url_before_publish)
 
                 if not verified_url:
                     uncertain_msg = (
@@ -2693,7 +3093,7 @@ def upload_via_playwright_studio(
                         channel_name=channel.get("name", ""),
                         video_title=metadata.get("title", ""),
                     )
-                elif draft_created and page is not None:
+                elif draft_created and page is not None and not draft_preserve_for_review:
                     try:
                         add_log(
                             "Upload",
@@ -2716,6 +3116,14 @@ def upload_via_playwright_studio(
                             channel_name=channel.get("name", ""),
                             video_title=metadata.get("title", ""),
                         )
+                elif draft_created and draft_preserve_for_review:
+                    add_log(
+                        "Upload",
+                        "Giữ bản nháp để đối soát vì Checks chưa xác nhận trạng thái an toàn; không tự xóa video.",
+                        "WARNING",
+                        channel_name=channel.get("name", ""),
+                        video_title=metadata.get("title", ""),
+                    )
                 raise
 
 
@@ -2728,26 +3136,11 @@ def upload_video_to_youtube(
     """
     Hàm điều phối trung tâm: Tự động chọn phương thức đăng (Playwright YouTube Studio hoặc YouTube Data API v3).
     """
+    metadata = validate_upload_preflight(video_item, channel, option_group)
+    mode = (channel.get("upload_mode") or "playwright").strip().lower()
     video_path = video_item.get("output_video_path") or video_item.get("input_video_path") or ""
     if not video_path or not os.path.exists(video_path):
         raise FileNotFoundError(f"Không tìm thấy file video để upload: {video_path}")
-
-    metadata = build_final_metadata(video_item, channel, option_group)
-    mode = (channel.get("upload_mode") or "playwright").lower()
-
-    if not (channel.get("channel_id") or "").strip():
-        raise RuntimeError(
-            f"Kênh '{channel.get('name') or channel.get('handle') or '?'}' chưa có Channel ID. "
-            "Không thể xác minh chính xác kênh nhận video — hãy bấm 'Refresh Kênh' hoặc nhập Channel ID "
-            "trong tab Quản Lý Kênh trước khi đăng."
-        )
-
-    if _channel_antidetect_id(channel) and mode == "youtube_api":
-        raise RuntimeError(
-            f"Kênh '{channel.get('name') or channel.get('handle') or '?'}' dùng Profile Antidetect nên "
-            "không thể đăng bằng YouTube Data API (sẽ đi sai proxy/fingerprint). "
-            "Hãy chuyển kênh sang chế độ đăng 'playwright' (YouTube Studio)."
-        )
 
     if mode == "youtube_api":
         return upload_via_youtube_api(
@@ -2765,3 +3158,38 @@ def upload_video_to_youtube(
             thumbnail_path=video_item.get("thumbnail_path") or "",
             progress_callback=progress_callback,
         )
+
+
+def validate_upload_preflight(
+    video_item: Dict[str, Any],
+    channel: Dict[str, Any],
+    option_group: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Validate channel ownership and final metadata before download/render work starts."""
+    if not (channel.get("channel_id") or "").strip():
+        raise RuntimeError(
+            f"Kênh '{channel.get('name') or channel.get('handle') or '?'}' chưa có Channel ID. "
+            "Hãy đồng bộ hoặc nhập Channel ID trước khi chạy video."
+        )
+    metadata = build_final_metadata(video_item, channel, option_group)
+    mode = (channel.get("upload_mode") or "playwright").strip().lower()
+    ad_id = _channel_antidetect_id(channel)
+    if mode == "youtube_api":
+        if ad_id:
+            raise RuntimeError(
+                f"Kênh '{channel.get('name') or channel.get('handle') or '?'}' dùng Profile Antidetect nên "
+                "không thể đăng bằng YouTube Data API. Hãy dùng YouTube Studio với đúng Profile Antidetect."
+            )
+        unsupported = []
+        if metadata.get("age_restriction"):
+            unsupported.append("giới hạn độ tuổi 18+")
+        if metadata.get("is_premiere"):
+            unsupported.append("Công chiếu")
+        if unsupported:
+            raise RuntimeError(
+                "YouTube Data API hiện không thể xác minh/thiết lập " + ", ".join(unsupported)
+                + "; hãy chuyển sang YouTube Studio trước khi tải hoặc render video."
+            )
+    if not ad_id:
+        _parse_channel_proxy(channel)
+    return metadata

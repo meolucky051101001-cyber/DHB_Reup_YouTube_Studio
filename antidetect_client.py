@@ -475,9 +475,10 @@ def resolve_antidetect_profile_id(channel: Dict[str, Any]) -> str:
     if explicit:
         return explicit
 
-    profile_path = str(channel.get("profile_path") or "")
-    if profile_path.startswith("antidetect://"):
-        return profile_path.split("antidetect://", 1)[1].split("/", 1)[0].strip()
+    profile_path = str(channel.get("profile_path") or "").strip()
+    antidetect_prefix = "antidetect://"
+    if profile_path.lower().startswith(antidetect_prefix):
+        return profile_path[len(antidetect_prefix):].split("/", 1)[0].strip()
 
     profile_name = str(channel.get("profile_name") or "").strip()
     if not profile_name:

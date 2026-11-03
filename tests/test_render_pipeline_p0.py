@@ -58,9 +58,9 @@ class IntroOutroConcatTests(unittest.TestCase):
             fc = _filter_complex_of(captured["cmd"])
 
             # Main (i=0) đã đúng khung, outro (i=1) phải được scale/pad về cùng khung
-            self.assertIn("[0:v]fps=30", fc)
+            self.assertIn("[0:v]setpts=PTS-STARTPTS,fps=30", fc)
             self.assertNotIn("[0:v]scale=", fc)
-            self.assertIn("[1:v]scale=1080:1920", fc)
+            self.assertIn("[1:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
             self.assertIn("pad=1080:1920", fc)
             self.assertIn("concat=n=2:v=1:a=1", fc)
             self.assertEqual(captured["kwargs"]["owner"], "monitor")
@@ -77,10 +77,10 @@ class IntroOutroConcatTests(unittest.TestCase):
             captured = self._apply(intro, outro, str(main))
             fc = _filter_complex_of(captured["cmd"])
 
-            self.assertIn("[0:v]scale=1080:1920", fc)
-            self.assertIn("[1:v]fps=30", fc)
+            self.assertIn("[0:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
+            self.assertIn("[1:v]setpts=PTS-STARTPTS,fps=30", fc)
             self.assertNotIn("[1:v]scale=", fc)
-            self.assertIn("[2:v]scale=1080:1920", fc)
+            self.assertIn("[2:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
             self.assertIn("concat=n=3:v=1:a=1", fc)
 
 
@@ -134,7 +134,8 @@ class FFmpegOrphanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             partial = str(Path(td) / "partial.mp4")
             Path(partial).write_bytes(b"x")
-            with mock.patch("render_engine.subprocess.Popen", return_value=fake):
+            with mock.patch("render_engine.subprocess.Popen", return_value=fake), \
+                    mock.patch("render_engine.subprocess.run", side_effect=lambda *a, **k: fake.kill()):
                 with self.assertRaises(RuntimeError):
                     render_engine._run_ffmpeg_with_progress(
                         ["ffmpeg"], 10.0, progress, partial_output=partial, owner="batch",
@@ -156,7 +157,8 @@ class FFmpegOrphanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             partial = str(Path(td) / "partial.mp4")
             Path(partial).write_bytes(b"x")
-            with mock.patch("render_engine.subprocess.Popen", return_value=fake):
+            with mock.patch("render_engine.subprocess.Popen", return_value=fake), \
+                    mock.patch("render_engine.subprocess.run", side_effect=lambda *a, **k: fake.kill()):
                 with self.assertRaises(InterruptedError):
                     render_engine._run_ffmpeg_with_progress(
                         ["ffmpeg"], 10.0, progress,
@@ -186,7 +188,10 @@ class OwnerScopedKillTests(unittest.TestCase):
             render_engine._ACTIVE_FFMPEG_PROCS[111] = (batch_proc, "batch")
             render_engine._ACTIVE_FFMPEG_PROCS[222] = (monitor_proc, "monitor")
 
-        with mock.patch.object(render_engine, "_kill_stray_tool_ffmpeg") as stray:
+        with mock.patch(
+            "render_engine.subprocess.run",
+            side_effect=lambda cmd, **kwargs: batch_proc.kill(),
+        ) as taskkill:
             render_engine.kill_all_render_processes(owner="batch")
 
         self.assertTrue(batch_proc.killed)
@@ -194,7 +199,10 @@ class OwnerScopedKillTests(unittest.TestCase):
         self.assertEqual(monitor_proc.wait_calls, 0)
         self.assertIn(222, render_engine._ACTIVE_FFMPEG_PROCS)
         self.assertNotIn(111, render_engine._ACTIVE_FFMPEG_PROCS)
-        stray.assert_not_called()
+        if os.name == "nt":
+            self.assertEqual(taskkill.call_args[0][0], ["taskkill", "/PID", "111", "/T", "/F"])
+        else:
+            taskkill.assert_not_called()
 
     def test_global_kill_stops_every_lane(self):
         batch_proc = _FakeFFmpegProc(111, [])
@@ -203,13 +211,17 @@ class OwnerScopedKillTests(unittest.TestCase):
             render_engine._ACTIVE_FFMPEG_PROCS[111] = (batch_proc, "batch")
             render_engine._ACTIVE_FFMPEG_PROCS[222] = (monitor_proc, "monitor")
 
-        with mock.patch.object(render_engine, "_kill_stray_tool_ffmpeg") as stray:
+        def _kill_pid(cmd, **kwargs):
+            pid = int(cmd[2])
+            {111: batch_proc, 222: monitor_proc}[pid].kill()
+
+        with mock.patch("render_engine.subprocess.run", side_effect=_kill_pid) as taskkill:
             render_engine.kill_all_render_processes()
 
         self.assertTrue(batch_proc.killed)
         self.assertTrue(monitor_proc.killed)
         self.assertEqual(render_engine._ACTIVE_FFMPEG_PROCS, {})
-        self.assertEqual(stray.call_count, 1 if os.name == "nt" else 0)
+        self.assertEqual(taskkill.call_count, 2 if os.name == "nt" else 0)
 
 
 class _FakeCursor:
@@ -277,6 +289,8 @@ class RenderOwnerPropagationTests(unittest.TestCase):
             with mock.patch.object(pm, "get_conn", side_effect=lambda: _FakeConn(row)), \
                     mock.patch.object(pm, "add_log"), \
                     mock.patch.object(pm, "get_settings", return_value={}), \
+                    mock.patch.object(pm, "sha256_file", return_value="test-fingerprint"), \
+                    mock.patch.object(pm, "_store_content_fingerprint", return_value="stored"), \
                     mock.patch.object(
                         pm.render_queue, "submit",
                         return_value=_FakeFuture(str(output_path)),

@@ -1,4 +1,37 @@
 # CHANGELOG — DHB Reup YouTube Studio
+## 2026-11-03 — Đợt 5: tải, render và quản lý dung lượng
+
+- ffprobe fail-closed khi file thiếu, hỏng JSON, không có video stream, thiếu kích thước hoặc thời lượng hợp lệ; downloader dùng prefix UUID, timeout/retry hữu hạn, cookies Netscape tùy chọn, worker process riêng để dừng cây tiến trình, kiểm tra video đầu ra và dọn riêng partial của lượt tải.
+- Render xác thực speed dùng chung, timeline audio/video theo speed, padding/cắt audio, nhạc nền lặp theo video, audio im lặng cho nguồn câm; kiểm tra output bằng ffprobe trước khi queue nhận trạng thái Rendered. FFmpeg có watchdog thời gian im lặng/thời hạn tổng, giới hạn log và kill/reap cây tiến trình thuộc job.
+- Chuẩn hóa và giới hạn path tài nguyên nhạc/font/logo/intro/outro; thiếu asset được báo lỗi rõ. Tên output chịu được Unicode/dấu cách và ký tự đặc biệt qua argv với `shell=False`.
+- Thêm manifest `managed_artifacts`, ước lượng dung lượng trước tải/render, thống kê dung lượng và preview dọn file theo lựa chọn rõ ràng. Dọn chỉ áp dụng artifact đã đăng ký trong thư mục quản lý, kiểm tra tuổi lưu, symlink, common-path và tham chiếu queue; giữ file NeedsReview. UI hiển thị dung lượng và bản xem trước; housekeeping giữ 5.000 log gần nhất.
+- Kiểm tra sau rà soát: suite cô lập `144 passed`, `5 deselected`, `4 subtests passed`; gồm media FFmpeg nhỏ, dừng downloader, probe, hợp đồng output và cleanup manifest. `py_compile`, `node --check static/app.js`, `git diff --check` pass. Đã sửa logger best-effort để lỗi ghi manifest/log không biến output hợp lệ thành render fail. Không chạy 5 SmokeTests vì TestClient bị treo; bỏ qua hai suite Antidetect/Studio cần server tích hợp. Chưa migration DB vận hành, server live hay YouTube Studio thật; chưa commit.
+
+## 2026-11-03 — Đợt 4: phân phối nhóm, lịch và nhập dữ liệu
+
+- Thêm schema nhóm kênh có version, bảng membership nhiều nhóm/kênh; backfill dữ liệu cũ, dedupe kênh khi hợp nhất nhóm và giữ thứ tự chọn ổn định. Queue lưu các nhóm đích và kênh được phân công; batch kiểm tra đích rồi ghi assignment trước khi chạy. Đích bị xóa/đổi thành viên sẽ bị chặn để người dùng xác nhận lại; job đang chạy giữ nguyên kênh đã gán.
+- Bổ sung preview phân phối theo video/kênh/nhóm/visibility/lịch, cảnh báo lịch sử trùng và lý do bị chặn. UI có preview trước khi chạy, multiselect nhóm, sửa/xóa nhóm và giữ option đích đã mất để người dùng nhận biết.
+- Chuẩn hóa URL, metadata, render, visibility, lịch, audience; kiểm tra trạng thái cuối sau merge. Lịch thiếu giờ, ở quá khứ hoặc mâu thuẫn visibility bị từ chối. File upload và đường dẫn local hỗ trợ lịch nhiều video giãn tối thiểu 30 phút.
+- CSV/Excel có preview trước khi ghi, thống kê dòng hợp lệ/trùng/bỏ qua/lỗi và lỗi theo số dòng. Excel kiểm tra nhóm, profile/kênh, audience và schedule; cập nhật theo transaction, không áp dụng một phần khi dòng đích bắt đầu chạy. Cập nhật bulk có transaction và đếm số hàng thực sự đổi.
+- Kênh tạo tự động từ Profile/Studio, video quét, CSV, Monitor, upload file và local path được ghi vào schema nhóm có version. Xóa Profile cũng xóa membership mồ côi. Tài nguyên JavaScript đổi thành `app.js?v=23`.
+- Kiểm tra tĩnh sau sửa: `py_compile` cho các module đợt 4 và `node --check static/app.js` pass. Chưa chạy bộ test, migration DB vận hành, server live, Antidetect hoặc YouTube Studio thật.
+
+## 2026-11-03 — Rà soát đợt 2 và gia cố uploader, Studio, Antidetect (đợt 3)
+
+- Rà soát luồng đợt 2: xác nhận đăng thủ công nay chỉ nhận URL video YouTube hợp lệ và lưu URL chuẩn; đăng lại item trong nhóm bị chặn nếu không xác định được kênh đích. Uploader trả URL sai miền/ID sẽ chuyển `NeedsReview`, không ghi history và không nhả reservation. History cũ được bổ sung URL nguồn, `content_key` và URL đã đăng khi có bằng chứng từ queue.
+- Resumable YouTube API kiểm tra session URL Google HTTPS, đọc `Range` sau phản hồi 308, hỏi trạng thái phiên trước retry khi mất kết nối/5xx, giới hạn retry và fail-closed khi phiên hết hạn. Sau upload, đợi xử lý và đọc lại metadata/trạng thái từ YouTube API. Metadata API không hỗ trợ được chặn ở preflight trước download/render.
+- Studio chỉ tiếp tục khi Checks đọc được trạng thái an toàn; trạng thái chưa rõ hoặc thiếu panel được giữ để review thủ công. Đọc lại đối tượng khán giả, giới hạn tuổi, khai báo synthetic media, visibility và lịch trước khi publish; xác định URL từ hộp Share hiện tại và không dùng URL trang Studio cũ làm kết quả.
+- Antidetect: proxy/assignment sai định dạng fail-closed; login, probe và upload đồng bộ bằng khóa theo profile; giữ Antidetect là chủ sở hữu trình duyệt và proxy.
+- Kiểm thử cô lập: `test_p2_quality` 14, `test_p3_uploader` 10, `test_p0_fail_closed` 27, guard đợt 2 13, Antidetect mock 14, identity 5, reservation 7, lifecycle 3 test pass. `py_compile` và `node --check static/app.js` pass. Test tích hợp cần HTTP server Antidetect cục bộ không chạy được trong sandbox; chưa kiểm thử YouTube Studio thật, DB vận hành hay server live.
+
+## 2026-11-03 — Fingerprint bền vững, reservation theo kênh và quyết định đăng lại từng item
+
+- File kéo-thả được SHA-256 ngay trong lúc ghi; file local/tải về được hash toàn bộ ở worker. Fingerprint lưu trên queue và history; không backfill dữ liệu cũ khi thiếu bằng chứng.
+- Reservation SQLite nguyên tử theo khóa nội dung + channel ID được giữ qua thời gian chờ giãn cách, uploader và xác minh. Lịch sử khớp theo channel, giữ các dấu cũ chưa có channel như khóa toàn cục; lịch sử đăng không còn bị dọn sau 90 ngày.
+- Thêm bảng `upload_attempts`; startup phục hồi attempt chưa gửi thành `NotSent` và upload dở thành `NeedsReview`. Lỗi sau khi gọi uploader giữ reservation để đối soát.
+- Bổ sung thao tác cho một item: nhập lý do để cho phép đăng lại; NeedsReview bắt buộc xác nhận chưa đăng hoặc ghi URL đã xác minh. Khi có history, kênh cũ được giữ lại. Bỏ cờ force đăng lại cho cả batch.
+- Không cho xóa item NeedsReview hoặc còn reservation; thao tác giải quyết review sẽ giữ history sau khi queue được dọn.
+- Kiểm tra working copy cô lập: 28 test fingerprint/reservation/history/attempt/migration-report pass; 11 test guard/manual decision/delete pass; 51 test fail-closed, routing còn lại, upload gap và lifecycle pass. `py_compile` và `node --check static/app.js` pass. Chưa chạy migration trên DB vận hành, server đang dùng hay YouTube Studio thật.
 
 ## 2026-11-03 — Khóa một phiên server và phục hồi job sau khi tiến trình dừng
 
