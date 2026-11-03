@@ -69,7 +69,7 @@ from database import (
 )
 from antidetect_client import AntidetectClient, AntidetectError
 from scanner_downloader import scan_social_urls, probe_video_info, probe_video_infos, VIDEO_EXTENSIONS, VideoProbeError
-from ai_engine import ai_optimize_youtube_metadata, apply_batch_text_edit
+from ai_engine import ai_optimize_youtube_metadata, apply_batch_text_edit, SourceLinksTooLongError
 from youtube_uploader import (
     open_profile_for_login,
     probe_profile_login,
@@ -243,7 +243,7 @@ def _housekeeping_worker():
 threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
 pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.03-p6"
+APP_BUILD_VERSION = "2026.11.03-p7-fix1"
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
 API_TOKEN = generate_api_token()
@@ -259,9 +259,9 @@ def _extract_api_token(request: Request) -> str:
 
 
 _JSON_SECRET_KEYS = {
-    "access_token", "refresh_token", "id_token", "auth_token", "session_token",
-    "oauth_token", "oauth_token_json", "api_key", "apikey", "client_secret",
-    "secret", "password", "passwd", "cookie", "authorization",
+    "token", "accesstoken", "refreshtoken", "idtoken", "authtoken", "sessiontoken",
+    "oauthtoken", "oauthtokenjson", "apikey", "clientsecret", "secret",
+    "password", "passwd", "cookie", "authorization",
 }
 
 
@@ -270,13 +270,12 @@ def _redact_json_value(value: Any, secrets: List[str]) -> Any:
     if isinstance(value, dict):
         safe = {}
         for key, child in value.items():
-            normalized_key = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+            normalized_key = re.sub(r"[^a-z0-9]+", "", str(key).lower())
             is_secret = (
                 normalized_key in _JSON_SECRET_KEYS
-                or normalized_key.endswith(("_api_key", "_client_secret", "_password", "_passwd"))
-                or normalized_key.endswith("_token")
+                or normalized_key.endswith(("apikey", "clientsecret", "password", "passwd", "token"))
             )
-            safe[key] = "***" if is_secret and isinstance(child, str) else _redact_json_value(child, secrets)
+            safe[key] = "***" if is_secret and child is not None else _redact_json_value(child, secrets)
         return safe
     if isinstance(value, list):
         return [_redact_json_value(item, secrets) for item in value]
@@ -412,7 +411,7 @@ def get_overview():
     }
 
 
-def _probe_local_tool(label: str, executable: str) -> Dict[str, Any]:
+def _probe_local_tool(label: str, executable: str, version_args: Optional[List[str]] = None) -> Dict[str, Any]:
     command = str(executable or "").strip()
     result: Dict[str, Any] = {
         "name": label,
@@ -426,7 +425,7 @@ def _probe_local_tool(label: str, executable: str) -> Dict[str, Any]:
         return result
     try:
         completed = subprocess.run(
-            [command, "-version"], capture_output=True, text=True, timeout=6, check=False,
+            [command, *(version_args or ["-version"])], capture_output=True, text=True, timeout=6, check=False,
             encoding="utf-8", errors="replace",
         )
         output = (completed.stdout or completed.stderr or "").splitlines()
@@ -497,9 +496,9 @@ def api_diagnostics():
         "storage": storage_summary,
         "heartbeat": heartbeat,
         "tools": [
-            _probe_local_tool("FFmpeg", FFMPEG_EXE),
-            _probe_local_tool("FFprobe", FFPROBE_EXE),
-            _probe_local_tool("yt-dlp", YTDL_EXE),
+            _probe_local_tool("FFmpeg", FFMPEG_EXE, ["-version"]),
+            _probe_local_tool("FFprobe", FFPROBE_EXE, ["-version"]),
+            _probe_local_tool("yt-dlp", YTDL_EXE, ["--version"]),
         ],
     }
 
@@ -2685,37 +2684,44 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
     provider_counts: Dict[str, int] = {}
     fallback_count = 0
     links_preserved = 0
-    for r in rows:
-        item = dict(r)
-        if mode == "batch_edit":
-            old_val = item.get(edit_field) or ""
-            new_val = apply_batch_text_edit(old_val, edit_op, find_str, replace_str)
-            conn.execute(
-                f"UPDATE video_queue SET {edit_field} = ? WHERE id = ?",
-                (new_val, item["id"]),
-            )
-            updated += 1
-        else:
-            res = ai_optimize_youtube_metadata(
-                title=item.get("title") or "",
-                description=item.get("description") or "",
-                action=mode,
-                provider=provider,
-                target_lang=target_lang,
-                custom_prompt=custom_prompt,
-            )
-            conn.execute(
-                "UPDATE video_queue SET title = ?, description = ?, tags = ? WHERE id = ?",
-                (res["title"], res["description"], res["tags"], item["id"]),
-            )
-            actual_provider = str(res.get("provider_used") or provider)
-            provider_counts[actual_provider] = provider_counts.get(actual_provider, 0) + 1
-            fallback_count += int(bool(res.get("fallback")))
-            links_preserved += int(res.get("links_preserved") or 0)
-            updated += 1
+    failed_items = []
+    try:
+        for r in rows:
+            item = dict(r)
+            if mode == "batch_edit":
+                old_val = item.get(edit_field) or ""
+                new_val = apply_batch_text_edit(old_val, edit_op, find_str, replace_str)
+                conn.execute(
+                    f"UPDATE video_queue SET {edit_field} = ? WHERE id = ?",
+                    (new_val, item["id"]),
+                )
+                updated += 1
+            else:
+                try:
+                    res = ai_optimize_youtube_metadata(
+                        title=item.get("title") or "",
+                        description=item.get("description") or "",
+                        action=mode,
+                        provider=provider,
+                        target_lang=target_lang,
+                        custom_prompt=custom_prompt,
+                    )
+                except SourceLinksTooLongError as exc:
+                    failed_items.append({"id": int(item["id"]), "error": str(exc)})
+                    continue
+                conn.execute(
+                    "UPDATE video_queue SET title = ?, description = ?, tags = ? WHERE id = ?",
+                    (res["title"], res["description"], res["tags"], item["id"]),
+                )
+                actual_provider = str(res.get("provider_used") or provider)
+                provider_counts[actual_provider] = provider_counts.get(actual_provider, 0) + 1
+                fallback_count += int(bool(res.get("fallback")))
+                links_preserved += int(res.get("links_preserved") or 0)
+                updated += 1
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
     if mode == "batch_edit":
         add_log("AI", f"Đã biên tập thủ công {updated} video.", "SUCCESS")
         return {"ok": True, "updated": updated}
@@ -2723,11 +2729,12 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
     add_log(
         "AI",
         f"Đã xử lý {updated} video; yêu cầu {provider}; nhà cung cấp thực tế [{summary}]; fallback {fallback_count}.",
-        "WARNING" if fallback_count else "SUCCESS",
+        "WARNING" if fallback_count or failed_items else "SUCCESS",
     )
     return {
-        "ok": True,
+        "ok": not failed_items,
         "updated": updated,
+        "failed": failed_items,
         "provider_requested": provider,
         "provider_counts": provider_counts,
         "fallback_count": fallback_count,
@@ -3976,7 +3983,17 @@ def api_list_monitors():
     conn = get_conn()
     rows = conn.execute("SELECT * FROM monitors ORDER BY id DESC").fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    items = [dict(r) for r in rows]
+    states = pipeline_manager.refresh_monitor_states([int(item["id"]) for item in items])
+    for item in items:
+        monitor_id = int(item["id"])
+        running = bool(item.get("is_running"))
+        state = states.get(monitor_id) or ("Running" if running else "Stopped")
+        active = pipeline_manager._monitor_handles_alive(monitor_id)
+        item["lifecycle_state"] = state
+        item["can_start"] = not running and not active and state not in {"Starting", "Stopping"}
+        item["can_delete"] = not running and not active and state not in {"Starting", "Running", "Stopping"}
+    return items
 
 
 @app.post("/api/monitors")
@@ -4017,25 +4034,22 @@ def api_create_monitor(data: Dict[str, Any] = Body(...)):
 
 @app.post("/api/monitors/{monitor_id}/toggle")
 def api_toggle_monitor(monitor_id: int):
-    conn = get_conn()
-    row = conn.execute("SELECT is_running FROM monitors WHERE id = ?", (monitor_id,)).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(404, "Không tìm thấy Monitor.")
-    if row["is_running"]:
-        return pipeline_manager.stop_monitor(monitor_id)
-    else:
-        return pipeline_manager.start_monitor(monitor_id)
+    result = pipeline_manager.toggle_monitor(monitor_id)
+    if not result.get("ok"):
+        if "Không tìm thấy" in str(result.get("message", "")):
+            raise HTTPException(404, result["message"])
+        raise HTTPException(409, result.get("message", "Monitor đang chuyển trạng thái."))
+    return result
 
 
 @app.delete("/api/monitors/{monitor_id}")
 def api_delete_monitor(monitor_id: int):
-    pipeline_manager.stop_monitor(monitor_id)
-    conn = get_conn()
-    conn.execute("DELETE FROM monitors WHERE id = ?", (monitor_id,))
-    conn.commit()
-    conn.close()
-    return {"ok": True}
+    result = pipeline_manager.delete_monitor(monitor_id)
+    if not result.get("ok"):
+        if "Không tìm thấy" in str(result.get("message", "")):
+            raise HTTPException(404, result["message"])
+        raise HTTPException(409, result.get("message", "Không thể xóa Monitor lúc này."))
+    return result
 
 
 # ==========================================================

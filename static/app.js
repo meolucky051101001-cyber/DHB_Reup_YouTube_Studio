@@ -36,6 +36,7 @@ let gApiToken = null;
 let gApiTokenPromise = null;
 let gLiveRefreshInFlight = false;
 let gLiveRefreshTimer = null;
+let gMonitorLifecycleTimer = null;
 let gApiRetryTimer = null;
 
 function selectedMultiValues(selectEl) {
@@ -2504,7 +2505,11 @@ async function runAIProcess(type) {
     } else {
       const actual = Object.entries(res.provider_counts || {}).map(([name, count]) => `${name}: ${count}`).join(', ') || 'không có video';
       const fallback = Number(res.fallback_count || 0);
-      alert(`Đã cập nhật ${res.updated} video.\nYêu cầu: ${res.provider_requested || payload.provider}\nThực tế: ${actual}${fallback ? `\n${fallback} video chuyển sang Google Translate.` : ''}${res.links_preserved ? `\nĐã giữ ${res.links_preserved} link từ mô tả gốc.` : ''}`);
+      const failed = res.failed || [];
+      const failureMessage = failed.length
+        ? `\nKhông cập nhật được ${failed.length} video (ID: ${failed.map(item => item.id).join(', ')}); metadata gốc được giữ.`
+        : '';
+      alert(`Đã cập nhật ${res.updated} video.\nYêu cầu: ${res.provider_requested || payload.provider}\nThực tế: ${actual}${fallback ? `\n${fallback} video chuyển sang Google Translate.` : ''}${res.links_preserved ? `\nĐã giữ ${res.links_preserved} link từ mô tả gốc.` : ''}${failureMessage}`);
     }
     await loadQueue(true);
   } catch (e) {
@@ -2873,7 +2878,12 @@ async function applyShortsBooster() {
 async function loadMonitors() {
   const list = await apiFetch('/api/monitors');
   const tbody = document.getElementById('monitors-tbody');
-  tbody.innerHTML = list.map(m => `
+  tbody.innerHTML = list.map(m => {
+    const transitioning = ['Starting', 'Stopping'].includes(m.lifecycle_state);
+    const actionLabel = m.lifecycle_state === 'Stopping' ? '⏳ Đang dừng...' :
+      m.lifecycle_state === 'Starting' ? '⏳ Đang khởi động...' :
+      m.is_running ? '⏹️ Dừng' : '▶️ Chạy 24/7';
+    return `
     <tr>
       <td>#${m.id}</td>
       <td><b>${escapeHtml(m.name)}</b><br/><span style="font-size:11px;color:var(--text-muted)">${escapeHtml((m.source_urls || '').split('\n')[0])}</span></td>
@@ -2884,13 +2894,22 @@ async function loadMonitors() {
         ${m.last_checked_at ? `<div style="font-size:10.5px;color:var(--text-muted)">${escapeHtml(m.last_checked_at)}</div>` : ''}
       </td>
       <td>
-        <button class="btn ${m.is_running ? 'btn-warning' : 'btn-success'} btn-sm" onclick="toggleMonitor(${m.id})">
-          ${m.is_running ? '⏹️ Dừng' : '▶️ Chạy 24/7'}
+        <button class="btn ${m.is_running ? 'btn-warning' : 'btn-success'} btn-sm" onclick="toggleMonitor(${m.id})" ${transitioning ? 'disabled' : ''}>
+          ${actionLabel}
         </button>
-        <button class="btn btn-outline btn-sm" onclick="deleteMonitor(${m.id})">🗑️</button>
+        <button class="btn btn-outline btn-sm" onclick="deleteMonitor(${m.id})" ${m.can_delete ? '' : 'disabled'} title="${m.can_delete ? 'Xóa monitor' : 'Dừng monitor và đợi worker kết thúc trước khi xóa'}">🗑️</button>
       </td>
     </tr>
-  `).join('');
+  `;
+  }).join('');
+  if (gMonitorLifecycleTimer) clearTimeout(gMonitorLifecycleTimer);
+  gMonitorLifecycleTimer = null;
+  if (list.some(m => ['Starting', 'Stopping'].includes(m.lifecycle_state))) {
+    gMonitorLifecycleTimer = setTimeout(() => {
+      gMonitorLifecycleTimer = null;
+      loadMonitors().catch(error => console.error('Không thể cập nhật trạng thái Monitor:', error));
+    }, 1000);
+  }
 }
 
 async function addMonitor() {
@@ -2919,14 +2938,24 @@ async function addMonitor() {
 }
 
 async function toggleMonitor(id) {
-  await apiFetch(`/api/monitors/${id}/toggle`, { method: 'POST' });
-  await loadMonitors();
+  try {
+    const result = await apiFetch(`/api/monitors/${id}/toggle`, { method: 'POST' });
+    if (result.message) showToast(result.message, result.ok ? 'success' : 'warning');
+  } catch (e) {
+    alert(e.message);
+  } finally {
+    await loadMonitors();
+  }
 }
 
 async function deleteMonitor(id) {
   if (!confirm('Xóa luồng Auto Monitor này?')) return;
-  await apiFetch(`/api/monitors/${id}`, { method: 'DELETE' });
-  await loadMonitors();
+  try {
+    await apiFetch(`/api/monitors/${id}`, { method: 'DELETE' });
+    await loadMonitors();
+  } catch (e) {
+    alert(e.message);
+  }
 }
 
 async function loadAppSettings() {

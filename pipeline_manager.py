@@ -635,8 +635,10 @@ class PipelineManager:
         self._monitor_threads: Dict[int, threading.Event] = {}
         self._monitor_workers: Dict[int, threading.Thread] = {}
         self._monitor_heartbeats: Dict[int, threading.Thread] = {}
+        self._monitor_states: Dict[int, str] = {}
         self._monitor_restart_history: Dict[int, List[float]] = {}
         self._monitor_lock = threading.Lock()
+        self._monitor_lifecycle_lock = threading.RLock()
         self._monitor_supervisor: Optional[threading.Thread] = None
         self._monitor_supervisor_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
@@ -1865,76 +1867,311 @@ class PipelineManager:
     # ==========================================================
     # CHẾ ĐỘ AUTO MONITOR 24/7 (Tương đương ZhScDd của DHB Reup)
     # ==========================================================
-    def start_monitor(self, monitor_id: int, _auto_restart: bool = False) -> Dict[str, Any]:
+    def _monitor_handles_alive(self, monitor_id: int) -> bool:
         with self._monitor_lock:
-            existing_worker = self._monitor_workers.get(monitor_id)
-            if existing_worker is not None and existing_worker.is_alive():
-                return {"ok": True, "message": f"Luồng Monitor #{monitor_id} đang chạy."}
-            stop_ev = threading.Event()
-            self._monitor_threads[monitor_id] = stop_ev
+            worker = self._monitor_workers.get(monitor_id)
+            heartbeat = self._monitor_heartbeats.get(monitor_id)
+            return bool(
+                (worker is not None and worker.is_alive())
+                or (heartbeat is not None and heartbeat.is_alive())
+            )
 
-        conn = get_conn()
-        mon_row = conn.execute("SELECT name FROM monitors WHERE id = ?", (monitor_id,)).fetchone()
-        if not mon_row:
+    def _reap_monitor_locked(self, monitor_id: int) -> Optional[str]:
+        """Reap handles only after both threads have actually exited.
+
+        Caller holds `_monitor_lifecycle_lock`; this never joins a thread or waits
+        for scanner/uploader I/O.
+        """
+        with self._monitor_lock:
+            stop_ev = self._monitor_threads.get(monitor_id)
+            worker = self._monitor_workers.get(monitor_id)
+            heartbeat = self._monitor_heartbeats.get(monitor_id)
+            if ((worker is not None and worker.is_alive())
+                    or (heartbeat is not None and heartbeat.is_alive())):
+                return self._monitor_states.get(monitor_id, "Running")
+            previous_state = self._monitor_states.get(monitor_id)
+
+        # A requested stop is not complete until the desired state is durable.
+        # Keep the Stopping generation registered if SQLite is temporarily busy;
+        # otherwise the supervisor could mistake it for a crashed, desired worker.
+        if previous_state == "Stopping":
+            conn = None
+            try:
+                conn = get_conn()
+                cursor = conn.execute(
+                    "UPDATE monitors SET is_running = 0, status = 'Stopped' WHERE id = ?",
+                    (monitor_id,),
+                )
+                exists = cursor.rowcount > 0
+                conn.commit()
+            except Exception:
+                return "Stopping"
+            finally:
+                if conn is not None:
+                    conn.close()
+
             with self._monitor_lock:
-                self._monitor_threads.pop(monitor_id, None)
-            conn.close()
-            return {"ok": False, "message": f"Không tìm thấy Monitor #{monitor_id}."}
+                if self._monitor_workers.get(monitor_id) is worker and self._monitor_heartbeats.get(monitor_id) is heartbeat:
+                    if ((worker is not None and worker.is_alive())
+                            or (heartbeat is not None and heartbeat.is_alive())):
+                        return "Stopping"
+                    if self._monitor_threads.get(monitor_id) is stop_ev:
+                        self._monitor_threads.pop(monitor_id, None)
+                    self._monitor_workers.pop(monitor_id, None)
+                    self._monitor_heartbeats.pop(monitor_id, None)
+                    self._monitor_states[monitor_id] = "Stopped"
+            return "Stopped" if exists else None
 
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute(
-            "UPDATE monitors SET is_running = 1, status = 'Running', last_checked_at = ?, last_heartbeat_at = ? WHERE id = ?",
-            (now_str, now_str, monitor_id),
-        )
-        conn.commit()
-        conn.close()
-
-        if not _auto_restart:
-            self._monitor_restart_history.pop(monitor_id, None)
-            # Chỉ reset bộ đếm giới hạn khi NGƯỜI DÙNG chủ động bật lại monitor;
-            # tự khôi phục sau crash phải giữ nguyên bộ đếm để không lách giới hạn.
-            self._monitor_upload_counts[monitor_id] = {"n": 0}
-        else:
-            self._monitor_upload_counts.setdefault(monitor_id, {"n": 0})
-
-        worker = threading.Thread(
-            target=self._monitor_worker,
-            args=(monitor_id, stop_ev),
-            daemon=True,
-            name=f"DHB-Monitor-{monitor_id}",
-        )
         with self._monitor_lock:
-            self._monitor_workers[monitor_id] = worker
-        worker.start()
-        self._start_monitor_heartbeat(monitor_id, stop_ev)
-        self.start_monitor_supervisor()
+            if self._monitor_threads.get(monitor_id) is stop_ev:
+                self._monitor_threads.pop(monitor_id, None)
+            if self._monitor_workers.get(monitor_id) is worker:
+                self._monitor_workers.pop(monitor_id, None)
+            if self._monitor_heartbeats.get(monitor_id) is heartbeat:
+                self._monitor_heartbeats.pop(monitor_id, None)
 
-        if _auto_restart:
-            add_log("Monitor", f"Đã tự khôi phục luồng Auto Monitor #{monitor_id} [{mon_row['name']}].", "WARNING")
-            return {"ok": True, "message": f"Đã tự khôi phục Monitor #{monitor_id}"}
-        add_log("Monitor", f"Đã bật luồng Auto Monitor #{monitor_id}", "INFO")
-        return {"ok": True, "message": f"Đã bật theo dõi tự động #{monitor_id}"}
+            if previous_state in {"Starting", "Running"}:
+                # The worker exited without an accepted Stop request. Keep the
+                # DB desired-running flag so the supervisor can recover it.
+                self._monitor_states[monitor_id] = "Error"
+                final_status = "Luồng đã dừng bất ngờ; đang chờ tự khôi phục."
+            else:
+                final_status = None
+            state = self._monitor_states.get(monitor_id)
+
+        if final_status:
+            try:
+                conn = get_conn()
+                if state == "Stopped":
+                    conn.execute("UPDATE monitors SET is_running = 0, status = 'Stopped' WHERE id = ?", (monitor_id,))
+                else:
+                    conn.execute(
+                        "UPDATE monitors SET status = ? WHERE id = ? AND is_running = 1",
+                        (final_status, monitor_id),
+                    )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        return state
+
+    def refresh_monitor_states(self, monitor_ids: List[int]) -> Dict[int, str]:
+        with self._monitor_lifecycle_lock:
+            states = {}
+            for monitor_id in monitor_ids:
+                monitor_id = int(monitor_id)
+                state = self._reap_monitor_locked(monitor_id)
+                if state:
+                    states[monitor_id] = state
+            return states
+
+    def start_monitor(self, monitor_id: int, _auto_restart: bool = False) -> Dict[str, Any]:
+        with self._monitor_lifecycle_lock:
+            state = self._reap_monitor_locked(monitor_id)
+            with self._monitor_lock:
+                worker = self._monitor_workers.get(monitor_id)
+                heartbeat = self._monitor_heartbeats.get(monitor_id)
+                alive = bool((worker and worker.is_alive()) or (heartbeat and heartbeat.is_alive()))
+            if alive:
+                if state == "Stopping":
+                    return {"ok": False, "lifecycle_state": state,
+                            "message": f"Monitor #{monitor_id} đang dừng; hãy đợi lượt hiện tại kết thúc rồi bật lại."}
+                return {"ok": True, "lifecycle_state": state or "Running",
+                        "message": f"Luồng Monitor #{monitor_id} đang chạy."}
+            if state == "Stopping":
+                # A Stop transition is cleared only after the old handles are reaped.
+                state = self._reap_monitor_locked(monitor_id)
+                if state == "Stopping":
+                    return {"ok": False, "lifecycle_state": state,
+                            "message": f"Monitor #{monitor_id} đang dừng; chưa thể tạo lượt mới."}
+
+            stop_ev = threading.Event()
+            with self._monitor_lock:
+                self._monitor_states[monitor_id] = "Starting"
+                self._monitor_threads[monitor_id] = stop_ev
+
+            conn = None
+            try:
+                conn = get_conn()
+                mon_row = conn.execute("SELECT name FROM monitors WHERE id = ?", (monitor_id,)).fetchone()
+                if not mon_row:
+                    stop_ev.set()
+                    with self._monitor_lock:
+                        self._monitor_threads.pop(monitor_id, None)
+                        self._monitor_states[monitor_id] = "Stopped"
+                    return {"ok": False, "lifecycle_state": "Stopped",
+                            "message": f"Không tìm thấy Monitor #{monitor_id}."}
+
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                conn.execute(
+                    "UPDATE monitors SET is_running = 1, status = 'Starting', last_checked_at = ?, last_heartbeat_at = ? WHERE id = ?",
+                    (now_str, now_str, monitor_id),
+                )
+                conn.commit()
+            except Exception as exc:
+                stop_ev.set()
+                with self._monitor_lock:
+                    if self._monitor_threads.get(monitor_id) is stop_ev:
+                        self._monitor_threads.pop(monitor_id, None)
+                    self._monitor_states[monitor_id] = "Error"
+                return {"ok": False, "lifecycle_state": "Error",
+                        "message": f"Không thể khởi động Monitor #{monitor_id}: {exc}"}
+            finally:
+                if conn is not None:
+                    conn.close()
+
+            if not _auto_restart:
+                self._monitor_restart_history.pop(monitor_id, None)
+                self._monitor_upload_counts[monitor_id] = {"n": 0}
+            else:
+                self._monitor_upload_counts.setdefault(monitor_id, {"n": 0})
+
+            worker = threading.Thread(
+                target=self._monitor_worker,
+                args=(monitor_id, stop_ev),
+                daemon=True,
+                name=f"DHB-Monitor-{monitor_id}",
+            )
+            with self._monitor_lock:
+                self._monitor_workers[monitor_id] = worker
+            try:
+                worker.start()
+            except Exception as exc:
+                stop_ev.set()
+                try:
+                    worker_started = worker.ident is not None or worker.is_alive()
+                except Exception:
+                    worker_started = False
+                with self._monitor_lock:
+                    if worker_started:
+                        self._monitor_states[monitor_id] = "Stopping"
+                    else:
+                        if self._monitor_workers.get(monitor_id) is worker:
+                            self._monitor_workers.pop(monitor_id, None)
+                        if self._monitor_threads.get(monitor_id) is stop_ev:
+                            self._monitor_threads.pop(monitor_id, None)
+                        self._monitor_states[monitor_id] = "Error"
+                try:
+                    conn = get_conn()
+                    status = "Stopping" if worker_started else "Không thể tạo worker monitor."
+                    conn.execute("UPDATE monitors SET is_running = 0, status = ? WHERE id = ?", (status, monitor_id))
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+                add_log("Monitor", f"Không thể tạo worker Monitor #{monitor_id}: {type(exc).__name__}", "ERROR")
+                return {"ok": False, "lifecycle_state": "Stopping" if worker_started else "Error",
+                        "message": f"Không thể khởi chạy Monitor #{monitor_id}."}
+
+            with self._monitor_lock:
+                if self._monitor_states.get(monitor_id) == "Starting":
+                    self._monitor_states[monitor_id] = "Running"
+
+            heartbeat_warning = ""
+            try:
+                if worker.is_alive():
+                    self._start_monitor_heartbeat(monitor_id, stop_ev)
+            except Exception as exc:
+                heartbeat_warning = " Worker đang chạy nhưng heartbeat chưa khởi động; supervisor sẽ thử lại."
+                add_log("Monitor", f"Không thể tạo heartbeat Monitor #{monitor_id}: {type(exc).__name__}", "WARNING")
+            self.start_monitor_supervisor()
+
+            if not worker.is_alive():
+                state = self._reap_monitor_locked(monitor_id)
+                return {"ok": False, "lifecycle_state": state,
+                        "message": f"Worker Monitor #{monitor_id} đã thoát ngay sau khi khởi chạy."}
+            if _auto_restart:
+                add_log("Monitor", f"Đã tự khôi phục luồng Auto Monitor #{monitor_id} [{mon_row['name']}].", "WARNING")
+                return {"ok": True, "lifecycle_state": "Running",
+                        "message": f"Đã tự khôi phục Monitor #{monitor_id}.{heartbeat_warning}"}
+            add_log("Monitor", f"Đã bật luồng Auto Monitor #{monitor_id}", "INFO")
+            return {"ok": True, "lifecycle_state": "Running",
+                    "message": f"Đã bật theo dõi tự động #{monitor_id}.{heartbeat_warning}"}
 
     def stop_monitor(self, monitor_id: int) -> Dict[str, Any]:
-        # Cập nhật DB trước khi gỡ thread để supervisor không khởi động lại nhầm
-        conn = get_conn()
-        conn.execute(
-            "UPDATE monitors SET is_running = 0, status = 'Stopped' WHERE id = ?",
-            (monitor_id,),
-        )
-        conn.commit()
-        conn.close()
+        with self._monitor_lifecycle_lock:
+            with self._monitor_lock:
+                stop_ev = self._monitor_threads.get(monitor_id)
+                if stop_ev is not None:
+                    stop_ev.set()
+                worker = self._monitor_workers.get(monitor_id)
+                heartbeat = self._monitor_heartbeats.get(monitor_id)
+                alive = bool((worker and worker.is_alive()) or (heartbeat and heartbeat.is_alive()))
+                self._monitor_states[monitor_id] = "Stopping"
 
-        with self._monitor_lock:
-            stop_ev = self._monitor_threads.pop(monitor_id, None)
-            if stop_ev is not None:
-                stop_ev.set()
-            self._monitor_workers.pop(monitor_id, None)
-            self._monitor_heartbeats.pop(monitor_id, None)
+            try:
+                conn = get_conn()
+                cursor = conn.execute(
+                    "UPDATE monitors SET is_running = 0, status = ? WHERE id = ?",
+                    ("Stopping" if alive else "Stopped", monitor_id),
+                )
+                conn.commit()
+                exists = cursor.rowcount > 0
+                conn.close()
+            except Exception as exc:
+                add_log("Monitor", f"Đã gửi tín hiệu dừng Monitor #{monitor_id}, nhưng chưa cập nhật được DB: {type(exc).__name__}", "ERROR")
+                return {"ok": False, "lifecycle_state": "Stopping" if alive else "Error",
+                        "message": f"Đã gửi tín hiệu dừng nhưng trạng thái DB chưa đồng bộ: {exc}"}
+
+            if not exists:
+                if not alive:
+                    with self._monitor_lock:
+                        self._monitor_states.pop(monitor_id, None)
+                        self._monitor_threads.pop(monitor_id, None)
+                        self._monitor_workers.pop(monitor_id, None)
+                        self._monitor_heartbeats.pop(monitor_id, None)
+                return {"ok": False, "lifecycle_state": "Stopped", "message": f"Không tìm thấy Monitor #{monitor_id}."}
+            state = "Stopping" if alive else self._reap_monitor_locked(monitor_id)
             self._monitor_restart_history.pop(monitor_id, None)
 
-        add_log("Monitor", f"Đã dừng luồng Auto Monitor #{monitor_id}", "WARNING")
-        return {"ok": True, "message": f"Đã dừng theo dõi tự động #{monitor_id}"}
+        add_log("Monitor", f"Đã yêu cầu dừng luồng Auto Monitor #{monitor_id}", "WARNING")
+        if state == "Stopping":
+            message = f"Đã yêu cầu dừng Monitor #{monitor_id}; cần chờ worker kết thúc và đồng bộ trạng thái."
+        else:
+            message = f"Đã dừng theo dõi tự động #{monitor_id}"
+        return {"ok": True, "lifecycle_state": state, "message": message}
+
+    def toggle_monitor(self, monitor_id: int) -> Dict[str, Any]:
+        with self._monitor_lifecycle_lock:
+            try:
+                conn = get_conn()
+                row = conn.execute("SELECT is_running FROM monitors WHERE id = ?", (monitor_id,)).fetchone()
+                conn.close()
+            except Exception as exc:
+                return {"ok": False, "message": f"Không thể đọc Monitor #{monitor_id}: {exc}"}
+            if not row:
+                return {"ok": False, "message": f"Không tìm thấy Monitor #{monitor_id}."}
+            if row["is_running"]:
+                return self.stop_monitor(monitor_id)
+            return self.start_monitor(monitor_id)
+
+    def delete_monitor(self, monitor_id: int) -> Dict[str, Any]:
+        with self._monitor_lifecycle_lock:
+            state = self._reap_monitor_locked(monitor_id)
+            with self._monitor_lock:
+                worker = self._monitor_workers.get(monitor_id)
+                heartbeat = self._monitor_heartbeats.get(monitor_id)
+                alive = bool((worker and worker.is_alive()) or (heartbeat and heartbeat.is_alive()))
+            conn = get_conn()
+            row = conn.execute("SELECT is_running FROM monitors WHERE id = ?", (monitor_id,)).fetchone()
+            if not row:
+                conn.close()
+                return {"ok": False, "lifecycle_state": "Stopped", "message": "Không tìm thấy Monitor."}
+            if alive or row["is_running"] or state in {"Starting", "Running", "Stopping"}:
+                conn.close()
+                return {"ok": False, "lifecycle_state": "Stopping" if state == "Stopping" else state,
+                        "message": "Hãy dừng Monitor và đợi worker kết thúc trước khi xóa."}
+            conn.execute("DELETE FROM monitors WHERE id = ?", (monitor_id,))
+            conn.commit()
+            conn.close()
+            with self._monitor_lock:
+                self._monitor_states.pop(monitor_id, None)
+                self._monitor_threads.pop(monitor_id, None)
+                self._monitor_workers.pop(monitor_id, None)
+                self._monitor_heartbeats.pop(monitor_id, None)
+            self._monitor_upload_counts.pop(monitor_id, None)
+            self._monitor_restart_history.pop(monitor_id, None)
+            return {"ok": True, "lifecycle_state": "Stopped", "message": "Đã xóa Monitor."}
 
     def start_monitor_supervisor(self):
         with self._monitor_supervisor_lock:
@@ -1963,78 +2200,101 @@ class PipelineManager:
         conn = get_conn()
         try:
             rows = conn.execute(
-                "SELECT id, name, status, last_heartbeat_at FROM monitors WHERE is_running = 1 ORDER BY id ASC"
+                "SELECT id, name, status, last_heartbeat_at, is_running FROM monitors ORDER BY id ASC"
             ).fetchall()
         finally:
             conn.close()
 
+        self.refresh_monitor_states([int(row["id"]) for row in rows])
         now = time.time()
         for row in rows:
+            if not row["is_running"]:
+                continue
             monitor_id = int(row["id"])
             monitor_name = row["name"] or f"#{monitor_id}"
-            worker = self._monitor_workers.get(monitor_id)
-            if worker is None or not worker.is_alive():
-                self._restart_dead_monitor(monitor_id, monitor_name)
-                continue
+            with self._monitor_lifecycle_lock:
+                state = self._monitor_states.get(monitor_id)
+                if state == "Stopping":
+                    continue
+                with self._monitor_lock:
+                    worker = self._monitor_workers.get(monitor_id)
+                    heartbeat = self._monitor_heartbeats.get(monitor_id)
+                    worker_alive = bool(worker and worker.is_alive())
+                    heartbeat_alive = bool(heartbeat and heartbeat.is_alive())
+                if not worker_alive:
+                    self._restart_dead_monitor(monitor_id, monitor_name)
+                    continue
 
-            heartbeat = self._monitor_heartbeats.get(monitor_id)
-            if heartbeat is None or not heartbeat.is_alive():
-                self._start_monitor_heartbeat(monitor_id)
-                add_log("Monitor", f"[{monitor_name}] Bộ đếm heartbeat đã dừng, đã khởi động lại.", "WARNING")
+                if not heartbeat_alive:
+                    try:
+                        self._start_monitor_heartbeat(monitor_id)
+                        add_log("Monitor", f"[{monitor_name}] Bộ đếm heartbeat đã dừng, đã khởi động lại.", "WARNING")
+                    except Exception as exc:
+                        add_log("Monitor", f"[{monitor_name}] Không thể khởi động heartbeat: {type(exc).__name__}.", "ERROR")
 
-            last_hb = self._parse_monitor_ts(row["last_heartbeat_at"])
-            if last_hb is None or now - last_hb > MONITOR_STALE_SECONDS:
-                status = row["status"] or ""
-                if not status.startswith("⚠️"):
-                    stale_for = int(now - last_hb) if last_hb else 0
-                    self._set_monitor_status_raw(
-                        monitor_id,
-                        f"⚠️ Luồng không phản hồi {stale_for}s — đang theo dõi, không tự khởi động lại để tránh đăng trùng.",
-                    )
-                    add_log(
-                        "Monitor",
-                        f"[{monitor_name}] Không có heartbeat trong {stale_for}s. Giữ nguyên luồng để tránh đăng trùng; kiểm tra log nếu kéo dài.",
-                        "WARNING",
-                    )
+                last_hb = self._parse_monitor_ts(row["last_heartbeat_at"])
+                if last_hb is None or now - last_hb > MONITOR_STALE_SECONDS:
+                    status = row["status"] or ""
+                    if not status.startswith("⚠️"):
+                        stale_for = int(now - last_hb) if last_hb else 0
+                        self._set_monitor_status_raw(
+                            monitor_id,
+                            f"⚠️ Luồng không phản hồi {stale_for}s — đang theo dõi, không tự khởi động lại để tránh đăng trùng.",
+                            only_running=True,
+                        )
+                        add_log(
+                            "Monitor",
+                            f"[{monitor_name}] Không có heartbeat trong {stale_for}s. Giữ nguyên luồng để tránh đăng trùng; kiểm tra log nếu kéo dài.",
+                            "WARNING",
+                        )
 
     def _restart_dead_monitor(self, monitor_id: int, monitor_name: str):
-        now = time.time()
-        history = [
-            t for t in self._monitor_restart_history.get(monitor_id, [])
-            if now - t < MONITOR_RESTART_WINDOW_SECONDS
-        ]
-        if len(history) >= MONITOR_MAX_RESTARTS:
+        with self._monitor_lifecycle_lock:
             conn = get_conn()
-            conn.execute(
-                "UPDATE monitors SET is_running = 0, status = ? WHERE id = ?",
-                (f"Đã dừng sau {MONITOR_MAX_RESTARTS} lần lỗi liên tiếp — kiểm tra log rồi bật lại.", monitor_id),
-            )
-            conn.commit()
+            row = conn.execute("SELECT is_running FROM monitors WHERE id = ?", (monitor_id,)).fetchone()
             conn.close()
-            self._monitor_restart_history.pop(monitor_id, None)
-            with self._monitor_lock:
-                self._monitor_threads.pop(monitor_id, None)
-                self._monitor_workers.pop(monitor_id, None)
-                self._monitor_heartbeats.pop(monitor_id, None)
+            if not row or not row["is_running"]:
+                return
+
+            state = self._reap_monitor_locked(monitor_id)
+            if state == "Stopping" or self._monitor_handles_alive(monitor_id):
+                return
+
+            now = time.time()
+            history = [
+                t for t in self._monitor_restart_history.get(monitor_id, [])
+                if now - t < MONITOR_RESTART_WINDOW_SECONDS
+            ]
+            if len(history) >= MONITOR_MAX_RESTARTS:
+                conn = get_conn()
+                conn.execute(
+                    "UPDATE monitors SET is_running = 0, status = ? WHERE id = ?",
+                    (f"Đã dừng sau {MONITOR_MAX_RESTARTS} lần lỗi liên tiếp — kiểm tra log rồi bật lại.", monitor_id),
+                )
+                conn.commit()
+                conn.close()
+                self._monitor_restart_history.pop(monitor_id, None)
+                with self._monitor_lock:
+                    self._monitor_states[monitor_id] = "Error"
+                add_log(
+                    "Monitor",
+                    f"[{monitor_name}] Luồng dừng lặp lại {MONITOR_MAX_RESTARTS} lần trong "
+                    f"{MONITOR_RESTART_WINDOW_SECONDS // 60} phút — đã tắt tự khôi phục để tránh vòng lặp lỗi.",
+                    "ERROR",
+                )
+                return
+
+            history.append(now)
+            self._monitor_restart_history[monitor_id] = history
             add_log(
                 "Monitor",
-                f"[{monitor_name}] Luồng dừng lặp lại {MONITOR_MAX_RESTARTS} lần trong "
-                f"{MONITOR_RESTART_WINDOW_SECONDS // 60} phút — đã tắt tự khôi phục để tránh vòng lặp lỗi.",
-                "ERROR",
+                f"[{monitor_name}] Phát hiện luồng đã dừng, tự khởi động lại "
+                f"(lần {len(history)}/{MONITOR_MAX_RESTARTS} trong {MONITOR_RESTART_WINDOW_SECONDS // 60} phút).",
+                "WARNING",
             )
-            return
-
-        history.append(now)
-        self._monitor_restart_history[monitor_id] = history
-        add_log(
-            "Monitor",
-            f"[{monitor_name}] Phát hiện luồng đã dừng, tự khởi động lại "
-            f"(lần {len(history)}/{MONITOR_MAX_RESTARTS} trong {MONITOR_RESTART_WINDOW_SECONDS // 60} phút).",
-            "WARNING",
-        )
-        result = self.start_monitor(monitor_id, _auto_restart=True)
-        if not result.get("ok"):
-            add_log("Monitor", f"[{monitor_name}] Không thể tự khởi động lại: {result.get('message')}", "ERROR")
+            result = self.start_monitor(monitor_id, _auto_restart=True)
+            if not result.get("ok"):
+                add_log("Monitor", f"[{monitor_name}] Không thể tự khởi động lại: {result.get('message')}", "ERROR")
 
     def _start_monitor_heartbeat(self, monitor_id: int, stop_ev: Optional[threading.Event] = None):
         with self._monitor_lock:
@@ -2043,7 +2303,9 @@ class PipelineManager:
                 return
             if stop_ev is None:
                 stop_ev = self._monitor_threads.get(monitor_id)
-            if stop_ev is None:
+            if (stop_ev is None or stop_ev.is_set()
+                    or self._monitor_threads.get(monitor_id) is not stop_ev
+                    or self._monitor_states.get(monitor_id) == "Stopping"):
                 return
             heartbeat = threading.Thread(
                 target=self._monitor_heartbeat_loop,
@@ -2052,7 +2314,13 @@ class PipelineManager:
                 name=f"DHB-Monitor-HB-{monitor_id}",
             )
             self._monitor_heartbeats[monitor_id] = heartbeat
-        heartbeat.start()
+        try:
+            heartbeat.start()
+        except Exception:
+            with self._monitor_lock:
+                if self._monitor_heartbeats.get(monitor_id) is heartbeat:
+                    self._monitor_heartbeats.pop(monitor_id, None)
+            raise
 
     def _monitor_heartbeat_loop(self, monitor_id: int, stop_ev: threading.Event):
         while not stop_ev.wait(MONITOR_HEARTBEAT_SECONDS):
@@ -2068,24 +2336,34 @@ class PipelineManager:
                 pass
 
     def _monitor_worker(self, monitor_id: int, stop_ev: threading.Event):
+        error = None
         try:
             self._monitor_loop(monitor_id, stop_ev)
         except Exception as e:
+            error = e
             try:
                 add_log("Monitor", f"Luồng Monitor #{monitor_id} gặp lỗi ngoài dự kiến: {e}", "ERROR")
             except Exception:
                 pass
-            try:
-                self._set_monitor_status_raw(monitor_id, f"Luồng gặp lỗi, chờ tự phục hồi: {e}")
-            except Exception:
-                pass
         finally:
-            stop_ev.set()
             with self._monitor_lock:
-                if self._monitor_threads.get(monitor_id) is stop_ev:
-                    self._monitor_threads.pop(monitor_id, None)
-                    self._monitor_workers.pop(monitor_id, None)
-                    self._monitor_heartbeats.pop(monitor_id, None)
+                current = self._monitor_threads.get(monitor_id) is stop_ev
+                stopping = current and self._monitor_states.get(monitor_id) == "Stopping"
+                if current and not stopping:
+                    self._monitor_states[monitor_id] = "Error"
+            stop_ev.set()
+            if not stopping:
+                try:
+                    status = (
+                        f"Luồng gặp lỗi, chờ tự phục hồi: {error}"
+                        if error is not None
+                        else "Luồng đã thoát ngoài yêu cầu; đang chờ tự khôi phục."
+                    )
+                    self._set_monitor_status_raw(
+                        monitor_id, status, only_running=True,
+                    )
+                except Exception:
+                    pass
 
     @staticmethod
     def _parse_monitor_ts(value: Any) -> Optional[float]:
@@ -2096,9 +2374,12 @@ class PipelineManager:
         except Exception:
             return None
 
-    def _set_monitor_status_raw(self, monitor_id: int, status_text: str):
+    def _set_monitor_status_raw(self, monitor_id: int, status_text: str, only_running: bool = False):
         conn = get_conn()
-        conn.execute("UPDATE monitors SET status = ? WHERE id = ?", (status_text, monitor_id))
+        if only_running:
+            conn.execute("UPDATE monitors SET status = ? WHERE id = ? AND is_running = 1", (status_text, monitor_id))
+        else:
+            conn.execute("UPDATE monitors SET status = ? WHERE id = ?", (status_text, monitor_id))
         conn.commit()
         conn.close()
 
@@ -2335,9 +2616,12 @@ class PipelineManager:
                 time.sleep(1)
 
     def _update_monitor_status(self, monitor_id: int, status_text: str):
+        with self._monitor_lock:
+            if self._monitor_states.get(monitor_id) == "Stopping":
+                return
         conn = get_conn()
         conn.execute(
-            "UPDATE monitors SET status = ?, last_checked_at = ? WHERE id = ?",
+            "UPDATE monitors SET status = ?, last_checked_at = ? WHERE id = ? AND is_running = 1",
             (status_text, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), monitor_id),
         )
         conn.commit()

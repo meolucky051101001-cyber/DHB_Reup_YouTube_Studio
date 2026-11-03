@@ -173,24 +173,46 @@ def _fallback_translate_metadata(title: str, description: str, target_lang: str)
     }
 
 
+class SourceLinksTooLongError(ValueError):
+    """The original URLs cannot fit in the metadata field without being cut."""
+
+
 def _preserve_source_links(original: str, generated: str, limit: int = 5000) -> tuple[str, int]:
-    """Keep links from the source description (including affiliate URLs) in generated metadata."""
+    """Keep each exact source URL complete, reserving its space before prose is clipped."""
     links = list(dict.fromkeys(re.findall(r"https?://[^\s<>\"']+", str(original or ""), flags=re.IGNORECASE)))
     result = str(generated or "").strip()
-    missing = [url for url in links if url.casefold() not in result.casefold()]
-    suffix = ""
-    preserved = 0
-    for url in missing:
-        candidate = suffix + ("\n" if suffix else "") + url
-        if len(candidate) > limit:
-            continue
-        suffix = candidate
-        preserved += 1
-    if suffix:
-        separator = "\n\n" if result else ""
-        available = max(0, limit - len(separator) - len(suffix))
-        result = result[:available].rstrip() + separator + suffix
-    return result[:limit], preserved
+    if not links:
+        return result[:limit], 0
+
+    link_block = "\n".join(links)
+    separator = "\n\n" if result else ""
+    required = len(separator) + len(link_block)
+    if required > limit:
+        raise SourceLinksTooLongError(
+            f"Link nguồn dài {required} ký tự, vượt giới hạn mô tả {limit}; chưa cập nhật metadata."
+        )
+
+    # Put canonical source URLs in one protected block. This also prevents an
+    # already generated URL near the end of the text from being cut in half.
+    for url in links:
+        result = result.replace(url, "")
+    result = re.sub(r"[ \t]{2,}", " ", result).strip()
+    available = limit - required
+
+    if len(result) > available:
+        boundary = available
+        for match in re.finditer(r"https?://[^\s<>\"']+", result, flags=re.IGNORECASE):
+            if match.start() < boundary < match.end():
+                boundary = match.start()
+        result = result[:boundary].rstrip()
+
+    separator = "\n\n" if result else ""
+    final = result + separator + link_block
+    if len(final) > limit or any(url not in final for url in links):
+        raise SourceLinksTooLongError(
+            f"Không thể giữ nguyên link nguồn trong giới hạn mô tả {limit}; chưa cập nhật metadata."
+        )
+    return final, len(links)
 
 
 def ai_optimize_youtube_metadata(
@@ -247,6 +269,8 @@ def ai_optimize_youtube_metadata(
             result["provider_used"] = provider
             result["fallback"] = False
             return result
+    except SourceLinksTooLongError:
+        raise
     except Exception as ex:
         add_log("AI", f"AI ({provider}) chuyển sang dịch nhanh Google Translate: {ex}", "WARNING")
         result = _fallback_translate_metadata(title, description, target_lang)

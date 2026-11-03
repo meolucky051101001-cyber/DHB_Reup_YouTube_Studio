@@ -15,6 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -427,7 +428,8 @@ class JsonResponseRedactionTests(unittest.TestCase):
             "message": "Cookie: SID=sample",
             "text": '"quoted"\\line\nnext',
             "authorization": "Bearer sample-token",
-            "nested": [{"api_key": "sample-key", "refresh_token": "sample-refresh", "ok": True}],
+            "cookie": {"SID": "structured-cookie"},
+            "nested": [{"api_key": "sample-key", "refreshToken": "sample-refresh", "ok": True}],
             "count": 7,
         }
 
@@ -449,8 +451,9 @@ class JsonResponseRedactionTests(unittest.TestCase):
         self.assertEqual(result["message"], "Cookie: ***")
         self.assertEqual(result["text"], '"quoted"\\line\nnext')
         self.assertEqual(result["authorization"], "***")
+        self.assertEqual(result["cookie"], "***")
         self.assertEqual(result["nested"][0]["api_key"], "***")
-        self.assertEqual(result["nested"][0]["refresh_token"], "***")
+        self.assertEqual(result["nested"][0]["refreshToken"], "***")
         self.assertIs(result["nested"][0]["ok"], True)
         self.assertEqual(result["count"], 7)
         self.assertEqual(int(response.headers["content-length"]), len(response.body))
@@ -471,6 +474,141 @@ class JsonResponseRedactionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertNotIn("SID=secret", response.body.decode("utf-8"))
         self.assertIn("detail", result)
+
+
+class AiBatchLinkLimitTests(unittest.TestCase):
+    def test_bulk_ai_skips_too_long_item_and_preserves_its_original_metadata(self):
+        conn = database.get_conn()
+        conn.execute(
+            "INSERT INTO video_queue (project_name, title, description, tags, status) VALUES (?, ?, ?, ?, ?)",
+            ("AI link limit", "Too long", "original long description", "old tags", "Pending"),
+        )
+        too_long_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.execute(
+            "INSERT INTO video_queue (project_name, title, description, tags, status) VALUES (?, ?, ?, ?, ?)",
+            ("AI link limit", "Good", "original short description", "old tags", "Pending"),
+        )
+        good_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.commit()
+        conn.close()
+
+        def optimize(title, **_kwargs):
+            if title == "Too long":
+                raise app_module.SourceLinksTooLongError("source links exceed description limit")
+            return {"title": "Updated", "description": "updated description", "tags": "new tags",
+                    "provider_used": "gemini", "fallback": False, "links_preserved": 0}
+
+        with mock.patch.object(app_module, "ai_optimize_youtube_metadata", side_effect=optimize):
+            result = app_module.api_ai_process_queue({
+                "ids": [too_long_id, good_id], "mode": "rewrite_seo", "provider": "gemini",
+            })
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual([item["id"] for item in result["failed"]], [too_long_id])
+        conn = database.get_conn()
+        too_long = conn.execute("SELECT title, description, tags FROM video_queue WHERE id = ?", (too_long_id,)).fetchone()
+        good = conn.execute("SELECT title, description, tags FROM video_queue WHERE id = ?", (good_id,)).fetchone()
+        conn.close()
+        self.assertEqual(tuple(too_long), ("Too long", "original long description", "old tags"))
+        self.assertEqual(tuple(good), ("Updated", "updated description", "new tags"))
+
+
+class DiagnosticsProbeTests(unittest.TestCase):
+    def test_each_tool_receives_its_own_version_argument(self):
+        cases = [
+            ("FFmpeg", "C:/Tools/ffmpeg.exe", ["-version"]),
+            ("FFprobe", "C:/Tools/ffprobe.exe", ["-version"]),
+            ("yt-dlp", "C:/Tools with spaces/yt-dlp.exe", ["--version"]),
+        ]
+        for label, executable, args in cases:
+            with self.subTest(label=label), mock.patch.object(
+                app_module.subprocess, "run",
+                return_value=mock.Mock(returncode=0, stdout="2026.07.04\n", stderr=""),
+            ) as run:
+                result = app_module._probe_local_tool(label, executable, args)
+            self.assertTrue(result["available"])
+            self.assertEqual(result["version"], "2026.07.04")
+            self.assertEqual(run.call_args.args[0], [executable, *args])
+
+    def test_probe_reports_nonzero_missing_and_timeout(self):
+        with mock.patch.object(app_module.subprocess, "run", return_value=mock.Mock(
+            returncode=2, stdout="", stderr="tool error",
+        )) as run:
+            failed = app_module._probe_local_tool("yt-dlp", "yt-dlp", ["--version"])
+        self.assertFalse(failed["available"])
+        self.assertTrue(failed["error"])
+        self.assertEqual(run.call_args.args[0], ["yt-dlp", "--version"])
+
+        with mock.patch.object(app_module.subprocess, "run", side_effect=FileNotFoundError):
+            missing = app_module._probe_local_tool("yt-dlp", "missing-yt-dlp", ["--version"])
+        self.assertFalse(missing["available"])
+
+        with mock.patch.object(app_module.subprocess, "run", side_effect=app_module.subprocess.TimeoutExpired("yt-dlp", 6)):
+            timed_out = app_module._probe_local_tool("yt-dlp", "yt-dlp", ["--version"])
+        self.assertFalse(timed_out["available"])
+
+
+class MonitorLifecycleApiTests(unittest.TestCase):
+    def test_api_surfaces_stopping_and_rejects_restart_or_delete_until_exit(self):
+        conn = database.get_conn()
+        conn.execute("INSERT INTO monitors (name, source_urls) VALUES ('API lifecycle', 'https://example.test/source')")
+        monitor_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.commit()
+        conn.close()
+
+        manager = pm.PipelineManager()
+        entered = threading.Event()
+        release = threading.Event()
+        runs = []
+        def fake_loop(_monitor_id, _stop_event):
+            runs.append(1)
+            entered.set()
+            release.wait(4)
+        manager._monitor_loop = fake_loop
+        manager._start_monitor_heartbeat = lambda *args, **kwargs: None
+        manager.start_monitor_supervisor = lambda: None
+        original_manager = app_module.pipeline_manager
+        original_check = original_manager._check_monitors_health
+        original_manager._check_monitors_health = lambda: None
+        token = client.get("/api/auth/token").json()["token"]
+        headers = {"x-dhb-token": token, "Origin": "http://127.0.0.1:8686"}
+
+        try:
+            with mock.patch.object(app_module, "pipeline_manager", manager):
+                started = client.post(f"/api/monitors/{monitor_id}/toggle", headers=headers)
+                self.assertEqual(started.status_code, 200, started.text)
+                self.assertTrue(entered.wait(2))
+
+                listed = client.get("/api/monitors", headers={"x-dhb-token": token}).json()[0]
+                self.assertEqual(listed["lifecycle_state"], "Running")
+                self.assertFalse(listed["can_delete"])
+
+                stopped = client.post(f"/api/monitors/{monitor_id}/toggle", headers=headers)
+                self.assertEqual(stopped.status_code, 200, stopped.text)
+                self.assertEqual(stopped.json()["lifecycle_state"], "Stopping")
+                self.assertEqual(client.post(f"/api/monitors/{monitor_id}/toggle", headers=headers).status_code, 409)
+                self.assertEqual(client.delete(f"/api/monitors/{monitor_id}", headers=headers).status_code, 409)
+                self.assertEqual(len(runs), 1)
+
+                with manager._monitor_lock:
+                    worker = manager._monitor_workers[monitor_id]
+                release.set()
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+                listed = client.get("/api/monitors", headers={"x-dhb-token": token}).json()[0]
+                self.assertEqual(listed["lifecycle_state"], "Stopped")
+                self.assertTrue(listed["can_delete"])
+                deleted = client.delete(f"/api/monitors/{monitor_id}", headers=headers)
+                self.assertEqual(deleted.status_code, 200, deleted.text)
+        finally:
+            release.set()
+            manager.stop_monitor(monitor_id)
+            with manager._monitor_lock:
+                worker = manager._monitor_workers.get(monitor_id)
+            if worker is not None and worker.is_alive():
+                worker.join(2)
+            original_manager._check_monitors_health = original_check
 
 
 if __name__ == "__main__":

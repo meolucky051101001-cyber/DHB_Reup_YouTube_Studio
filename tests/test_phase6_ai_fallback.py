@@ -10,6 +10,36 @@ import ai_engine
 
 
 class Phase6AiFallbackTests(TestCase):
+    def test_long_generated_description_reserves_complete_source_url(self):
+        url = "https://shop.example/item?aff=sample123"
+        generated = "x" * 4990 + " " + url
+        result, preserved = ai_engine._preserve_source_links(url, generated)
+        self.assertLessEqual(len(result), 5000)
+        self.assertTrue(result.endswith(url))
+        self.assertIn(url, result)
+        self.assertEqual(preserved, 1)
+
+    def test_source_urls_are_deduplicated_exactly_without_casefolding_path(self):
+        upper = "https://shop.example/item/A?aff=one"
+        lower = "https://shop.example/item/a?aff=one"
+        result, preserved = ai_engine._preserve_source_links(f"{upper} {lower} {upper}", "rewritten")
+        self.assertEqual(preserved, 2)
+        self.assertIn(upper, result)
+        self.assertIn(lower, result)
+
+    def test_source_urls_that_cannot_fit_fail_explicitly(self):
+        url = "https://example.test/" + "x" * 100
+        with self.assertRaises(ai_engine.SourceLinksTooLongError):
+            ai_engine._preserve_source_links(url, "generated", limit=40)
+
+    def test_generated_text_is_shortened_when_source_links_are_reserved(self):
+        url = "https://shop.example/item?aff=sample123"
+        generated = "prose " + url + " " + "x" * 5100
+        result, preserved = ai_engine._preserve_source_links(url, generated)
+        self.assertLessEqual(len(result), 5000)
+        self.assertTrue(result.endswith(url))
+        self.assertEqual(preserved, 1)
+
     def test_provider_failure_is_reported_and_source_link_is_preserved(self):
         with mock.patch.object(ai_engine, "call_llm", side_effect=RuntimeError("temporary provider error")), \
              mock.patch.object(ai_engine, "translate_google_free", side_effect=lambda text, lang: "translated"), \
