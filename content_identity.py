@@ -1,6 +1,7 @@
 """Stable identities for uploaded files and source URLs."""
 
 import hashlib
+import ipaddress
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -49,10 +50,18 @@ def normalize_source_url(url):
         host = (parts.hostname or "").rstrip(".").lower()
         if scheme not in ("http", "https") or not host or parts.username or parts.password:
             return ""
+        if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+            return ""
         try:
             host = host.encode("idna").decode("ascii")
             port = parts.port
         except (UnicodeError, ValueError):
+            return ""
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_global:
             return ""
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"

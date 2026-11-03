@@ -3,6 +3,7 @@ import ipaddress
 import os
 import re
 import subprocess
+import shutil
 import threading
 import time
 from datetime import datetime
@@ -101,7 +102,8 @@ def _log_optional_step_failure(step: str, err: Exception, channel: Dict[str, Any
 
 def find_system_chrome_exe() -> Optional[str]:
     """Tìm đường dẫn Chrome / Chromium trên máy để chạy Persistent Profile."""
-    candidates = [
+    configured = os.environ.get("DHB_CHROME_EXE", "").strip()
+    candidates = ([str(Path(configured).expanduser())] if configured else []) + [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
@@ -110,7 +112,7 @@ def find_system_chrome_exe() -> Optional[str]:
     for c in candidates:
         if os.path.exists(c):
             return c
-    return None
+    return shutil.which("chrome") or shutil.which("chrome.exe") or shutil.which("chromium")
 
 
 def _launch_persistent_context_guarded(p, ctx_kwargs: Dict[str, Any], prof_name: str):

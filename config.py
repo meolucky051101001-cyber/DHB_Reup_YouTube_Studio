@@ -2,8 +2,8 @@ import os
 import json
 from pathlib import Path
 
-# Đường dẫn gốc tới bộ công cụ DHB Reup Facebook tại ổ C
-DHB_ROOT = Path(r"C:\DHB Reup Facebook")
+# Đường dẫn gốc tới bộ công cụ DHB Reup Facebook (có thể ghi đè cho cài mới).
+DHB_ROOT = Path(os.environ.get("DHB_ROOT", r"C:\DHB Reup Facebook")).expanduser()
 DHB_DATA_DIR = DHB_ROOT / "Data"
 DHB_CONFIG_DIR = DHB_DATA_DIR / "Config"
 DHB_RENDER_DIR = DHB_DATA_DIR / "Render"
@@ -11,14 +11,21 @@ DHB_PROJECT_DIR = DHB_DATA_DIR / "Project"
 DHB_PROFILE_CHROME_DIR = (DHB_DATA_DIR / "Profile Chrome") if (DHB_DATA_DIR / "Profile Chrome").exists() else (DHB_DATA_DIR / "Profile_Chrome")
 DHB_LIB_DIR = DHB_ROOT / "lib"
 
-# Các file thực thi kế thừa trực tiếp từ C:\DHB Reup Facebook
-FFMPEG_EXE = str(DHB_ROOT / "ffmpeg.exe") if (DHB_ROOT / "ffmpeg.exe").exists() else "ffmpeg"
-FFPROBE_EXE = str(DHB_ROOT / "ffprobe.exe") if (DHB_ROOT / "ffprobe.exe").exists() else "ffprobe"
-FFPLAY_EXE = str(DHB_ROOT / "ffplay.exe") if (DHB_ROOT / "ffplay.exe").exists() else "ffplay"
-YTDL_EXE = str(DHB_ROOT / "youtube-dl.exe") if (DHB_ROOT / "youtube-dl.exe").exists() else "yt-dlp"
-BROWSER_HOST_EXE = str(DHB_ROOT / "DHBBrowserHost.exe")
-MAGICK_EXE = str(DHB_LIB_DIR / "magick.exe") if (DHB_LIB_DIR / "magick.exe").exists() else "magick"
-STHP_EXE = str(DHB_LIB_DIR / "sthp.exe")
+# Các executable kế thừa từ DHB có thể được chỉ định riêng khi cài mới.
+def _tool_path(env_name: str, bundled_path: Path, fallback: str) -> str:
+    configured = os.environ.get(env_name, "").strip()
+    if configured:
+        return str(Path(configured).expanduser())
+    return str(bundled_path) if bundled_path.exists() else fallback
+
+
+FFMPEG_EXE = _tool_path("DHB_FFMPEG", DHB_ROOT / "ffmpeg.exe", "ffmpeg")
+FFPROBE_EXE = _tool_path("DHB_FFPROBE", DHB_ROOT / "ffprobe.exe", "ffprobe")
+FFPLAY_EXE = _tool_path("DHB_FFPLAY", DHB_ROOT / "ffplay.exe", "ffplay")
+YTDL_EXE = _tool_path("DHB_YTDL", DHB_ROOT / "youtube-dl.exe", "yt-dlp")
+BROWSER_HOST_EXE = _tool_path("DHB_BROWSER_HOST", DHB_ROOT / "DHBBrowserHost.exe", "DHBBrowserHost.exe")
+MAGICK_EXE = _tool_path("DHB_MAGICK", DHB_LIB_DIR / "magick.exe", "magick")
+STHP_EXE = _tool_path("DHB_STHP", DHB_LIB_DIR / "sthp.exe", "sthp.exe")
 
 # Các cơ sở dữ liệu sẵn có của DHB Reup
 DHB_MAIN_SQLITE = DHB_DATA_DIR / "data.sqlite"

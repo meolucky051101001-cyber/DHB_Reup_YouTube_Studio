@@ -31,6 +31,13 @@ class ApiSecurityTests(unittest.TestCase):
         for origin in ("http://evil.com", "null", "https://127.0.0.1.evil.com", "file://"):
             self.assertFalse(api_security.is_allowed_origin(origin), origin)
 
+    def test_mutation_origin_must_match_host_and_port(self):
+        self.assertTrue(api_security.is_same_local_origin("http://127.0.0.1:8686", "127.0.0.1:8686"))
+        self.assertTrue(api_security.is_same_local_origin("http://localhost:8686", "localhost:8686"))
+        self.assertFalse(api_security.is_same_local_origin("", "127.0.0.1:8686"))
+        self.assertFalse(api_security.is_same_local_origin("http://localhost:8686", "127.0.0.1:8686"))
+        self.assertFalse(api_security.is_same_local_origin("http://localhost:9000", "localhost:8686"))
+
     def test_token_matches(self):
         token = api_security.generate_api_token()
         self.assertTrue(api_security.token_matches(token, token))
@@ -53,7 +60,30 @@ class SecretMaskingTests(unittest.TestCase):
         self.assertTrue(public["gemini_api_key_configured"])
         self.assertFalse(public["openai_api_key_configured"])
         self.assertEqual(public["gemini_model"], "gemini-2.5-flash")
-        self.assertEqual(public["last_upload_started_epoch"], 123)
+        self.assertNotIn("last_upload_started_epoch", public)
+
+    def test_settings_whitelist_and_type_validation(self):
+        self.assertEqual(
+            database.validate_public_settings({"max_concurrent_threads": 3, "hide_browser": True}),
+            {"max_concurrent_threads": 3, "hide_browser": True},
+        )
+        with self.assertRaises(ValueError):
+            database.validate_public_settings({"unknown_secret": "do-not-store"})
+        with self.assertRaises(ValueError):
+            database.validate_public_settings({"max_concurrent_threads": "3"})
+        with self.assertRaises(ValueError):
+            database.validate_public_settings({"max_uploads_per_run": 1000})
+
+    def test_secrets_require_separate_payload(self):
+        with self.assertRaises(ValueError):
+            database.validate_public_settings({"gemini_api_key": "new-key"})
+        self.assertEqual(database.validate_secret_settings({"gemini_api_key": " new-key "}), {
+            "gemini_api_key": "new-key",
+        })
+
+    def test_proxy_password_is_masked_in_public_channel(self):
+        public = database.public_channel({"id": 2, "name": "Kênh", "proxy": "1.2.3.4:8080:user:pass123"})
+        self.assertEqual(public["proxy"], "1.2.3.4:8080:user:***")
 
     def test_public_channel_removes_token_and_cookie(self):
         row = {
@@ -102,16 +132,102 @@ class SecretMaskingTests(unittest.TestCase):
         self.assertNotIn("abc.def.ghi", redacted)
         self.assertIn("***", redacted)
 
+    def test_redact_query_json_and_proxy_credentials(self):
+        text = (
+            "https://service.test/cb?access_token=oauth-secret "
+            '{"refresh_token":"refresh-secret"} '
+            "http://user:proxy-secret@example.test:8080 "
+            "1.2.3.4:8080:user:colon-secret "
+            "Authorization: Basic dXNlcjpwYXNz"
+        )
+        redacted = database.redact_secrets(text, [])
+        for secret in ("oauth-secret", "refresh-secret", "proxy-secret", "colon-secret", "dXNlcjpwYXNz"):
+            self.assertNotIn(secret, redacted)
+
+    def test_add_log_persists_structured_run_context_and_safe_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "logs.sqlite"
+
+            def connect():
+                result = sqlite3.connect(db_path)
+                result.row_factory = sqlite3.Row
+                return result
+
+            conn = connect()
+            conn.execute(
+                "CREATE TABLE system_logs (id INTEGER PRIMARY KEY, module TEXT, channel_name TEXT, video_title TEXT, "
+                "status TEXT, message TEXT, created_at TEXT, run_id TEXT, queue_id INTEGER, attempt_id INTEGER, "
+                "phase TEXT, error_code TEXT)"
+            )
+            conn.commit()
+            conn.close()
+            database.clear_log_context()
+            database.set_log_context(run_id="run-1", queue_id=7, attempt_id=12, phase="Uploading")
+            database._invalidate_secret_cache()
+            try:
+                with mock.patch.object(database, "get_conn", side_effect=connect):
+                    database.add_log("Test", "Authorization: Bearer secret-token", "ERROR")
+                conn = connect()
+                row = conn.execute("SELECT * FROM system_logs").fetchone()
+                self.assertEqual(row["run_id"], "run-1")
+                self.assertEqual(row["queue_id"], 7)
+                self.assertEqual(row["attempt_id"], 12)
+                self.assertEqual(row["phase"], "Uploading")
+                self.assertEqual(row["error_code"], "ERR_UNCLASSIFIED")
+                self.assertNotIn("secret-token", row["message"])
+                conn.close()
+            finally:
+                database.clear_log_context()
+
+    def test_existing_log_table_receives_phase6_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "data" / "app.sqlite"
+            db_path.parent.mkdir(parents=True)
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "CREATE TABLE system_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, module TEXT DEFAULT 'System', "
+                "channel_name TEXT DEFAULT '', video_title TEXT DEFAULT '', status TEXT DEFAULT 'INFO', "
+                "message TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+            )
+            conn.commit()
+            conn.close()
+            original = {
+                "APP_DB_PATH": database.APP_DB_PATH,
+                "APP_DATA_DIR": database.APP_DATA_DIR,
+                "APP_TEMP_DIR": database.APP_TEMP_DIR,
+                "APP_PROFILES_DIR": database.APP_PROFILES_DIR,
+            }
+            database.APP_DB_PATH = db_path
+            database.APP_DATA_DIR = root / "data"
+            database.APP_TEMP_DIR = root / "temp"
+            database.APP_PROFILES_DIR = root / "profiles"
+            for path in (database.APP_TEMP_DIR, database.APP_PROFILES_DIR):
+                path.mkdir(parents=True, exist_ok=True)
+            try:
+                with mock.patch.object(database, "backup_database_on_startup"), \
+                     mock.patch.object(database, "sync_from_dhb_facebook"):
+                    database.init_db()
+                conn = database.get_conn()
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(system_logs)")}
+                conn.close()
+                self.assertTrue({"run_id", "queue_id", "attempt_id", "phase", "error_code"}.issubset(columns))
+            finally:
+                for name, value in original.items():
+                    setattr(database, name, value)
+
     def test_csv_export_redacts_secret_columns(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.execute("CREATE TABLE app_settings (key TEXT, value TEXT)")
         conn.execute("CREATE TABLE youtube_channels (id INTEGER, name TEXT, oauth_token_json TEXT, cookie TEXT)")
+        conn.execute("CREATE TABLE chrome_profiles (name TEXT, path TEXT, proxy TEXT)")
         conn.execute("INSERT INTO app_settings VALUES ('gemini_api_key', 'AIza-secret-value')")
         conn.execute("INSERT INTO app_settings VALUES ('gemini_model', 'gemini-2.5-flash')")
         conn.execute(
             "INSERT INTO youtube_channels VALUES (1, 'Kênh A', '{\"refresh_token\":\"secret\"}', 'SID=secret')"
         )
+        conn.execute("INSERT INTO chrome_profiles VALUES ('Profile A', 'C:/Profiles/A', '1.2.3.4:8080:user:proxy-pass-987')")
         conn.commit()
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -130,6 +246,8 @@ class SecretMaskingTests(unittest.TestCase):
             self.assertNotIn("refresh_token", channel_text)
             self.assertNotIn("SID=secret", channel_text)
             self.assertIn("Kênh A", channel_text)
+            profile_text = (export_dir / "chrome_profiles.csv").read_text(encoding="utf-8-sig")
+            self.assertNotIn("proxy-pass-987", profile_text)
 
 
 class RenderSafetyTests(unittest.TestCase):

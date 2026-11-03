@@ -173,6 +173,26 @@ def _fallback_translate_metadata(title: str, description: str, target_lang: str)
     }
 
 
+def _preserve_source_links(original: str, generated: str, limit: int = 5000) -> tuple[str, int]:
+    """Keep links from the source description (including affiliate URLs) in generated metadata."""
+    links = list(dict.fromkeys(re.findall(r"https?://[^\s<>\"']+", str(original or ""), flags=re.IGNORECASE)))
+    result = str(generated or "").strip()
+    missing = [url for url in links if url.casefold() not in result.casefold()]
+    suffix = ""
+    preserved = 0
+    for url in missing:
+        candidate = suffix + ("\n" if suffix else "") + url
+        if len(candidate) > limit:
+            continue
+        suffix = candidate
+        preserved += 1
+    if suffix:
+        separator = "\n\n" if result else ""
+        available = max(0, limit - len(separator) - len(suffix))
+        result = result[:available].rstrip() + separator + suffix
+    return result[:limit], preserved
+
+
 def ai_optimize_youtube_metadata(
     title: str,
     description: str = "",
@@ -180,12 +200,17 @@ def ai_optimize_youtube_metadata(
     provider: str = "gemini",
     target_lang: str = "Tiếng Việt",
     custom_prompt: str = "",
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     """
     Dịch hoặc viết lại trọn bộ Title, Description, Tags chuẩn SEO YouTube / Shorts.
     """
     if provider == "google_translate" or (action == "translate" and provider == "google_translate"):
-        return _fallback_translate_metadata(title, description, target_lang)
+        result = _fallback_translate_metadata(title, description, target_lang)
+        result["title"] = result["title"][:100]
+        result["description"], result["links_preserved"] = _preserve_source_links(description, result["description"])
+        result["provider_used"] = "google_translate"
+        result["fallback"] = False
+        return result
 
     if action == "shorts_hook":
         default_inst = (
@@ -213,16 +238,31 @@ def ai_optimize_youtube_metadata(
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
             parsed = json.loads(m.group(0))
-            return {
+            result = {
                 "title": str(parsed.get("title") or title)[:100],
                 "description": str(parsed.get("description") or description or title),
                 "tags": str(parsed.get("tags") or "shorts, viral"),
             }
+            result["description"], result["links_preserved"] = _preserve_source_links(description, result["description"])
+            result["provider_used"] = provider
+            result["fallback"] = False
+            return result
     except Exception as ex:
         add_log("AI", f"AI ({provider}) chuyển sang dịch nhanh Google Translate: {ex}", "WARNING")
-        return _fallback_translate_metadata(title, description, target_lang)
+        result = _fallback_translate_metadata(title, description, target_lang)
+        result["description"], result["links_preserved"] = _preserve_source_links(description, result["description"])
+        result["provider_used"] = "google_translate"
+        result["fallback"] = True
+        result["fallback_reason"] = "Nhà cung cấp được chọn không trả kết quả hợp lệ; đã dùng Google Translate."
+        return result
 
-    return _fallback_translate_metadata(title, description, target_lang)
+    add_log("AI", f"AI ({provider}) trả nội dung không đúng định dạng; chuyển sang Google Translate.", "WARNING")
+    result = _fallback_translate_metadata(title, description, target_lang)
+    result["description"], result["links_preserved"] = _preserve_source_links(description, result["description"])
+    result["provider_used"] = "google_translate"
+    result["fallback"] = True
+    result["fallback_reason"] = "Nhà cung cấp được chọn trả nội dung không đúng định dạng; đã dùng Google Translate."
+    return result
 
 
 def apply_batch_text_edit(

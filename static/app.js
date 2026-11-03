@@ -35,6 +35,8 @@ let gLastQueueProject = null;
 let gApiToken = null;
 let gApiTokenPromise = null;
 let gLiveRefreshInFlight = false;
+let gLiveRefreshTimer = null;
+let gApiRetryTimer = null;
 
 function selectedMultiValues(selectEl) {
   return selectEl ? Array.from(selectEl.selectedOptions || []).map(option => option.value).filter(Boolean) : [];
@@ -133,6 +135,7 @@ function filterQueueTable(query) {
     const text = r.textContent.toLowerCase();
     r.style.display = text.includes(q) ? '' : 'none';
   });
+  updateQueueSelectionSummary();
 }
 
 function onDragOverVideo(e) {
@@ -364,15 +367,15 @@ async function bfNavigate(path) {
 
     let rows = '';
     if (r.parent) {
-      rows += `<tr style="cursor:pointer;" onclick="bfNavigate(${JSON.stringify(r.parent).replace(/"/g, '&quot;')})">
+      rows += `<tr style="cursor:pointer;" onclick="bfNavigate(${escapeHtml(JSON.stringify(r.parent))})">
         <td style="padding:7px 12px; color:#38bdf8;">⬆️ .. (Thư mục cha)</td><td></td>
       </tr>`;
     }
     for (const d of (r.dirs || [])) {
       rows += `<tr>
-        <td style="padding:7px 12px; cursor:pointer;" onclick="bfNavigate(${JSON.stringify(d.path).replace(/"/g, '&quot;')})">📁 <b>${escapeHtml(d.name)}</b></td>
+        <td style="padding:7px 12px; cursor:pointer;" onclick="bfNavigate(${escapeHtml(JSON.stringify(d.path))})">📁 <b>${escapeHtml(d.name)}</b></td>
         <td style="width:60px; text-align:right; padding-right:10px;">
-          <button class="btn btn-success btn-sm" onclick="event.stopPropagation(); bfAddPath(${JSON.stringify(d.path).replace(/"/g, '&quot;')}, false)" title="Lấy video trong thư mục này">➕</button>
+          <button class="btn btn-success btn-sm" onclick="event.stopPropagation(); bfAddPath(${escapeHtml(JSON.stringify(d.path))}, false)" title="Lấy video trong thư mục này">➕</button>
         </td>
       </tr>`;
     }
@@ -491,11 +494,19 @@ async function apiFetch(url, options = {}) {
     }
     return fetch(url, { ...options, headers });
   };
-  let res = await doFetch();
+  const safeFetch = async () => {
+    try { return await doFetch(); }
+    catch (cause) {
+      const error = new Error('Không kết nối được API cục bộ. Kiểm tra server rồi thử lại.');
+      error.cause = cause;
+      throw error;
+    }
+  };
+  let res = await safeFetch();
   if (res.status === 401) {
     // Token đổi theo tiến trình server: tab đang mở phải tự lấy token mới thay vì Ctrl+F5.
     resetApiToken();
-    res = await doFetch();
+    res = await safeFetch();
   }
   if (!res.ok) {
     let errText = await res.text();
@@ -503,7 +514,9 @@ async function apiFetch(url, options = {}) {
       const j = JSON.parse(errText);
       errText = j.detail || j.message || errText;
     } catch (_) {}
-    throw new Error(errText);
+    const error = new Error(`HTTP ${res.status}: ${errText}`);
+    error.status = res.status;
+    throw error;
   }
   return res.json();
 }
@@ -514,10 +527,18 @@ async function downloadWithToken(url, fallbackName) {
       const token = await ensureApiToken();
       return fetch(url, { headers: { 'X-DHB-Token': token } });
     };
-    let res = await doFetch();
+    const safeFetch = async () => {
+      try { return await doFetch(); }
+      catch (cause) {
+        const error = new Error('Không kết nối được API cục bộ. Kiểm tra server rồi thử lại.');
+        error.cause = cause;
+        throw error;
+      }
+    };
+    let res = await safeFetch();
     if (res.status === 401) {
       resetApiToken();
-      res = await doFetch();
+      res = await safeFetch();
     }
     if (!res.ok) {
       let errText = await res.text();
@@ -525,7 +546,9 @@ async function downloadWithToken(url, fallbackName) {
         const j = JSON.parse(errText);
         errText = j.detail || j.message || errText;
       } catch (_) {}
-      throw new Error(errText);
+      const error = new Error(`HTTP ${res.status}: ${errText}`);
+      error.status = res.status;
+      throw error;
     }
     const blob = await res.blob();
     const disposition = res.headers.get('Content-Disposition') || '';
@@ -547,10 +570,11 @@ async function refreshLivePanels() {
   if (document.hidden || gLiveRefreshInFlight) return;
   gLiveRefreshInFlight = true;
   try {
-    await loadOverview();
-    await loadQueue(true);
-    await loadMonitors();
-    await loadLogs();
+    const results = await Promise.allSettled([
+      loadOverview(), loadQueue(true), loadMonitors(), loadLogs(),
+    ]);
+    const failed = results.filter(result => result.status === 'rejected').length;
+    if (failed) console.warn(`${failed} phần của bảng điều khiển chưa cập nhật được.`);
   } catch (e) {
     console.warn('Không cập nhật được bảng điều khiển:', e);
   } finally {
@@ -562,27 +586,27 @@ async function initApp() {
   try {
     await ensureApiToken();
   } catch (e) {
-    alert('Không kết nối được API cục bộ: ' + e.message);
+    showToast('Không kết nối được API cục bộ; sẽ thử lại sau vài giây.', 'warning');
+    if (!gApiRetryTimer) {
+      gApiRetryTimer = setTimeout(() => {
+        gApiRetryTimer = null;
+        initApp();
+      }, 5000);
+    }
     return;
   }
-  await Promise.all([
-    loadOverview(),
-    loadProjects(),
-    loadGroups(),
-    loadProfiles(),
-    loadChannels(),
-    loadOptions(),
-    loadRenderResources(),
-    loadRenderPresets(),
-    loadMonitors(),
-    loadAppSettings(),
-    loadLogs(),
-    loadLogModules(),
-  ]);
-  await loadQueue();
+  const sections = [
+    loadOverview(), loadProjects(), loadGroups(), loadProfiles(), loadChannels(),
+    loadOptions(), loadRenderResources(), loadRenderPresets(), loadMonitors(),
+    loadAppSettings(), loadLogs(), loadLogModules(),
+  ];
+  const results = await Promise.allSettled(sections);
+  const followup = await Promise.allSettled([loadDiagnostics(), loadQueue()]);
+  const failed = results.concat(followup).filter(result => result.status === 'rejected').length;
+  if (failed) showToast(`${failed} phần không tải được; các phần còn lại vẫn hoạt động.`, 'warning');
 
   // Polling tự động mỗi 2.5 giây; tạm dừng khi tab ẩn để không tải DB/log vô ích
-  setInterval(refreshLivePanels, 2500);
+  if (!gLiveRefreshTimer) gLiveRefreshTimer = setInterval(refreshLivePanels, 2500);
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) refreshLivePanels();
   });
@@ -1512,11 +1536,13 @@ async function loadQueue(preserveSelection = false) {
   const tbody = document.getElementById('queue-tbody');
   if (!items.length) {
     tbody.innerHTML = `<tr><td colspan="12" style="text-align:center; padding:28px; color:var(--text-muted)">Chưa có video nào trong dự án này. Hãy nhập Link hoặc Thư mục video ở khung bên trái để quét!</td></tr>`;
+    updateQueueSelectionSummary();
     return;
   }
 
   tbody.innerHTML = items.map(item => {
     const checked = gSelectedIds.has(item.id) ? 'checked' : '';
+    const publishedHref = safePublishedVideoUrl(item.published_url);
     let profLabel = item.target_profile_name ? `👤 ${escapeHtml(item.target_profile_name)}` : '';
     let chLabel = item.assigned_channel_id && chMap[item.assigned_channel_id]
       ? `📺 ${escapeHtml(chMap[item.assigned_channel_id].name)} (đã chốt)`
@@ -1616,7 +1642,7 @@ async function loadQueue(preserveSelection = false) {
         </td>
         <td>
           ${statusBadge}
-          ${item.published_url ? `<div style="margin-top:4px;"><a href="${escapeHtml(item.published_url)}" target="_blank" style="color:#34d399; font-size:11.5px; font-weight:600;">🔗 Xem trên YT</a></div>` : ''}
+          ${publishedHref ? `<div style="margin-top:4px;"><a href="${escapeHtml(publishedHref)}" target="_blank" rel="noopener noreferrer" style="color:#34d399; font-size:11.5px; font-weight:600;">🔗 Xem trên YT</a></div>` : (item.published_url ? '<div title="URL không phải địa chỉ HTTPS của YouTube" style="margin-top:4px; color:var(--text-muted); font-size:11px;">🔗 URL không hợp lệ</div>' : '')}
           ${item.schedule_time ? `<div style="font-size:11px; color:#fbbf24; margin-top:3px; font-weight:600;" title="Thời gian hẹn giờ đăng">📅 ${escapeHtml(item.schedule_time.slice(5, 16))}</div>` : ''}
           ${item.error_message ? `<div style="font-size:10.5px; color:#fb7185; margin-top:2px;">${escapeHtml(item.error_message.slice(0, 65))}</div>` : ''}
         </td>
@@ -1636,27 +1662,57 @@ async function loadQueue(preserveSelection = false) {
   if (searchInput && searchInput.value) {
     filterQueueTable(searchInput.value);
   }
+  updateQueueSelectionSummary();
 }
 
 function onRowCheck(id, checked) {
   if (checked) gSelectedIds.add(id);
   else gSelectedIds.delete(id);
+  updateQueueSelectionSummary();
 }
 
 function toggleSelectAll(checked) {
-  document.getElementById('chk-all').checked = checked;
   document.querySelectorAll('.row-chk').forEach(cb => {
+    const row = cb.closest('tr');
+    if (!row || row.style.display === 'none') return;
     cb.checked = checked;
     const id = parseInt(cb.getAttribute('data-id'), 10);
     if (checked) gSelectedIds.add(id);
     else gSelectedIds.delete(id);
   });
+  updateQueueSelectionSummary();
+}
+
+function getVisibleQueueIds() {
+  return Array.from(document.querySelectorAll('.row-chk'))
+    .filter(cb => cb.closest('tr') && cb.closest('tr').style.display !== 'none')
+    .map(cb => parseInt(cb.getAttribute('data-id'), 10))
+    .filter(Number.isFinite);
+}
+
+function updateQueueSelectionSummary() {
+  const summary = document.getElementById('queue-selection-summary');
+  const currentIds = new Set((gQueueItems || []).map(item => Number(item.id)));
+  const selected = Array.from(gSelectedIds).filter(id => currentIds.has(Number(id)));
+  const visible = getVisibleQueueIds();
+  const hiddenCount = selected.filter(id => !visible.includes(Number(id))).length;
+  if (summary) {
+    summary.textContent = selected.length
+      ? `Đã chọn ${selected.length} video${hiddenCount ? ` (${hiddenCount} dòng đang ẩn)` : ''}; thao tác dùng đủ số đã chọn.`
+      : `Chưa chọn thủ công; thao tác mặc định áp dụng ${visible.length} dòng đang hiển thị.`;
+  }
+  const selectAll = document.getElementById('chk-all');
+  if (selectAll) {
+    const selectedVisible = visible.filter(id => gSelectedIds.has(id)).length;
+    selectAll.checked = visible.length > 0 && selectedVisible === visible.length;
+    selectAll.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+  }
 }
 
 function getTargetIdsOrAlert() {
-  if (gSelectedIds.size > 0) return Array.from(gSelectedIds);
-  const allBoxes = Array.from(document.querySelectorAll('.row-chk'));
-  return allBoxes.map(cb => parseInt(cb.getAttribute('data-id'), 10));
+  const currentIds = new Set((gQueueItems || []).map(item => Number(item.id)));
+  const selected = Array.from(gSelectedIds).filter(id => currentIds.has(Number(id)));
+  return selected.length ? selected : getVisibleQueueIds();
 }
 
 function toggleScanScheduleFields() {
@@ -2092,14 +2148,19 @@ async function applyAutoSchedule() {
 }
 
 async function deleteSelectedQueue() {
-  if (gSelectedIds.size === 0) {
+  const currentIds = new Set((gQueueItems || []).map(item => Number(item.id)));
+  const ids = Array.from(gSelectedIds).filter(id => currentIds.has(Number(id)));
+  if (!ids.length) {
     alert('Hãy tích chọn các dòng video muốn xóa.');
     return;
   }
-  if (!confirm(`Xóa ${gSelectedIds.size} video đã chọn?`)) return;
+  const visibleIds = new Set(getVisibleQueueIds());
+  const hiddenCount = ids.filter(id => !visibleIds.has(Number(id))).length;
+  const scope = hiddenCount ? ` (bao gồm ${hiddenCount} dòng đang ẩn theo bộ lọc)` : '';
+  if (!confirm(`Xóa ${ids.length} video đã chọn${scope}?`)) return;
   await apiFetch('/api/queue/delete', {
     method: 'POST',
-    body: JSON.stringify({ ids: Array.from(gSelectedIds) }),
+    body: JSON.stringify({ ids }),
   });
   gSelectedIds.clear();
   await loadProjects();
@@ -2322,15 +2383,13 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
   let ids;
   if (Array.isArray(overrideIds) && overrideIds.length > 0) {
     ids = overrideIds.slice();
-  } else if (gSelectedIds.size > 0) {
-    ids = Array.from(gSelectedIds);
   } else {
-    ids = Array.from(document.querySelectorAll('.row-chk')).map(cb => parseInt(cb.getAttribute('data-id'), 10));
+    ids = getTargetIdsOrAlert();
     if (!ids.length) {
       alert('Chưa có video nào để chạy.');
       return;
     }
-    if (!confirm(`Bạn chưa chọn video nào. Hệ thống sẽ chạy TẤT CẢ ${ids.length} video đang hiển thị. Tiếp tục?`)) return;
+    if (!gSelectedIds.size && !confirm(`Bạn chưa chọn thủ công. Hệ thống sẽ chạy ${ids.length} video đang hiển thị theo bộ lọc hiện tại. Tiếp tục?`)) return;
   }
 
   if (doUpload) {
@@ -2399,9 +2458,7 @@ function formatDistributionPreview(preview) {
 }
 
 async function previewSelectedDistribution() {
-  const ids = gSelectedIds.size
-    ? Array.from(gSelectedIds)
-    : Array.from(document.querySelectorAll('.row-chk')).map(cb => parseInt(cb.getAttribute('data-id'), 10)).filter(Number.isFinite);
+  const ids = getTargetIdsOrAlert();
   if (!ids.length) return alert('Chưa có video nào để preview.');
   try {
     const preview = await apiFetch('/api/queue/preview-distribution', {
@@ -2442,7 +2499,13 @@ async function runAIProcess(type) {
       method: 'POST',
       body: JSON.stringify(payload),
     });
-    alert(`Đã cập nhật nội dung thành công cho ${res.updated} video!`);
+    if (payload.mode === 'batch_edit') {
+      alert(`Đã biên tập ${res.updated} video.`);
+    } else {
+      const actual = Object.entries(res.provider_counts || {}).map(([name, count]) => `${name}: ${count}`).join(', ') || 'không có video';
+      const fallback = Number(res.fallback_count || 0);
+      alert(`Đã cập nhật ${res.updated} video.\nYêu cầu: ${res.provider_requested || payload.provider}\nThực tế: ${actual}${fallback ? `\n${fallback} video chuyển sang Google Translate.` : ''}${res.links_preserved ? `\nĐã giữ ${res.links_preserved} link từ mô tả gốc.` : ''}`);
+    }
     await loadQueue(true);
   } catch (e) {
     alert('Lỗi xử lý AI/Biên tập: ' + e.message);
@@ -2894,6 +2957,35 @@ async function loadAppSettings() {
   await loadStorageOverview();
 }
 
+async function loadDiagnostics() {
+  const panel = document.getElementById('diagnostics-summary');
+  if (!panel) return;
+  panel.textContent = 'Đang kiểm tra phiên bản, database, worker và FFmpeg…';
+  try {
+    const data = await apiFetch('/api/diagnostics');
+    const db = data.database || {};
+    const workers = data.workers || {};
+    const storage = data.storage || {};
+    const heartbeat = data.heartbeat || {};
+    const schemaText = (db.schemas || []).map(item => `${item.key}: v${item.version}`).join(', ') || 'chưa có bản ghi schema';
+    const toolsText = (data.tools || []).map(tool =>
+      `${tool.name}: ${tool.available ? 'OK' : 'LỖI'}${tool.version ? ` — ${tool.version}` : ''}${tool.error ? ` (${tool.error})` : ''}`
+    ).join('\n');
+    panel.textContent = [
+      `Bản dựng: ${data.version || 'không rõ'}`,
+      `Database: ${db.available ? 'OK' : 'không tìm thấy'} · ${storageFormatBytes(db.bytes || 0)} · user_version ${db.user_version ?? 0}`,
+      `Schema: ${schemaText}`,
+      `Worker batch: ${workers.pipeline_running ? 'đang chạy' : 'dừng'} · active ${workers.active_batch_threads || 0}`,
+      `Monitor: ${workers.monitor_workers || 0} worker · ${workers.monitor_heartbeats || 0} heartbeat · supervisor ${workers.monitor_supervisor_alive ? 'sống' : 'dừng'}`,
+      `NeedsReview: ${data.needs_review_count || 0} · heartbeat mới nhất: ${heartbeat.latest || 'chưa có'} (${heartbeat.running_monitors || 0} monitor bật)`,
+      `Ổ đĩa trống: ${storageFormatBytes(storage.free_bytes || 0)} · temp ${storageFormatBytes(storage.temp_bytes || 0)} · output ${storageFormatBytes(storage.output_bytes || 0)} · artifact ${storage.artifact_count || 0}`,
+      toolsText,
+    ].filter(Boolean).join('\n');
+  } catch (error) {
+    panel.textContent = `Không đọc được diagnostics: ${error.message}`;
+  }
+}
+
 async function saveAppSettings() {
   const payload = {
     gemini_model: document.getElementById('set-gemini-model').value,
@@ -2917,12 +3009,17 @@ async function saveAppSettings() {
     openai_api_key: 'set-openai-key',
     deepseek_api_key: 'set-deepseek-key',
   };
+  const secretPayload = {};
   for (const [key, id] of Object.entries(secretFields)) {
     const value = document.getElementById(id).value.trim();
-    if (value) payload[key] = value;
+    if (value) secretPayload[key] = value;
   }
   await apiFetch('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
+  if (Object.keys(secretPayload).length) {
+    await apiFetch('/api/settings/secrets', { method: 'POST', body: JSON.stringify(secretPayload) });
+  }
   await loadAppSettings();
+  await loadDiagnostics();
   alert('Đã lưu cấu hình hệ thống thành công!');
 }
 
@@ -3112,14 +3209,23 @@ async function loadLogs() {
     const logs = await apiFetch('/api/logs?' + buildLogQuery({ limit: 80 }));
     const tbody = document.getElementById('logs-tbody');
     if (!tbody) return;
-    tbody.innerHTML = logs.length ? logs.map(l => `
+    tbody.innerHTML = logs.length ? logs.map(l => {
+      const context = [
+        l.run_id ? `run ${l.run_id}` : '',
+        l.queue_id != null ? `queue #${l.queue_id}` : '',
+        l.attempt_id != null ? `attempt #${l.attempt_id}` : '',
+        l.phase || '',
+        l.error_code || '',
+      ].filter(Boolean).map(escapeHtml).join(' · ');
+      return `
       <tr>
         <td style="color:var(--text-muted); font-size:11.5px;">${escapeHtml(l.created_at)}</td>
         <td><b>${escapeHtml(l.module)}</b></td>
         <td><span class="badge ${l.status === 'ERROR' ? 'badge-err' : (l.status === 'SUCCESS' ? 'badge-ok' : 'badge-wait')}">${escapeHtml(l.status)}</span></td>
-        <td>${escapeHtml(l.message)}</td>
+        <td>${context ? `<div style="font-size:10px; color:var(--text-muted); margin-bottom:3px;">${context}</div>` : ''}${escapeHtml(l.message)}</td>
       </tr>
-    `).join('') : `
+    `;
+    }).join('') : `
       <tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:18px;">Không có log phù hợp bộ lọc.</td></tr>
     `;
   } catch (e) {}
@@ -3140,7 +3246,25 @@ function escapeHtml(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safePublishedVideoUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    const host = url.hostname.toLowerCase();
+    const allowedHosts = new Set(['youtu.be', 'www.youtu.be', 'youtube.com', 'www.youtube.com', 'm.youtube.com']);
+    if (url.protocol !== 'https:' || !allowedHosts.has(host) || (url.port && url.port !== '443') || url.username || url.password) return '';
+    const parts = url.pathname.split('/').filter(Boolean);
+    let videoId = '';
+    if (host.endsWith('youtu.be') && parts.length === 1) videoId = parts[0];
+    else if (parts.length === 1 && parts[0] === 'watch') videoId = url.searchParams.get('v') || '';
+    else if (parts.length === 2 && ['shorts', 'live', 'embed'].includes(parts[0].toLowerCase())) videoId = parts[1];
+    return /^[A-Za-z0-9_-]{11}$/.test(videoId) ? url.href : '';
+  } catch (_) {
+    return '';
+  }
 }
 
 window.addEventListener('DOMContentLoaded', initApp);

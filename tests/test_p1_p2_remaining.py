@@ -147,7 +147,8 @@ class FrontendTokenRefreshTests(unittest.TestCase):
     def test_api_fetch_retries_once_after_401(self):
         self.assertIn("function resetApiToken()", self.source)
         self.assertIn("if (res.status === 401)", self.source)
-        self.assertIn("resetApiToken();\n    res = await doFetch();", self.source)
+        self.assertIn("const safeFetch = async () =>", self.source)
+        self.assertIn("resetApiToken();\n    res = await safeFetch();", self.source)
         self.assertIn("ensureApiToken(true)", self.source)
 
     def test_excel_import_uses_retrying_fetch(self):

@@ -18,3 +18,5 @@ logs/
 
 # Bản backup code theo phiên
 _backup_*/
+# Runtime singleton lock file
+data/app_instance.lock

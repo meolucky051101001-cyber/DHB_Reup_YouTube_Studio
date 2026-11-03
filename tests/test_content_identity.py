@@ -46,6 +46,9 @@ class ContentIdentityTests(unittest.TestCase):
     def test_url_normalization_rejects_unsupported_or_credentialed_urls(self):
         self.assertEqual(content_identity.normalize_source_url("ftp://example.com/video"), "")
         self.assertEqual(content_identity.normalize_source_url("https://user@example.com/video"), "")
+        self.assertEqual(content_identity.normalize_source_url("http://127.0.0.1/video"), "")
+        self.assertEqual(content_identity.normalize_source_url("http://192.168.1.10/video"), "")
+        self.assertEqual(content_identity.normalize_source_url("http://printer.local/video"), "")
 
     def test_dedupe_key_prefers_fingerprint_then_source_id_then_url(self):
         self.assertEqual(

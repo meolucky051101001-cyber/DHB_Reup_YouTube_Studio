@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import shutil
 import threading
@@ -9,7 +10,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from database import get_conn, add_log, get_settings, save_settings, register_managed_artifact
+from database import (
+    get_conn, add_log, get_settings, save_settings, register_managed_artifact,
+    set_log_context, clear_log_context,
+)
 from config import APP_OUTPUT_DIR, APP_TEMP_DIR
 from scanner_downloader import download_video, scan_social_urls
 from render_engine import render_video, generate_thumbnail_from_video
@@ -45,6 +49,11 @@ _UPLOAD_GAP_LOCK = threading.Lock()
 _UPLOAD_GAP_STATE_BROKEN = False
 
 RENDER_QUEUE_DEFAULT_WORKERS = 2
+
+
+def _log_run_id(batch_token: str) -> str:
+    """Derive a correlation ID without exposing the claim token in API-visible logs."""
+    return hashlib.sha256(str(batch_token or "").encode("utf-8")).hexdigest()[:16]
 
 
 def _history_contains_item(conn, item, channel_id, content_key):
@@ -1013,7 +1022,8 @@ class PipelineManager:
             self._batch_worker(item_ids, do_download, do_render, do_upload, batch_token, force_reupload)
         except Exception as exc:
             try:
-                add_log("Pipeline", f"Tiến trình hàng đợi gặp lỗi: {exc}", "ERROR")
+                add_log("Pipeline", f"Tiến trình hàng đợi gặp lỗi: {exc}", "ERROR",
+                        run_id=_log_run_id(batch_token), phase="batch", error_code="ERR_BATCH")
             except Exception:
                 pass
         finally:
@@ -1042,40 +1052,92 @@ class PipelineManager:
     ):
         settings = get_settings()
         max_workers = max(1, int(settings.get("max_concurrent_threads", 2) or 2))
-        delay_sec = max(0, int(settings.get("upload_delay_seconds", 5) or 5))
+        delay_value = settings.get("upload_delay_seconds", 5)
+        delay_sec = max(0, int(5 if delay_value in (None, "") else delay_value))
         sem = threading.Semaphore(max_workers)
         threads = []
+        launch_failure = None
 
         add_log(
             "Pipeline",
             f"Khởi chạy hàng đợi ({len(item_ids)} video) với tối đa {max_workers} luồng song song.",
             "INFO",
+            run_id=_log_run_id(batch_token),
+            phase="batch",
         )
 
         for idx, item_id in enumerate(item_ids):
-            if self._stop_event.is_set():
+            acquired = False
+            try:
+                while not self._stop_event.is_set():
+                    if sem.acquire(timeout=0.25):
+                        acquired = True
+                        break
+            except Exception as exc:
+                launch_failure = (item_id, type(exc).__name__)
                 break
-            sem.acquire()
+            if not acquired:
+                break
             if self._stop_event.is_set():
                 sem.release()
                 break
 
-            worker_t = threading.Thread(
-                target=self._process_single_item_safe,
-                args=(item_id, idx, do_download, do_render, do_upload, sem, batch_token, force_reupload),
-                daemon=True,
-            )
+            worker_t = None
+            try:
+                worker_t = threading.Thread(
+                    target=self._process_single_item_safe,
+                    args=(item_id, idx, do_download, do_render, do_upload, sem, batch_token, force_reupload),
+                    daemon=True,
+                )
+                worker_t.start()
+            except Exception as exc:
+                worker_started = False
+                if worker_t is not None:
+                    try:
+                        worker_started = worker_t.ident is not None or worker_t.is_alive()
+                    except Exception:
+                        worker_started = False
+                if worker_started:
+                    threads.append(worker_t)
+                else:
+                    sem.release()
+                launch_failure = (item_id, type(exc).__name__)
+                break
             threads.append(worker_t)
-            worker_t.start()
+
             if delay_sec > 0 and idx < len(item_ids) - 1:
                 import random
                 actual_delay = delay_sec + random.randint(2, 6)
-                time.sleep(actual_delay)
+                if self._stop_event.wait(actual_delay):
+                    break
 
+        # A launch/stop must not clear claims while any already-started child is still alive.
         for wt in threads:
             wt.join()
 
-        add_log("Pipeline", "Hoàn tất xử lý hàng đợi video.", "SUCCESS")
+        if launch_failure:
+            failed_item_id, error_type = launch_failure
+            add_log(
+                "Pipeline",
+                f"Không khởi chạy được worker cho queue #{failed_item_id} ({error_type}); lô đã dừng nhận item mới.",
+                "ERROR",
+                run_id=_log_run_id(batch_token),
+                queue_id=failed_item_id,
+                phase="worker_start",
+                error_code="ERR_WORKER_START",
+            )
+            return
+        if self._stop_event.is_set():
+            add_log(
+                "Pipeline",
+                "Đã dừng nhận item mới; các worker đã bắt đầu hoàn tất trước khi đóng lô.",
+                "WARNING",
+                run_id=_log_run_id(batch_token),
+                phase="batch",
+            )
+            return
+
+        add_log("Pipeline", "Hoàn tất xử lý hàng đợi video.", "SUCCESS", run_id=_log_run_id(batch_token), phase="batch")
 
     def _process_single_item_safe(
         self,
@@ -1091,15 +1153,35 @@ class PipelineManager:
         upload_counter: Optional[Dict[str, int]] = None,
         owner: str = "batch",
     ):
+        clear_log_context()
+        set_log_context(run_id=_log_run_id(batch_token), queue_id=item_id, phase="queued")
         try:
             self.process_single_item(
                 item_id, row_idx, do_download, do_render, do_upload,
                 claim_token=batch_token, force_reupload=force_reupload,
                 stop_event=stop_event, upload_counter=upload_counter, owner=owner,
             )
+        except Exception as exc:
+            try:
+                add_log(
+                    "Pipeline",
+                    f"Worker queue #{item_id} exited unexpectedly ({type(exc).__name__}).",
+                    "ERROR",
+                    run_id=_log_run_id(batch_token),
+                    queue_id=item_id,
+                    phase="worker",
+                    error_code="ERR_WORKER",
+                )
+            except Exception:
+                pass
         finally:
-            release_item_claim(item_id, batch_token)
-            sem.release()
+            try:
+                release_item_claim(item_id, batch_token)
+            finally:
+                try:
+                    sem.release()
+                finally:
+                    clear_log_context()
 
     def process_single_item(
         self,
@@ -1227,6 +1309,7 @@ class PipelineManager:
                         state["stage"] = stage
                         try:
                             _set_upload_attempt_phase(upload_attempt_id, stage)
+                            set_log_context(attempt_id=upload_attempt_id, phase=stage)
                             _update_row(status=f"Uploading -> {stage}")
                         except Exception as phase_err:
                             add_log(
@@ -1284,6 +1367,7 @@ class PipelineManager:
                     _update_row(status="Stopped")
                     return
                 ensure_disk_space(APP_TEMP_DIR, MIN_DOWNLOAD_HEADROOM_BYTES, "tải video")
+                set_log_context(phase="download")
                 _update_row(status="Downloading...", download_progress=5, error_message="")
                 dl_res = download_video(
                     source_url=item.get("source_url") or "",
@@ -1349,6 +1433,7 @@ class PipelineManager:
                     APP_OUTPUT_DIR, estimate_render_bytes(input_path), "render video"
                 )
 
+                set_log_context(phase="render")
                 _update_row(status="Rendering...", render_progress=5, error_message="")
                 try:
                     render_cfg = json.loads(item.get("render_config_json") or "{}")
@@ -1530,6 +1615,7 @@ class PipelineManager:
                         error_message="Worker không còn quyền sở hữu lượt đăng; chưa gửi yêu cầu lên YouTube.",
                     )
                     return
+                set_log_context(attempt_id=upload_attempt_id, phase="Uploading")
                 if not _update_row(status=f"Uploading -> {channel['name']}", upload_progress=10, error_message=""):
                     _finish_upload_attempt(upload_attempt_id, "NotSent", error_message="Claim đã đổi trước khi gọi uploader.")
                     return
@@ -1727,7 +1813,8 @@ class PipelineManager:
                 return
             err_msg = str(e)
             _update_row(status="Error", error_message=err_msg)
-            add_log("Error", f"Lỗi xử lý '{title}': {err_msg}", "ERROR", video_title=title)
+            add_log("Error", f"Lỗi xử lý '{title}': {err_msg}", "ERROR", video_title=title,
+                    error_code="ERR_JOB")
         finally:
             if reservation_owned:
                 try:

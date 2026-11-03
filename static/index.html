@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DHB Reup YouTube Studio — Hệ Thống Tự Động Hóa Reup & Đăng YouTube</title>
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261103-p6" />
 </head>
 <body>
   <!-- TOP HEADER -->
@@ -506,6 +506,7 @@
                   </button>
                   <button class="btn btn-outline btn-sm" onclick="toggleSelectAll(true)">Chọn tất cả</button>
                   <button class="btn btn-outline btn-sm" onclick="toggleSelectAll(false)">Bỏ chọn</button>
+                  <span id="queue-selection-summary" aria-live="polite" style="font-size:11px; color:var(--text-muted);">Chưa chọn thủ công; thao tác mặc định áp dụng các dòng đang hiển thị.</span>
                   <button class="btn btn-outline btn-sm" style="color:#f87171; border-color:rgba(248,113,113,0.3);" onclick="deleteSelectedQueue()" title="Xóa các video đang tích chọn khỏi hàng đợi">
                     🗑️ Xóa dòng chọn
                   </button>
@@ -1259,7 +1260,7 @@
           <div class="row-inline form-group">
             <div>
               <label>Google Gemini API Key:</label>
-              <input type="text" id="set-gemini-key" />
+              <input type="password" id="set-gemini-key" autocomplete="new-password" />
             </div>
             <div>
               <label>Gemini Model:</label>
@@ -1419,6 +1420,14 @@
           <div class="form-group" style="font-size:11.5px; color:var(--text-muted);">
             Chỉ file có manifest của tool và không còn được hàng đợi tham chiếu mới xuất hiện. NeedsReview luôn được giữ. Việc dọn chỉ chạy sau khi chọn mục và xác nhận.
           </div>
+        </div>
+        <div class="card" style="grid-column:1/-1;">
+          <div class="card-header">
+            <div class="card-title">🩺 Chẩn Đoán Cài Đặt & Worker</div>
+            <button class="btn btn-outline btn-sm" onclick="loadDiagnostics()">Kiểm tra lại</button>
+          </div>
+          <pre id="diagnostics-summary" class="form-group" style="white-space:pre-wrap; overflow-wrap:anywhere; color:var(--text-muted);">Đang kiểm tra…</pre>
+          <div style="font-size:11.5px; color:var(--text-muted);">Phiên bản, schema, heartbeat, NeedsReview, dung lượng và khả năng chạy FFmpeg/FFprobe/yt-dlp. Bảng này không hiển thị khóa hoặc mật khẩu.</div>
         </div>
       </div>
     </section>
@@ -1806,6 +1815,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=24"></script>
+  <script src="/static/app.js?v=20261103-p6"></script>
 </body>
 </html>

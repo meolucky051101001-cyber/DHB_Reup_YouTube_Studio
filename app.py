@@ -7,10 +7,12 @@ import json
 import shutil
 import hashlib
 import threading
+import subprocess
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Body, File, UploadFile, Form, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, JSONResponse
 from pydantic import BaseModel
@@ -24,9 +26,11 @@ if hasattr(sys.stderr, "reconfigure"):
 from config import (
     APP_ROOT,
     APP_DATA_DIR,
+    APP_DB_PATH,
     APP_TEMP_DIR,
     DHB_ROOT,
     FFMPEG_EXE,
+    FFPROBE_EXE,
     YTDL_EXE,
     list_dhb_render_resources,
     load_dhb_render_configs,
@@ -35,6 +39,7 @@ from api_security import (
     generate_api_token,
     is_allowed_host,
     is_allowed_origin,
+    is_same_local_origin,
     token_matches,
 )
 from content_identity import copy_stream_and_hash, normalize_source_url
@@ -53,6 +58,8 @@ from database import (
     export_all_tables_csv,
     collect_secret_values,
     is_secret_setting_key,
+    validate_public_settings,
+    validate_secret_settings,
     public_channel,
     public_settings,
     redact_secrets,
@@ -236,7 +243,8 @@ def _housekeeping_worker():
 threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
 pipeline_manager.start_monitor_supervisor()
 
-app = FastAPI(title="DHB Reup YouTube Studio", version="2.0.0")
+APP_BUILD_VERSION = "2026.11.03-p6"
+app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
 API_TOKEN = generate_api_token()
 TOKEN_EXEMPT_PATHS = {"/api/auth/token"}
@@ -257,7 +265,9 @@ async def guard_local_api(request: Request, call_next):
 
     path = request.url.path
     if path.startswith("/api/") and path not in TOKEN_EXEMPT_PATHS:
-        if request.method in STATE_CHANGING_METHODS and not is_allowed_origin(request.headers.get("origin", "")):
+        if request.method in STATE_CHANGING_METHODS and not is_same_local_origin(
+            request.headers.get("origin", ""), request.headers.get("host", "")
+        ):
             return JSONResponse({"detail": "Origin không hợp lệ — chặn yêu cầu cross-site."}, status_code=403)
         token = _extract_api_token(request)
         if not token_matches(token, API_TOKEN):
@@ -265,7 +275,55 @@ async def guard_local_api(request: Request, call_next):
 
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    content_type = response.headers.get("content-type", "").lower()
+    if path != "/api/auth/token" and "application/json" in content_type:
+        try:
+            raw_body = b"".join([chunk async for chunk in response.body_iterator])
+            safe_body = redact_secrets(raw_body.decode("utf-8", errors="replace")).encode("utf-8")
+            response_headers = {
+                key: value for key, value in response.headers.items()
+                if key.lower() not in {"content-length", "content-encoding"}
+            }
+            return Response(
+                content=safe_body,
+                status_code=response.status_code,
+                headers=response_headers,
+                background=response.background,
+            )
+        except Exception:
+            pass
     return response
+
+
+@app.exception_handler(HTTPException)
+async def safe_http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail if isinstance(exc.detail, (str, int, float, bool)) or exc.detail is None else str(exc.detail)
+    return JSONResponse(
+        {"detail": redact_secrets(detail)},
+        status_code=exc.status_code,
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def safe_validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = []
+    for entry in exc.errors():
+        errors.append({
+            "loc": entry.get("loc", []),
+            "msg": redact_secrets(entry.get("msg", "Dữ liệu không hợp lệ.")),
+            "type": entry.get("type", "value_error"),
+        })
+    return JSONResponse({"detail": errors}, status_code=422)
+
+
+@app.exception_handler(Exception)
+async def safe_internal_exception_handler(request: Request, exc: Exception):
+    try:
+        add_log("API", f"Unhandled {type(exc).__name__}: {exc}", "ERROR", error_code="ERR_INTERNAL")
+    except Exception:
+        pass
+    return JSONResponse({"detail": "Lỗi nội bộ máy chủ. Hãy kiểm tra Nhật Ký Hệ Thống."}, status_code=500)
 
 
 @app.get("/api/auth/token")
@@ -304,6 +362,98 @@ def get_overview():
         "dhb_connected": DHB_ROOT.exists(),
         "ffmpeg_path": FFMPEG_EXE,
         "ytdl_path": YTDL_EXE,
+    }
+
+
+def _probe_local_tool(label: str, executable: str) -> Dict[str, Any]:
+    command = str(executable or "").strip()
+    result: Dict[str, Any] = {
+        "name": label,
+        "command": Path(command).name if command else "(chưa cấu hình)",
+        "available": False,
+        "version": "",
+        "error": "",
+    }
+    if not command:
+        result["error"] = "Chưa cấu hình executable."
+        return result
+    try:
+        completed = subprocess.run(
+            [command, "-version"], capture_output=True, text=True, timeout=6, check=False,
+            encoding="utf-8", errors="replace",
+        )
+        output = (completed.stdout or completed.stderr or "").splitlines()
+        result["available"] = completed.returncode == 0
+        result["version"] = redact_secrets(output[0][:240]) if output else ""
+        if completed.returncode != 0:
+            result["error"] = "Executable trả mã lỗi khi kiểm tra phiên bản."
+    except (OSError, subprocess.TimeoutExpired):
+        result["error"] = "Không tìm thấy executable hoặc hết thời gian kiểm tra."
+    return result
+
+
+@app.get("/api/diagnostics")
+def api_diagnostics():
+    conn = get_conn()
+    try:
+        user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        schema_rows = [
+            {"key": str(row["schema_key"]), "version": int(row["version"])}
+            for row in conn.execute("SELECT schema_key, version FROM app_schema_versions ORDER BY schema_key")
+        ]
+        needs_review = int(conn.execute("SELECT COUNT(*) FROM video_queue WHERE status = 'NeedsReview'").fetchone()[0])
+        artifact_count = int(conn.execute("SELECT COUNT(*) FROM managed_artifacts").fetchone()[0])
+        heartbeat_row = conn.execute(
+            "SELECT COUNT(*) AS running, MAX(last_heartbeat_at) AS latest FROM monitors WHERE is_running = 1"
+        ).fetchone()
+        heartbeat = {"running_monitors": int(heartbeat_row["running"] or 0), "latest": heartbeat_row["latest"] or ""}
+        db_bytes = int(APP_DB_PATH.stat().st_size) if APP_DB_PATH.exists() else 0
+    finally:
+        conn.close()
+
+    try:
+        with pipeline_manager._monitor_lock:
+            monitor_workers = sum(1 for thread in pipeline_manager._monitor_workers.values() if thread.is_alive())
+            monitor_heartbeats = sum(1 for thread in pipeline_manager._monitor_heartbeats.values() if thread.is_alive())
+            supervisor_alive = bool(
+                pipeline_manager._monitor_supervisor and pipeline_manager._monitor_supervisor.is_alive()
+            )
+        workers = {
+            "pipeline_running": bool(pipeline_manager.is_running),
+            "active_batch_threads": int(pipeline_manager._active_threads),
+            "monitor_workers": monitor_workers,
+            "monitor_heartbeats": monitor_heartbeats,
+            "monitor_supervisor_alive": supervisor_alive,
+        }
+    except Exception:
+        workers = {"pipeline_running": False, "active_batch_threads": 0, "monitor_workers": 0,
+                   "monitor_heartbeats": 0, "monitor_supervisor_alive": False}
+
+    try:
+        storage = storage_overview(DEFAULT_RETENTION_DAYS)
+        storage_summary = {
+            "free_bytes": int(storage.get("free_bytes") or 0),
+            "temp_bytes": int((storage.get("temp") or {}).get("bytes") or 0),
+            "output_bytes": int((storage.get("output") or {}).get("bytes") or 0),
+            "artifact_count": artifact_count,
+        }
+    except Exception:
+        storage_summary = {"free_bytes": 0, "temp_bytes": 0, "output_bytes": 0,
+                           "artifact_count": artifact_count, "available": False}
+
+    return {
+        "version": APP_BUILD_VERSION,
+        "database": {"available": APP_DB_PATH.exists(), "bytes": db_bytes, "user_version": user_version,
+                     "schemas": schema_rows},
+        "workers": workers,
+        "needs_review_count": needs_review,
+        "storage": storage_summary,
+        "heartbeat": heartbeat,
+        "tools": [
+            _probe_local_tool("FFmpeg", FFMPEG_EXE),
+            _probe_local_tool("FFprobe", FFPROBE_EXE),
+            _probe_local_tool("yt-dlp", YTDL_EXE),
+        ],
     }
 
 
@@ -2453,6 +2603,16 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
     provider = data.get("provider") or "gemini"
     target_lang = data.get("target_lang") or "Tiếng Việt"
     custom_prompt = data.get("custom_prompt") or ""
+    if not isinstance(mode, str) or mode not in {"translate", "rewrite_seo", "shorts_hook", "batch_edit"}:
+        raise HTTPException(400, "Chế độ biên tập không hợp lệ.")
+    if not isinstance(provider, str) or provider not in {"gemini", "openai", "deepseek", "google_translate"}:
+        raise HTTPException(400, "Nhà cung cấp AI không được hỗ trợ.")
+    if not isinstance(target_lang, str) or len(target_lang) > 80:
+        raise HTTPException(400, "Ngôn ngữ đích không hợp lệ hoặc quá dài.")
+    if not isinstance(custom_prompt, str) or len(custom_prompt) > 4000:
+        raise HTTPException(400, "Prompt tùy chỉnh không được vượt quá 4000 ký tự.")
+    if not isinstance(ids, list) or len(ids) > 5000 or any(type(item_id) is not int or item_id <= 0 for item_id in ids):
+        raise HTTPException(400, "Danh sách video phải là mảng ID nguyên dương, tối đa 5000 mục.")
 
     # Tham số cho batch_edit
     edit_field = data.get("edit_field") or "title"
@@ -2461,6 +2621,10 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
     edit_op = data.get("edit_op") or "append_end"
     find_str = data.get("find_str") or ""
     replace_str = data.get("replace_str") or ""
+    if not isinstance(edit_op, str) or edit_op not in {"append_end", "append_first", "replace", "strip_hashtags", "titlecase", "uppercase", "lowercase"}:
+        raise HTTPException(400, "Thao tác biên tập không hợp lệ.")
+    if not isinstance(find_str, str) or not isinstance(replace_str, str) or len(find_str) > 5000 or len(replace_str) > 5000:
+        raise HTTPException(400, "Chuỗi tìm/thay thế phải là văn bản tối đa 5000 ký tự.")
 
     conn = get_conn()
     if ids:
@@ -2471,6 +2635,9 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
         rows = conn.execute("SELECT * FROM video_queue WHERE project_name = ?", (project_name,)).fetchall()
 
     updated = 0
+    provider_counts: Dict[str, int] = {}
+    fallback_count = 0
+    links_preserved = 0
     for r in rows:
         item = dict(r)
         if mode == "batch_edit":
@@ -2494,12 +2661,31 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
                 "UPDATE video_queue SET title = ?, description = ?, tags = ? WHERE id = ?",
                 (res["title"], res["description"], res["tags"], item["id"]),
             )
+            actual_provider = str(res.get("provider_used") or provider)
+            provider_counts[actual_provider] = provider_counts.get(actual_provider, 0) + 1
+            fallback_count += int(bool(res.get("fallback")))
+            links_preserved += int(res.get("links_preserved") or 0)
             updated += 1
 
     conn.commit()
     conn.close()
-    add_log("AI", f"Đã xử lý AI / Biên tập cho {updated} video (chế độ: {mode}).", "SUCCESS")
-    return {"ok": True, "updated": updated}
+    if mode == "batch_edit":
+        add_log("AI", f"Đã biên tập thủ công {updated} video.", "SUCCESS")
+        return {"ok": True, "updated": updated}
+    summary = ", ".join(f"{name}: {count}" for name, count in sorted(provider_counts.items())) or "không có video"
+    add_log(
+        "AI",
+        f"Đã xử lý {updated} video; yêu cầu {provider}; nhà cung cấp thực tế [{summary}]; fallback {fallback_count}.",
+        "WARNING" if fallback_count else "SUCCESS",
+    )
+    return {
+        "ok": True,
+        "updated": updated,
+        "provider_requested": provider,
+        "provider_counts": provider_counts,
+        "fallback_count": fallback_count,
+        "links_preserved": links_preserved,
+    }
 
 
 # ==========================================================
@@ -2976,7 +3162,7 @@ def api_update_profile(profile_name: str, data: Dict[str, Any] = Body(...)):
             400,
             "Proxy của Profile Antidetect do Antidetect quản lý — hãy sửa trong Antidetect.",
         )
-    if "proxy" in data:
+    if "proxy" in data and "***" not in str(data.get("proxy") or ""):
         proxy = (data.get("proxy") or "").strip()
         conn.execute("UPDATE chrome_profiles SET proxy = ? WHERE name = ?", (proxy, profile_name))
         # Quy tắc an toàn: kênh thuộc Profile phải đi cùng Proxy với lúc đăng nhập thủ công
@@ -3308,6 +3494,9 @@ def api_update_channel(channel_id: int, data: Dict[str, Any] = Body(...)):
     for k in text_fields:
         if k in data:
             v = data.get(k)
+            if k == "proxy" and "***" in str(v or ""):
+                # GET intentionally masks proxy passwords. A masked value means keep the stored proxy.
+                continue
             if k == "oauth_token_json" and not str(v or "").strip():
                 # Ô token để trống = giữ nguyên token đã lưu (API không trả lại secret).
                 continue
@@ -3836,7 +4025,8 @@ def api_get_logs(limit: int = 100, module: str = "", status: str = "", q: str = 
     result = []
     for row in rows:
         item = dict(row)
-        item["message"] = redact_secrets(item.get("message"), secrets)
+        for field in ("module", "channel_name", "video_title", "status", "message", "run_id", "phase", "error_code"):
+            item[field] = redact_secrets(item.get(field), secrets)
         result.append(item)
     return result
 
@@ -3863,12 +4053,18 @@ def api_export_logs(module: str = "", status: str = "", q: str = ""):
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["id", "created_at", "module", "status", "channel_name", "video_title", "message"])
+    writer.writerow([
+        "id", "created_at", "module", "status", "channel_name", "video_title", "message",
+        "run_id", "queue_id", "attempt_id", "phase", "error_code",
+    ])
     secrets = collect_secret_values()
     for row in rows:
         writer.writerow([
             row["id"], row["created_at"], row["module"], row["status"],
-            row["channel_name"], row["video_title"], redact_secrets(row["message"], secrets),
+            redact_secrets(row["channel_name"], secrets), redact_secrets(row["video_title"], secrets),
+            redact_secrets(row["message"], secrets), redact_secrets(row["run_id"], secrets),
+            row["queue_id"], row["attempt_id"], redact_secrets(row["phase"], secrets),
+            redact_secrets(row["error_code"], secrets),
         ])
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     add_log("System", f"Đã xuất {len(rows)} dòng nhật ký ra file CSV.", "SUCCESS")
@@ -3924,11 +4120,10 @@ def api_storage_cleanup(data: Dict[str, Any] = Body(...)):
 
 @app.post("/api/settings")
 def api_save_settings(data: Dict[str, Any] = Body(...)):
-    payload = {
-        key: value
-        for key, value in data.items()
-        if not (is_secret_setting_key(key) and not str(value or "").strip())
-    }
+    try:
+        payload = validate_public_settings(data)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if "download_cookies_file" in payload:
         raw_cookie_path = str(payload.get("download_cookies_file") or "").strip()
         if raw_cookie_path:
@@ -3941,6 +4136,19 @@ def api_save_settings(data: Dict[str, Any] = Body(...)):
     return {"ok": True}
 
 
+@app.post("/api/settings/secrets")
+def api_save_secret_settings(data: Dict[str, Any] = Body(...)):
+    try:
+        payload = validate_secret_settings(data)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not payload:
+        raise HTTPException(400, "Không có khóa bí mật mới để lưu.")
+    save_settings(payload)
+    add_log("Settings", f"Đã lưu {len(payload)} khóa bí mật qua endpoint riêng.", "SUCCESS")
+    return {"ok": True, "saved": sorted(payload)}
+
+
 @app.post("/api/backup/export-now")
 def api_export_backup_now():
     settings = get_settings()
@@ -3951,8 +4159,8 @@ def api_export_backup_now():
     try:
         result = export_all_tables_csv(target, keep=keep)
     except Exception as exc:
-        add_log("Housekeeping", f"Export CSV thủ công thất bại: {exc}", "ERROR")
-        raise HTTPException(status_code=500, detail=f"Export thất bại: {exc}")
+        add_log("Housekeeping", f"Export CSV thủ công thất bại: {exc}", "ERROR", error_code="ERR_EXPORT")
+        raise HTTPException(status_code=500, detail="Export thất bại. Kiểm tra quyền thư mục và Nhật Ký Hệ Thống.") from exc
     add_log(
         "Housekeeping",
         f"Đã export CSV thủ công {result['tables']} bảng ({result['rows']} dòng) → {result['path']}",

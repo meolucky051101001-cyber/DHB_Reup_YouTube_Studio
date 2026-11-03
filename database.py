@@ -5,9 +5,11 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlsplit
 from content_identity import normalize_source_url
 from phase4_rules import GROUP_SCHEMA_VERSION, normalize_group_names, serialize_group_names
 
@@ -345,7 +347,12 @@ def init_db():
             video_title TEXT DEFAULT '',
             status TEXT DEFAULT 'INFO',
             message TEXT DEFAULT '',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            run_id TEXT DEFAULT '',
+            queue_id INTEGER DEFAULT NULL,
+            attempt_id INTEGER DEFAULT NULL,
+            phase TEXT DEFAULT '',
+            error_code TEXT DEFAULT ''
         )
     """)
 
@@ -415,6 +422,11 @@ def init_db():
     _add_col_if_missing("chrome_profiles", "last_login_check", "TEXT DEFAULT ''")
     _add_col_if_missing("chrome_profiles", "antidetect_profile_id", "TEXT DEFAULT ''")
     _add_col_if_missing("monitors", "last_heartbeat_at", "TEXT DEFAULT ''")
+    _add_col_if_missing("system_logs", "run_id", "TEXT DEFAULT ''")
+    _add_col_if_missing("system_logs", "queue_id", "INTEGER DEFAULT NULL")
+    _add_col_if_missing("system_logs", "attempt_id", "INTEGER DEFAULT NULL")
+    _add_col_if_missing("system_logs", "phase", "TEXT DEFAULT ''")
+    _add_col_if_missing("system_logs", "error_code", "TEXT DEFAULT ''")
 
     try:
         cur.execute(
@@ -564,6 +576,7 @@ def export_all_tables_csv(target_dir: str, keep: int = 10) -> Dict[str, Any]:
     dest.mkdir(parents=True, exist_ok=False)
 
     conn = get_conn()
+    secret_values = collect_secret_values(connection=conn)
     table_rows: Dict[str, int] = {}
     total_rows = 0
     try:
@@ -589,6 +602,8 @@ def export_all_tables_csv(target_dir: str, keep: int = 10) -> Dict[str, Any]:
                             value = ""
                         elif table == "app_settings" and column == "value" and is_secret_setting_key(row["key"]):
                             value = ""
+                        elif isinstance(value, str):
+                            value = redact_secrets(value, secret_values)
                         out_row.append(value)
                     writer.writerow(out_row)
             table_rows[table] = len(rows)
@@ -747,20 +762,64 @@ def content_identity_migration_report() -> Dict[str, int]:
 
 
 SECRET_CHANNEL_COLUMNS = {"oauth_token_json", "cookie"}
+SECRET_SETTING_KEYS = {
+    "gemini_api_key", "openai_api_key", "deepseek_api_key", "youtube_api_key",
+    "facebook_cookie", "douyin_cookie", "tiktok_cookie", "instagram_cookie",
+}
+PUBLIC_SETTING_KEYS = {
+    "gemini_model", "openai_model", "deepseek_model", "download_resolution",
+    "download_resolution_tiktok", "download_cookies_file", "hide_browser",
+    "delete_temp_after_upload", "max_concurrent_threads", "max_concurrent_renders",
+    "upload_delay_seconds", "checks_timeout_seconds", "monitor_upload_gap_minutes",
+    "max_uploads_per_run", "thumbnail_source", "external_backup_dir", "external_backup_keep",
+}
+SETTING_INT_RANGES = {
+    "max_concurrent_threads": (1, 10),
+    "max_concurrent_renders": (1, 8),
+    "upload_delay_seconds": (0, 3600),
+    "checks_timeout_seconds": (30, 600),
+    "monitor_upload_gap_minutes": (0, 1440),
+    "max_uploads_per_run": (0, 100),
+    "external_backup_keep": (1, 100),
+}
+SETTING_BOOL_KEYS = {"hide_browser", "delete_temp_after_upload"}
+SETTING_STRING_LIMITS = {
+    "gemini_model": 160, "openai_model": 160, "deepseek_model": 160,
+    "download_resolution": 80, "download_resolution_tiktok": 16,
+    "download_cookies_file": 2048, "external_backup_dir": 2048,
+    "thumbnail_source": 16,
+}
+_LOG_CONTEXT = threading.local()
+_SECRET_CACHE_LOCK = threading.Lock()
+_SECRET_CACHE_AT = 0.0
+_SECRET_CACHE_VALUES: List[str] = []
+
+
+def _invalidate_secret_cache() -> None:
+    global _SECRET_CACHE_AT, _SECRET_CACHE_VALUES
+    with _SECRET_CACHE_LOCK:
+        _SECRET_CACHE_AT = 0.0
+        _SECRET_CACHE_VALUES = []
+
+
+def set_log_context(**values: Any) -> None:
+    """Set structured context for logs emitted by the current worker thread."""
+    current = dict(getattr(_LOG_CONTEXT, "values", {}) or {})
+    current.update({key: value for key, value in values.items() if value is not None})
+    _LOG_CONTEXT.values = current
+
+
+def clear_log_context() -> None:
+    _LOG_CONTEXT.values = {}
 
 
 def is_secret_setting_key(key: str) -> bool:
     k = str(key or "").strip().lower()
-    return k in {
-        "gemini_api_key",
-        "openai_api_key",
-        "deepseek_api_key",
-        "youtube_api_key",
-        "facebook_cookie",
-        "douyin_cookie",
-        "tiktok_cookie",
-        "instagram_cookie",
-    } or k.endswith("_api_key") or k.endswith("_cookie")
+    return (
+        k in SECRET_SETTING_KEYS
+        or k in {"api_key", "token", "password", "secret", "cookie", "oauth_token_json"}
+        or k.endswith(("_api_key", "_cookie", "_token", "_password", "_secret"))
+    )
 
 
 def _is_secret_column(column: str) -> bool:
@@ -774,8 +833,64 @@ def public_settings(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     for key, value in (data or {}).items():
         if is_secret_setting_key(key):
             result[f"{key}_configured"] = bool(str(value or "").strip())
-        else:
+        elif key in PUBLIC_SETTING_KEYS:
             result[key] = value
+    return result
+
+
+def validate_public_settings(settings: Any) -> Dict[str, Any]:
+    """Validate the small, supported set of settings writable from the local API."""
+    if not isinstance(settings, dict):
+        raise ValueError("Cấu hình phải là một object JSON.")
+    unknown = sorted(str(key) for key in settings if key not in PUBLIC_SETTING_KEYS)
+    if unknown:
+        secret_names = [key for key in unknown if is_secret_setting_key(key)]
+        if secret_names:
+            raise ValueError("Giá trị bí mật phải được ghi qua thao tác lưu khóa riêng.")
+        raise ValueError("Có trường cài đặt không được hỗ trợ: " + ", ".join(unknown[:8]))
+
+    result: Dict[str, Any] = {}
+    for key, value in settings.items():
+        if key in SETTING_INT_RANGES:
+            if type(value) is not int:
+                raise ValueError(f"Cài đặt {key} phải là số nguyên.")
+            low, high = SETTING_INT_RANGES[key]
+            if not low <= value <= high:
+                raise ValueError(f"Cài đặt {key} phải nằm trong khoảng {low}–{high}.")
+            result[key] = value
+        elif key in SETTING_BOOL_KEYS:
+            if type(value) is not bool:
+                raise ValueError(f"Cài đặt {key} phải là true/false.")
+            result[key] = value
+        else:
+            if not isinstance(value, str):
+                raise ValueError(f"Cài đặt {key} phải là chuỗi.")
+            normalized = value.strip()
+            if len(normalized) > SETTING_STRING_LIMITS[key] or "\x00" in normalized:
+                raise ValueError(f"Cài đặt {key} vượt giới hạn độ dài hoặc có ký tự không hợp lệ.")
+            if key == "thumbnail_source" and normalized not in {"reup", "generate"}:
+                raise ValueError("Nguồn thumbnail chỉ nhận reup hoặc generate.")
+            if key == "download_resolution_tiktok" and normalized not in {"540p", "720p", "1080p"}:
+                raise ValueError("Độ phân giải tải TikTok chỉ nhận 540p, 720p hoặc 1080p.")
+            result[key] = normalized
+    return result
+
+
+def validate_secret_settings(settings: Any) -> Dict[str, str]:
+    if not isinstance(settings, dict) or not settings:
+        raise ValueError("Cần gửi ít nhất một khóa bí mật để lưu.")
+    result: Dict[str, str] = {}
+    for key, value in settings.items():
+        if key not in SECRET_SETTING_KEYS:
+            raise ValueError(f"Không hỗ trợ lưu khóa bí mật {key}.")
+        if not isinstance(value, str):
+            raise ValueError(f"Giá trị {key} phải là chuỗi.")
+        normalized = value.strip()
+        if not normalized:
+            continue
+        if len(normalized) > 20000 or "\x00" in normalized:
+            raise ValueError(f"Giá trị {key} vượt giới hạn hoặc có ký tự không hợp lệ.")
+        result[key] = normalized
     return result
 
 
@@ -785,12 +900,50 @@ def public_channel(row: Any) -> Dict[str, Any]:
     has_cookie = bool(str(item.pop("cookie", "") or "").strip())
     item["has_oauth_token"] = has_oauth
     item["has_cookie"] = has_cookie
+    if "proxy" in item:
+        item["proxy"] = mask_proxy_credentials(item.get("proxy"))
     return item
 
 
-def collect_secret_values(settings: Optional[Dict[str, Any]] = None) -> List[str]:
+def mask_proxy_credentials(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
     try:
-        data = settings if settings is not None else get_settings()
+        parsed = urlsplit(raw)
+        if parsed.scheme and parsed.netloc and parsed.username is not None and parsed.password is not None:
+            host = parsed.hostname or ""
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            if parsed.port:
+                host += f":{parsed.port}"
+            return redact_secrets(parsed._replace(netloc=f"{parsed.username}:***@{host}").geturl(), [])
+    except (ValueError, UnicodeError):
+        pass
+    parts = raw.split(":")
+    if len(parts) == 4 and parts[1].isdigit() and parts[2]:
+        return ":".join(parts[:3]) + ":***"
+    return redact_secrets(raw, [])
+
+
+def collect_secret_values(settings: Optional[Dict[str, Any]] = None, connection: Optional[sqlite3.Connection] = None) -> List[str]:
+    global _SECRET_CACHE_AT, _SECRET_CACHE_VALUES
+    if settings is None and connection is None:
+        with _SECRET_CACHE_LOCK:
+            if _SECRET_CACHE_AT and datetime.now().timestamp() - _SECRET_CACHE_AT < 5:
+                return list(_SECRET_CACHE_VALUES)
+    try:
+        if settings is not None:
+            data = settings
+        elif connection is not None:
+            data = {}
+            for row in connection.execute("SELECT key, value FROM app_settings"):
+                try:
+                    data[row["key"]] = json.loads(row["value"])
+                except Exception:
+                    data[row["key"]] = row["value"]
+        else:
+            data = get_settings()
     except Exception:
         return []
     values = []
@@ -800,7 +953,41 @@ def collect_secret_values(settings: Optional[Dict[str, Any]] = None) -> List[str
         raw = str(value or "").strip()
         if len(raw) >= 6:
             values.append(raw)
-    return sorted(set(values), key=len, reverse=True)
+    # Include channel credentials and only the password component of stored proxies.
+    owned_connection = connection is None
+    conn = connection
+    try:
+        if conn is None:
+            conn = get_conn()
+        try:
+            for row in conn.execute("SELECT oauth_token_json, cookie FROM youtube_channels"):
+                for raw_value in row:
+                    raw = str(raw_value or "").strip()
+                    if raw:
+                        values.append(raw)
+            for row in conn.execute("SELECT proxy FROM youtube_channels UNION ALL SELECT proxy FROM chrome_profiles"):
+                raw = str(row[0] or "").strip()
+                parts = raw.split(":")
+                if len(parts) == 4 and parts[1].isdigit() and parts[3]:
+                    values.append(parts[3])
+                else:
+                    try:
+                        parsed = urlsplit(raw)
+                        if parsed.password:
+                            values.append(parsed.password)
+                    except ValueError:
+                        pass
+        finally:
+            if owned_connection:
+                conn.close()
+    except Exception:
+        pass
+    result = sorted(set(values), key=len, reverse=True)
+    if settings is None and connection is None:
+        with _SECRET_CACHE_LOCK:
+            _SECRET_CACHE_VALUES = result
+            _SECRET_CACHE_AT = datetime.now().timestamp()
+    return result
 
 
 def redact_secrets(text: Any, secrets: Optional[List[str]] = None) -> str:
@@ -809,16 +996,55 @@ def redact_secrets(text: Any, secrets: Optional[List[str]] = None) -> str:
     for secret in values:
         if secret:
             out = out.replace(secret, "***")
-    out = re.sub(r"(?i)([?&]key=)[^&\s]+", r"\1***", out)
-    out = re.sub(r"(?i)(authorization:\s*bearer\s+)\S+", r"\1***", out)
+    out = re.sub(r"(?i)(authorization:\s*(?:bearer|basic)\s+|\b(?:bearer|basic)\s+)[^\s,;]+", r"\1***", out)
+    out = re.sub(
+        r"(?i)([?&](?:key|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|oauth[_-]?token|token|password|proxy[_-]?password|passwd|client[_-]?secret|secret|cookie)=)[^&\s#]+",
+        r"\1***", out,
+    )
+    out = re.sub(
+        r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|oauth[_-]?token|token|password|proxy[_-]?password|passwd|client[_-]?secret|secret|cookie)\b\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&]+)",
+        r"\1***", out,
+    )
+    out = re.sub(
+        r"(?i)(\"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|oauth[_-]?token|token|password|proxy[_-]?password|passwd|client[_-]?secret|secret|cookie|oauth_token_json)\"\s*:\s*\")[^\"]*(\")",
+        r"\1***\2", out,
+    )
+    out = re.sub(r"(?i)(https?://[^/@\s:]+:)[^/@\s]+@", r"\1***@", out)
+    out = re.sub(r"(?i)(cookie(?:\s+header)?\s*:\s*)[^\r\n]+", r"\1***", out)
+    out = re.sub(r"(?i)((?:\d{1,3}\.){3}\d{1,3}:\d{2,5}:[^:\s]+:)[^\s]+", r"\1***", out)
     return out
 
 
-def add_log(module: str, message: str, status: str = "INFO", channel_name: str = "", video_title: str = ""):
+def add_log(
+    module: str,
+    message: str,
+    status: str = "INFO",
+    channel_name: str = "",
+    video_title: str = "",
+    *,
+    run_id: Optional[str] = None,
+    queue_id: Optional[int] = None,
+    attempt_id: Optional[int] = None,
+    phase: Optional[str] = None,
+    error_code: Optional[str] = None,
+):
     conn = get_conn()
+    context = dict(getattr(_LOG_CONTEXT, "values", {}) or {})
+    safe_status = redact_secrets(status)
+    log_error_code = str(error_code or context.get("error_code") or ("ERR_UNCLASSIFIED" if safe_status.upper() == "ERROR" else ""))
+    context_run_id = run_id if run_id is not None else context.get("run_id", "")
+    context_queue_id = queue_id if queue_id is not None else context.get("queue_id")
+    context_attempt_id = attempt_id if attempt_id is not None else context.get("attempt_id")
+    context_phase = phase if phase is not None else context.get("phase", "")
     conn.execute(
-        "INSERT INTO system_logs (module, channel_name, video_title, status, message, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (module, channel_name, video_title, status, redact_secrets(message), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        "INSERT INTO system_logs (module, channel_name, video_title, status, message, created_at, run_id, queue_id, attempt_id, phase, error_code) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            redact_secrets(module), redact_secrets(channel_name), redact_secrets(video_title), safe_status,
+            redact_secrets(message), datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            redact_secrets(context_run_id), context_queue_id,
+            context_attempt_id, redact_secrets(context_phase), redact_secrets(log_error_code),
+        ),
     )
     conn.commit()
     conn.close()
@@ -892,6 +1118,8 @@ def save_settings(new_settings: Dict[str, Any]):
         )
     conn.commit()
     conn.close()
+    if any(is_secret_setting_key(key) for key in new_settings):
+        _invalidate_secret_cache()
 
 
 def sync_from_dhb_facebook(initial_only: bool = False) -> Dict[str, int]:
@@ -1084,6 +1312,7 @@ def get_all_profiles() -> List[Dict[str, Any]]:
         pdict = dict(p)
         cnt = conn.execute("SELECT COUNT(*) as c FROM youtube_channels WHERE profile_name = ?", (pdict["name"],)).fetchone()["c"]
         pdict["channel_count"] = cnt
+        pdict["proxy"] = mask_proxy_credentials(pdict.get("proxy"))
         res.append(pdict)
     conn.close()
     return res

@@ -393,9 +393,21 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertIn("pipeline_running", res.json())
 
-    def test_state_changing_blocked_without_token(self):
-        # 401 ở middleware — KHÔNG đụng vào pipeline thật.
-        self.assertEqual(client.post("/api/pipeline/stop").status_code, 401)
+    def test_state_changing_requires_same_origin_and_token(self):
+        # Thiếu Origin bị chặn trước khi xác thực token; không gọi tới pipeline thật.
+        self.assertEqual(client.post("/api/pipeline/stop").status_code, 403)
+
+        token = client.get("/api/auth/token").json()["token"]
+        headers = {"Origin": "http://127.0.0.1:8686", "Host": "127.0.0.1:8686"}
+        probe = "/api/__phase6_guard_probe"
+        self.assertEqual(client.post(probe, headers=headers).status_code, 401)
+
+        headers["X-DHB-Token"] = token
+        headers["Origin"] = "http://evil.example"
+        self.assertEqual(client.post(probe, headers=headers).status_code, 403)
+
+        headers["Origin"] = "http://127.0.0.1:8686"
+        self.assertEqual(client.post(probe, headers=headers).status_code, 404)
 
 
 if __name__ == "__main__":

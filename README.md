@@ -130,3 +130,9 @@ Khi sửa frontend, nhớ tăng tham số `app.js?v=N` để trình duyệt đan
 - [HUONG_DAN_SU_DUNG.txt](HUONG_DAN_SU_DUNG.txt) — hướng dẫn thao tác từng tab cho người vận hành.
 - [CHANGELOG.md](CHANGELOG.md) — các thay đổi theo phiên, gồm lỗi đã sửa và số lượng test.
 - [HANDOVER_PROMPT.md](HANDOVER_PROMPT.md) / [HANDOVER_PROMPT_v2.md](HANDOVER_PROMPT_v2.md) — bối cảnh bàn giao và ràng buộc khi tiếp tục phát triển.
+
+## Đường dẫn công cụ và chẩn đoán
+
+Mặc định tool tìm bộ DHB tại `C:\DHB Reup Facebook`; có thể đổi thư mục gốc bằng `DHB_ROOT`. Có thể chỉ định riêng executable khi cài đặt khác chuẩn: `DHB_FFMPEG`, `DHB_FFPROBE`, `DHB_FFPLAY`, `DHB_YTDL`, `DHB_BROWSER_HOST`, `DHB_MAGICK` và `DHB_STHP`. Nếu không đặt override, tool dùng file nằm trong thư mục DHB mặc định hoặc executable tương ứng trong `PATH` khi được hỗ trợ.
+
+Tab Tổng quan có phần Chẩn đoán; API `GET /api/diagnostics` trả phiên bản/schema, trạng thái worker, số item cần đối soát, tổng quan dung lượng/heartbeat và tình trạng các công cụ media.

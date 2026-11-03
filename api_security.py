@@ -30,6 +30,20 @@ def is_allowed_origin(origin: str) -> bool:
     return parsed.scheme in ("http", "https") and normalize_host(parsed.netloc) in LOCAL_HOSTS
 
 
+def is_same_local_origin(origin: str, host_header: str) -> bool:
+    """Require a real Origin header matching the request Host including its port."""
+    if not origin or not host_header or not is_allowed_origin(origin) or not is_allowed_host(host_header):
+        return False
+    try:
+        parsed = urlsplit(origin)
+        request_host = urlsplit("//" + host_header)
+        origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        request_port = request_host.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return False
+    return normalize_host(parsed.netloc) == normalize_host(host_header) and origin_port == request_port
+
+
 def generate_api_token() -> str:
     return secrets.token_urlsafe(32)
 
