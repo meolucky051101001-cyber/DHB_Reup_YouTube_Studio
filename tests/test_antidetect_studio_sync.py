@@ -98,7 +98,7 @@ def tearDownModule():
 
 def _auth_headers() -> dict:
     token = client.get("/api/auth/token").json()["token"]
-    return {"x-dhb-token": token}
+    return {"x-dhb-token": token, "Origin": "http://127.0.0.1:8686"}
 
 
 class StudioSyncTests(unittest.TestCase):
