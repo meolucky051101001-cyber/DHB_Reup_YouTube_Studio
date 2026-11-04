@@ -1,4 +1,11 @@
 # CHANGELOG — DHB Reup YouTube Studio
+## 2026-11-04 — Sửa monitor và URL sau nghiệm thu độc lập
+
+- Danh sách monitor thu hồi các lượt đã dừng và đọc lại DB dưới cùng khóa lifecycle, để `is_running`, trạng thái và quyền Chạy/Xóa cùng phản ánh trạng thái đã đồng bộ. Sửa trường hợp SQLite bận khiến nút Dừng dùng dữ liệu cũ và thao tác toggle lại khởi chạy monitor.
+- Bảo toàn URL bằng cách so khớp toàn bộ token, giữ nguyên các URL khác cùng tiền tố/path/query/fragment. Chỉ cộng separator khi phần mô tả còn chỗ; block URL dài đúng 5.000 ký tự được chấp nhận, block vượt giới hạn vẫn trả lỗi rõ.
+- Thêm regression tests HTTP với SQLite khóa thật và heartbeat thật, cùng các biên URL 4.998–5.000 ký tự có/không có phần văn bản. Các test mới tái hiện lỗi trên `f3db822` trước sửa.
+- Bản dựng `2026.11.04-p7-fix2`. Phần tích hợp ACCEPT-01 đầy đủ, Windows sạch và dịch vụ thật vẫn cần nghiệm thu theo kế hoạch.
+
 ## 2026-11-03 — Đợt 5: tải, render và quản lý dung lượng
 
 - ffprobe fail-closed khi file thiếu, hỏng JSON, không có video stream, thiếu kích thước hoặc thời lượng hợp lệ; downloader dùng prefix UUID, timeout/retry hữu hạn, cookies Netscape tùy chọn, worker process riêng để dừng cây tiến trình, kiểm tra video đầu ra và dọn riêng partial của lượt tải.

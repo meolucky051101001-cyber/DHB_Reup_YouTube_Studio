@@ -10,6 +10,27 @@ import ai_engine
 
 
 class Phase6AiFallbackTests(TestCase):
+    def test_source_prefix_does_not_damage_other_complete_urls(self):
+        source = "https://shop.example/item"
+        others = [source + "?aff=NEW", source + "/child", source + "#details"]
+        result, count = ai_engine._preserve_source_links(source, "Related: " + " ".join(others))
+        for url in others:
+            self.assertIn(url, result.split())
+        self.assertIn(source, result.split())
+        self.assertEqual(count, 1)
+
+    def test_urls_at_the_limit_fit_with_or_without_generated_prose(self):
+        prefix = "https://example.test/"
+        for length in (4998, 4999, 5000):
+            url = prefix + "x" * (length - len(prefix))
+            for generated in (url, "prose " + url, "prose"):
+                with self.subTest(length=length, prose=generated != url):
+                    result, count = ai_engine._preserve_source_links(url, generated)
+                    self.assertEqual(result, url)
+                    self.assertEqual(count, 1)
+        with self.assertRaises(ai_engine.SourceLinksTooLongError):
+            ai_engine._preserve_source_links(prefix + "x" * (5001 - len(prefix)), "")
+
     def test_long_generated_description_reserves_complete_source_url(self):
         url = "https://shop.example/item?aff=sample123"
         generated = "x" * 4990 + " " + url

@@ -1965,6 +1965,33 @@ class PipelineManager:
                     states[monitor_id] = state
             return states
 
+    def get_monitor_snapshots(self) -> List[Dict[str, Any]]:
+        """Reconcile completed stops before reading one lifecycle-consistent view."""
+        with self._monitor_lifecycle_lock:
+            conn = get_conn()
+            try:
+                monitor_ids = [int(row[0]) for row in conn.execute("SELECT id FROM monitors")]
+            finally:
+                conn.close()
+            for monitor_id in monitor_ids:
+                self._reap_monitor_locked(monitor_id)
+
+            conn = get_conn()
+            try:
+                items = [dict(row) for row in conn.execute("SELECT * FROM monitors ORDER BY id DESC")]
+            finally:
+                conn.close()
+            for item in items:
+                monitor_id = int(item["id"])
+                running = bool(item.get("is_running"))
+                with self._monitor_lock:
+                    state = self._monitor_states.get(monitor_id) or ("Running" if running else "Stopped")
+                active = self._monitor_handles_alive(monitor_id)
+                item["lifecycle_state"] = state
+                item["can_start"] = not running and not active and state not in {"Starting", "Stopping"}
+                item["can_delete"] = not running and not active and state not in {"Starting", "Running", "Stopping"}
+            return items
+
     def start_monitor(self, monitor_id: int, _auto_restart: bool = False) -> Dict[str, Any]:
         with self._monitor_lifecycle_lock:
             state = self._reap_monitor_locked(monitor_id)

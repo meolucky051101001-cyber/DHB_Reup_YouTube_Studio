@@ -179,14 +179,14 @@ class SourceLinksTooLongError(ValueError):
 
 def _preserve_source_links(original: str, generated: str, limit: int = 5000) -> tuple[str, int]:
     """Keep each exact source URL complete, reserving its space before prose is clipped."""
-    links = list(dict.fromkeys(re.findall(r"https?://[^\s<>\"']+", str(original or ""), flags=re.IGNORECASE)))
+    url_pattern = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+    links = list(dict.fromkeys(url_pattern.findall(str(original or ""))))
     result = str(generated or "").strip()
     if not links:
         return result[:limit], 0
 
     link_block = "\n".join(links)
-    separator = "\n\n" if result else ""
-    required = len(separator) + len(link_block)
+    required = len(link_block)
     if required > limit:
         raise SourceLinksTooLongError(
             f"Link nguồn dài {required} ký tự, vượt giới hạn mô tả {limit}; chưa cập nhật metadata."
@@ -194,10 +194,11 @@ def _preserve_source_links(original: str, generated: str, limit: int = 5000) -> 
 
     # Put canonical source URLs in one protected block. This also prevents an
     # already generated URL near the end of the text from being cut in half.
-    for url in links:
-        result = result.replace(url, "")
+    source_urls = set(links)
+    result = url_pattern.sub(lambda match: "" if match.group(0) in source_urls else match.group(0), result)
     result = re.sub(r"[ \t]{2,}", " ", result).strip()
-    available = limit - required
+    # Prose is optional; a URL block that fits by itself must always succeed.
+    available = max(0, limit - required - 2)
 
     if len(result) > available:
         boundary = available
@@ -208,7 +209,7 @@ def _preserve_source_links(original: str, generated: str, limit: int = 5000) -> 
 
     separator = "\n\n" if result else ""
     final = result + separator + link_block
-    if len(final) > limit or any(url not in final for url in links):
+    if len(final) > limit or not source_urls.issubset(set(url_pattern.findall(final))):
         raise SourceLinksTooLongError(
             f"Không thể giữ nguyên link nguồn trong giới hạn mô tả {limit}; chưa cập nhật metadata."
         )

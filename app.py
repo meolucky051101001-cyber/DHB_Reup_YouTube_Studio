@@ -243,7 +243,7 @@ def _housekeeping_worker():
 threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
 pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.03-p7-fix1"
+APP_BUILD_VERSION = "2026.11.04-p7-fix2"
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
 API_TOKEN = generate_api_token()
@@ -3980,20 +3980,7 @@ def api_delete_render_preset(preset_id: int):
 # ==========================================================
 @app.get("/api/monitors")
 def api_list_monitors():
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM monitors ORDER BY id DESC").fetchall()
-    conn.close()
-    items = [dict(r) for r in rows]
-    states = pipeline_manager.refresh_monitor_states([int(item["id"]) for item in items])
-    for item in items:
-        monitor_id = int(item["id"])
-        running = bool(item.get("is_running"))
-        state = states.get(monitor_id) or ("Running" if running else "Stopped")
-        active = pipeline_manager._monitor_handles_alive(monitor_id)
-        item["lifecycle_state"] = state
-        item["can_start"] = not running and not active and state not in {"Starting", "Stopping"}
-        item["can_delete"] = not running and not active and state not in {"Starting", "Running", "Stopping"}
-    return items
+    return pipeline_manager.get_monitor_snapshots()
 
 
 @app.post("/api/monitors")

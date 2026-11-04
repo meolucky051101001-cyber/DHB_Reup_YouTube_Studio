@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -550,6 +551,64 @@ class DiagnosticsProbeTests(unittest.TestCase):
 
 
 class MonitorLifecycleApiTests(unittest.TestCase):
+    def test_list_uses_durable_stopped_state_after_sqlite_lock_is_released(self):
+        conn = database.get_conn()
+        monitor_id = conn.execute("INSERT INTO monitors (name, source_urls) VALUES ('Stop DB lock', 'https://example.test/source')").lastrowid
+        conn.commit()
+        conn.close()
+        manager = pm.PipelineManager()
+        manager.start_monitor_supervisor = lambda: None
+        entered, release = threading.Event(), threading.Event()
+        def loop(_id, _stop):
+            entered.set()
+            release.wait(5)
+        manager._monitor_loop = loop
+        def short_connection():
+            conn = sqlite3.connect(str(database.APP_DB_PATH), timeout=0.05, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            return conn
+        blocker = None
+        handles = []
+        original_manager = app_module.pipeline_manager
+        try:
+            with mock.patch.object(original_manager, '_check_monitors_health'), mock.patch.object(pm, 'add_log'), mock.patch.object(app_module, 'pipeline_manager', manager):
+                self.assertTrue(manager.start_monitor(monitor_id)['ok'])
+                self.assertTrue(entered.wait(2))
+                handles = [manager._monitor_workers[monitor_id], manager._monitor_heartbeats[monitor_id]]
+                blocker = database.get_conn()
+                blocker.execute('BEGIN IMMEDIATE')
+                with mock.patch.object(pm, 'get_conn', side_effect=short_connection):
+                    result = manager.stop_monitor(monitor_id)
+                self.assertFalse(result['ok'])
+                self.assertEqual(result['lifecycle_state'], 'Stopping')
+                blocker.rollback()
+                blocker.close()
+                blocker = None
+                release.set()
+                for handle in handles:
+                    handle.join(2)
+                    self.assertFalse(handle.is_alive())
+                token = client.get('/api/auth/token').json()['token']
+                headers = {'x-dhb-token': token, 'Origin': 'http://127.0.0.1:8686'}
+                response = client.get('/api/monitors', headers=headers)
+                self.assertEqual(response.status_code, 200)
+                item = next(item for item in response.json() if item['id'] == monitor_id)
+                self.assertEqual(item['is_running'], 0)
+                self.assertEqual(item['status'], 'Stopped')
+                self.assertEqual(item['lifecycle_state'], 'Stopped')
+                self.assertTrue(item['can_start'])
+                self.assertTrue(item['can_delete'])
+                self.assertEqual(client.delete(f'/api/monitors/{monitor_id}', headers=headers).status_code, 200)
+        finally:
+            if blocker is not None:
+                blocker.rollback()
+                blocker.close()
+            release.set()
+            manager.stop_monitor(monitor_id)
+            for handle in handles:
+                handle.join(2)
+                self.assertFalse(handle.is_alive())
+
     def test_api_surfaces_stopping_and_rejects_restart_or_delete_until_exit(self):
         conn = database.get_conn()
         conn.execute("INSERT INTO monitors (name, source_urls) VALUES ('API lifecycle', 'https://example.test/source')")
