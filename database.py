@@ -26,6 +26,10 @@ from config import (
 )
 
 
+class SecretCollectionError(RuntimeError):
+    """Không đọc được nguồn bí mật — thà che toàn bộ còn hơn lộ dữ liệu thật."""
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(APP_DB_PATH), timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -944,8 +948,8 @@ def collect_secret_values(settings: Optional[Dict[str, Any]] = None, connection:
                     data[row["key"]] = row["value"]
         else:
             data = get_settings()
-    except Exception:
-        return []
+    except Exception as exc:
+        raise SecretCollectionError("Không đọc được cấu hình bí mật để che dữ liệu.") from exc
     values = []
     for key, value in (data or {}).items():
         if not is_secret_setting_key(key):
@@ -980,8 +984,8 @@ def collect_secret_values(settings: Optional[Dict[str, Any]] = None, connection:
         finally:
             if owned_connection:
                 conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        raise SecretCollectionError("Không đọc được thông tin đăng nhập để che dữ liệu.") from exc
     result = sorted(set(values), key=len, reverse=True)
     if settings is None and connection is None:
         with _SECRET_CACHE_LOCK:
@@ -992,7 +996,13 @@ def collect_secret_values(settings: Optional[Dict[str, Any]] = None, connection:
 
 def redact_secrets(text: Any, secrets: Optional[List[str]] = None) -> str:
     out = str(text or "")
-    values = secrets if secrets is not None else collect_secret_values()
+    if secrets is None:
+        try:
+            values = collect_secret_values()
+        except SecretCollectionError:
+            return "***"
+    else:
+        values = secrets
     for secret in values:
         if secret:
             out = out.replace(secret, "***")

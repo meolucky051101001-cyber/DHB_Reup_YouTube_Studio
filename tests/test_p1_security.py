@@ -144,6 +144,28 @@ class SecretMaskingTests(unittest.TestCase):
         for secret in ("oauth-secret", "refresh-secret", "proxy-secret", "colon-secret", "dXNlcjpwYXNz"):
             self.assertNotIn(secret, redacted)
 
+    def test_redact_fails_closed_when_secret_source_unreadable(self):
+        with mock.patch.object(
+            database, "collect_secret_values",
+            side_effect=database.SecretCollectionError("db down"),
+        ):
+            self.assertEqual(database.redact_secrets("token=abc123"), "***")
+        self.assertEqual(database.redact_secrets("token=abc123", []), "token=***")
+
+    def test_collect_secret_values_raises_when_settings_unreadable(self):
+        database._invalidate_secret_cache()
+        try:
+            with mock.patch.object(database, "get_settings", side_effect=RuntimeError("db down")):
+                with self.assertRaises(database.SecretCollectionError):
+                    database.collect_secret_values()
+        finally:
+            database._invalidate_secret_cache()
+
+    def test_collect_secret_values_raises_when_channel_store_unreadable(self):
+        with mock.patch.object(database, "get_conn", side_effect=sqlite3.OperationalError("locked")):
+            with self.assertRaises(database.SecretCollectionError):
+                database.collect_secret_values(settings={"gemini_api_key": "abcdef"})
+
     def test_add_log_persists_structured_run_context_and_safe_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "logs.sqlite"
@@ -159,6 +181,10 @@ class SecretMaskingTests(unittest.TestCase):
                 "status TEXT, message TEXT, created_at TEXT, run_id TEXT, queue_id INTEGER, attempt_id INTEGER, "
                 "phase TEXT, error_code TEXT)"
             )
+            # Redaction đọc bí mật từ các bảng này; thiếu bảng sẽ fail-closed thành "***".
+            conn.execute("CREATE TABLE app_settings (key TEXT, value TEXT)")
+            conn.execute("CREATE TABLE youtube_channels (oauth_token_json TEXT, cookie TEXT, proxy TEXT)")
+            conn.execute("CREATE TABLE chrome_profiles (proxy TEXT)")
             conn.commit()
             conn.close()
             database.clear_log_context()
@@ -220,12 +246,12 @@ class SecretMaskingTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.execute("CREATE TABLE app_settings (key TEXT, value TEXT)")
-        conn.execute("CREATE TABLE youtube_channels (id INTEGER, name TEXT, oauth_token_json TEXT, cookie TEXT)")
+        conn.execute("CREATE TABLE youtube_channels (id INTEGER, name TEXT, oauth_token_json TEXT, cookie TEXT, proxy TEXT)")
         conn.execute("CREATE TABLE chrome_profiles (name TEXT, path TEXT, proxy TEXT)")
         conn.execute("INSERT INTO app_settings VALUES ('gemini_api_key', 'AIza-secret-value')")
         conn.execute("INSERT INTO app_settings VALUES ('gemini_model', 'gemini-2.5-flash')")
         conn.execute(
-            "INSERT INTO youtube_channels VALUES (1, 'Kênh A', '{\"refresh_token\":\"secret\"}', 'SID=secret')"
+            "INSERT INTO youtube_channels VALUES (1, 'Kênh A', '{\"refresh_token\":\"secret\"}', 'SID=secret', '')"
         )
         conn.execute("INSERT INTO chrome_profiles VALUES ('Profile A', 'C:/Profiles/A', '1.2.3.4:8080:user:proxy-pass-987')")
         conn.commit()

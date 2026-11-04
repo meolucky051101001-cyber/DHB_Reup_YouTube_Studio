@@ -25,6 +25,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Import app sau khi đã tắt worker nền + lock thật (xem app.py).
+os.environ["DHB_DISABLE_BACKGROUND_TASKS"] = "1"
+
 import database
 import pipeline_manager as pm
 from fastapi import HTTPException, UploadFile
@@ -50,7 +53,9 @@ def setUpModule():
     database.init_db()
     import app
     app_module = app
-    app_module.APP_TEMP_DIR = _TMP / "temp"  # endpoint upload ghi file vào đây
+    app_module.APP_DB_PATH = database.APP_DB_PATH
+    app_module.APP_DATA_DIR = database.APP_DATA_DIR
+    app_module.APP_TEMP_DIR = database.APP_TEMP_DIR  # endpoint upload ghi file vào đây
     client = TestClient(app_module.app, base_url="http://127.0.0.1:8686")
 
 
@@ -187,6 +192,53 @@ class DeleteGuardTests(unittest.TestCase):
         rid2 = self._seed(status="Error")
         res = app_module.api_delete_queue_items({"ids": [rid1, rid2]})
         self.assertEqual(res["deleted"], 2)
+
+    def test_project_delete_blocked_when_queue_row_is_claimed(self):
+        conn = database.get_conn()
+        conn = database.get_conn()
+        conn.execute("INSERT OR IGNORE INTO projects (name) VALUES ('Dự án Xóa')")
+        conn.commit()
+        before = conn.execute(
+            "SELECT COUNT(*) AS c FROM video_queue WHERE project_name = 'Dự án Xóa'"
+        ).fetchone()["c"]
+        conn.close()
+        self._seed(status="Pending", claim="worker-token")
+
+        with self.assertRaises(HTTPException) as ctx:
+            app_module.api_delete_project("Dự án Xóa")
+        self.assertEqual(ctx.exception.status_code, 409)
+
+        conn = database.get_conn()
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS c FROM video_queue WHERE project_name = 'Dự án Xóa'"
+        ).fetchone()["c"]
+        project = conn.execute("SELECT 1 FROM projects WHERE name = 'Dự án Xóa'").fetchone()
+        conn.close()
+        self.assertEqual(remaining, before + 1)
+        self.assertIsNotNone(project)
+
+    def test_shorts_boost_blocked_for_claimed_row(self):
+        rid = self._seed(status="Pending", claim="worker-token")
+        with self.assertRaises(HTTPException) as ctx:
+            app_module.api_shorts_boost({"ids": [rid]})
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_auto_schedule_blocked_for_uploading_row(self):
+        rid = self._seed(status="Uploading -> Kênh A")
+        with self.assertRaises(HTTPException) as ctx:
+            app_module.api_auto_schedule({"ids": [rid], "interval_minutes": 60})
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_ai_edit_blocked_for_needs_review_row(self):
+        rid = self._seed(status="NeedsReview")
+        with self.assertRaises(HTTPException) as ctx:
+            app_module.api_ai_process_queue({
+                "ids": [rid],
+                "mode": "batch_edit",
+                "edit_field": "title",
+                "edit_op": "append_end",
+            })
+        self.assertEqual(ctx.exception.status_code, 409)
 
 
 class UploadDedupeTests(unittest.TestCase):
@@ -392,6 +444,16 @@ class SmokeTests(unittest.TestCase):
 
     def test_api_requires_token(self):
         self.assertEqual(client.get("/api/overview").status_code, 401)
+
+    def test_every_response_denies_framing(self):
+        for response in (
+            client.get("/"),
+            client.get("/api/auth/token"),
+            client.get("/api/overview"),
+            client.get("/api/auth/token", headers={"host": "evil.example"}),
+        ):
+            self.assertEqual(response.headers.get("x-frame-options"), "DENY")
+            self.assertIn("frame-ancestors 'none'", response.headers.get("content-security-policy", ""))
 
     def test_overview_with_token(self):
         token = client.get("/api/auth/token").json()["token"]

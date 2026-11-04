@@ -2946,6 +2946,14 @@ def upload_via_playwright_studio(
     Tích hợp khóa đồng bộ Profile Chrome, Anti-Checkpoint Stealth Shield & Copyright Check Guardian.
     Với Profile Antidetect: dùng chung trình duyệt qua CDP, không tự mở Chrome/user_data_dir.
     """
+    # Radio 18+ trên Studio chưa từng được xác minh trong DOM thật (xem HANDOVER v7).
+    # Chặn trước khi mở trình duyệt/nạp file để không tạo bản nháp rác rồi phải dọn.
+    if metadata.get("age_restriction"):
+        raise RuntimeError(
+            "Chưa hỗ trợ xác minh giới hạn độ tuổi 18+ trên giao diện YouTube Studio hiện tại. "
+            "Đã chặn trước khi mở trình duyệt và nạp file. Hãy tắt giới hạn tuổi, "
+            "hoặc probe lại DOM và bổ sung selector trước khi bật tính năng này."
+        )
     settings = get_settings()
     hide_browser = bool(channel.get("use_hidden_desktop") or settings.get("hide_browser", False))
     prof_name = channel.get("profile_name") or f"channel_{channel.get('id', 'default')}"
@@ -3238,18 +3246,25 @@ def upload_via_playwright_studio(
                         if progress_callback:
                             progress_callback(80, f"🛑 PHÁT HIỆN VI PHẠM BẢN QUYỀN: {reason}! Đang HỦY VIDEO...")
 
-                        discard_and_cancel_upload(
+                        discard_result = discard_and_cancel_upload(
                             page=page,
                             channel_name=channel.get("name", ""),
                             video_title=metadata.get("title", ""),
                             reason=reason,
                         )
+                        discard_status = str((discard_result or {}).get("status") or "unknown")
+                        discard_note = ""
+                        if discard_status != "deleted":
+                            discard_note = (
+                                " CHƯA xác minh được việc xóa bản nháp — hãy kiểm tra YouTube Studio thủ công."
+                            )
 
                         return {
                             "cancelled": True,
                             "url": "",
                             "flagged_copyright": True,
-                            "warning_message": f"Phát hiện cảnh báo vi phạm bản quyền trên YouTube Studio ({reason}). Đã tự động HỦY BỎ và XÓA video để bảo vệ kênh an toàn!",
+                            "discard_status": discard_status,
+                            "warning_message": f"Phát hiện cảnh báo vi phạm bản quyền trên YouTube Studio ({reason}). Đã tự động HỦY BỎ video để bảo vệ kênh an toàn.{discard_note}",
                         }
 
                     if chk.get("soft_warning") and not soft_warned:
@@ -3276,17 +3291,24 @@ def upload_via_playwright_studio(
                 final_chk = check_copyright_and_violations(page)
                 if final_chk["has_violation"]:
                     reason = final_chk["reason"]
-                    discard_and_cancel_upload(
+                    discard_result = discard_and_cancel_upload(
                         page=page,
                         channel_name=channel.get("name", ""),
                         video_title=metadata.get("title", ""),
                         reason=reason,
                     )
+                    discard_status = str((discard_result or {}).get("status") or "unknown")
+                    discard_note = ""
+                    if discard_status != "deleted":
+                        discard_note = (
+                            " CHƯA xác minh được việc xóa bản nháp — hãy kiểm tra YouTube Studio thủ công."
+                        )
                     return {
                         "cancelled": True,
                         "url": "",
                         "flagged_copyright": True,
-                        "warning_message": f"Phát hiện cảnh báo vi phạm bản quyền ({reason}). Đã tự động HỦY BỎ và XÓA video để bảo vệ kênh an toàn!",
+                        "discard_status": discard_status,
+                        "warning_message": f"Phát hiện cảnh báo vi phạm bản quyền ({reason}). Đã tự động HỦY BỎ video để bảo vệ kênh an toàn.{discard_note}",
                     }
 
                 if not checks_safe_seen:
@@ -3552,12 +3574,22 @@ def upload_via_playwright_studio(
                             channel_name=channel.get("name", ""),
                             video_title=metadata.get("title", ""),
                         )
-                        discard_and_cancel_upload(
+                        cleanup_result = discard_and_cancel_upload(
                             page=page,
                             channel_name=channel.get("name", ""),
                             video_title=metadata.get("title", ""),
                             reason="Upload thất bại giữa chừng (lỗi kỹ thuật / mạng / DOM đổi)",
                         )
+                        cleanup_status = str((cleanup_result or {}).get("status") or "unknown")
+                        if cleanup_status != "deleted":
+                            add_log(
+                                "Upload",
+                                "⚠️ Chưa xác minh được việc xóa bản nháp sau lỗi "
+                                f"(trạng thái: {cleanup_status}); hãy kiểm tra YouTube Studio thủ công.",
+                                "WARNING",
+                                channel_name=channel.get("name", ""),
+                                video_title=metadata.get("title", ""),
+                            )
                     except Exception as cleanup_err:
                         add_log(
                             "Upload",

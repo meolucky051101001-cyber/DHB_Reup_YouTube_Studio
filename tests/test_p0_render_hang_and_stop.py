@@ -27,6 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Import app trong file này sau khi đã tắt worker nền + lock thật (xem app.py).
+os.environ["DHB_DISABLE_BACKGROUND_TASKS"] = "1"
+
 import config
 import database
 import render_engine
