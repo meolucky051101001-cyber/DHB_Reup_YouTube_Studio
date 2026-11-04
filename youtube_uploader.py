@@ -215,9 +215,15 @@ def build_final_metadata(
         raise ValueError(
             f"Video '{title}' không thể vừa 'Dành cho trẻ em' vừa giới hạn độ tuổi 18+. Hãy chọn lại một trong hai."
         )
+    if len(desc) > 5000:
+        raise ValueError(
+            f"Mô tả video sau khi ghép hashtag/affiliate dài {len(desc)} ký tự, vượt giới hạn 5.000 ký tự "
+            "của YouTube. Hãy rút gọn mô tả hoặc nội dung affiliate; không cắt tự động để tránh mất URL."
+        )
     return {
         "title": title[:100],
-        "description": desc[:4900],
+        "description": desc,
+        "upload_to": upload_to,
         "tags": tags_list[:25],
         "category_id": (option_group.get("category_id") if option_group else None)
         or channel.get("default_category_id")
@@ -542,6 +548,73 @@ def _close_studio_account_menus(page):
             break
 
 
+# Nút "Tạo" trong Studio: phải khớp nhãn CHÍNH XÁC. Dạng tìm chuỗi con
+# [aria-label*='Tạo' i] từng bấm nhầm "Trò chuyện với Bộ phận hỗ trợ nhà sáng tạo".
+STUDIO_CREATE_BUTTON_SELECTOR = (
+    "[aria-label='Tạo'], [aria-label='Create'], "
+    "#create-icon, ytcp-button#create-icon, ytcp-button.ytcpAppHeaderCreateIcon"
+)
+
+# Con trỏ tạm trên window để CDP lấy đúng node input mà Playwright đã phân giải.
+_UPLOAD_INPUT_MARKER = "__dhbUploadFileInput"
+
+# Video dài/4K có thể còn xử lý sau khi bấm Xuất bản; hộp thoại chia sẻ chỉ hiện
+# khi Studio hoàn tất nên cần chờ lâu hơn thay vì kết luận thất bại sau 20 giây.
+PUBLISH_CONFIRM_TIMEOUT_SECONDS = 300
+
+
+def attach_upload_file(page, file_input, file_path) -> None:
+    """Nạp file video vào <input type=file> của Studio.
+
+    Playwright 1.62 từ chối set_input_files với file >50MB khi trình duyệt được
+    gắn qua CDP (browser không được đánh dấu đồng vị trí với driver). Chrome đọc
+    thẳng từ ổ đĩa nên DOM.setFileInputFiles không có giới hạn đó; vì vậy ưu tiên
+    CDP và chỉ dùng set_input_files cho trường hợp không mở được CDP session.
+    """
+    resolved_path = str(Path(str(file_path)).resolve())
+    try:
+        file_input.evaluate(
+            "(el, marker) => { window[marker] = el; }", _UPLOAD_INPUT_MARKER
+        )
+        session = page.context.new_cdp_session(page)
+        try:
+            session.send("DOM.enable")
+            session.send("Runtime.enable")
+            evaluated = session.send(
+                "Runtime.evaluate",
+                {
+                    "expression": f"window[{_UPLOAD_INPUT_MARKER!r}]",
+                    "objectGroup": "DHBUpload",
+                },
+            )
+            object_id = (evaluated.get("result") or {}).get("objectId")
+            if not object_id:
+                raise RuntimeError("Không lấy được node input tải file qua CDP.")
+            session.send(
+                "DOM.setFileInputFiles", {"objectId": object_id, "files": [resolved_path]}
+            )
+        finally:
+            try:
+                file_input.evaluate(
+                    "(el, marker) => { delete window[marker]; }", _UPLOAD_INPUT_MARKER
+                )
+            except Exception:
+                pass
+            try:
+                session.detach()
+            except Exception:
+                pass
+        return
+    except Exception as cdp_error:
+        try:
+            file_input.set_input_files(resolved_path, timeout=30000)
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"Không nạp được file tải lên: CDP lỗi ({cdp_error}); "
+                f"set_input_files dự phòng cũng lỗi ({fallback_error})"
+            ) from fallback_error
+
+
 def _open_studio_account_menu(page) -> bool:
     try:
         header = page.locator("ytd-active-account-header-renderer").first
@@ -550,7 +623,11 @@ def _open_studio_account_menu(page) -> bool:
         if _has_visible_account_items(page):
             _close_studio_account_menus(page)
         avatar = page.locator("#avatar-btn, ytcp-button#avatar-btn, img#avatar-btn").first
-        if avatar.count() == 0:
+        # Studio là SPA: nút avatar hiện sau domcontentloaded, càng chậm khi cửa sổ bị dời
+        # ra ngoài màn hình. Chờ nút hiện rồi mới bấm để không bỏ cuộc ở lần đọc đầu tiên.
+        try:
+            page.wait_for_selector("#avatar-btn, ytcp-button#avatar-btn, img#avatar-btn", timeout=20000)
+        except Exception:
             return False
         human_move_and_click(page, avatar, delay_after=1400)
         page.wait_for_timeout(1200)
@@ -986,7 +1063,7 @@ def _probe_antidetect_login(profile_id: str, grab_channels: bool = True) -> Dict
         # Cùng khóa với luồng upload: đang upload trên profile này thì quét Studio phải chờ,
         # và ngược lại — tránh 2 lease CDP tranh cùng một Chrome của Antidetect.
         with _get_antidetect_lock(profile_id):
-            with AntidetectBrowserLease(profile_id, stop_if_started=True) as lease:
+            with AntidetectBrowserLease(profile_id, stop_if_started=True, hide_window=True) as lease:
                 page = lease.page
                 page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(3500)
@@ -2197,6 +2274,16 @@ def check_copyright_and_violations(page) -> Dict[str, Any]:
     return state
 
 
+_PUBLISHED_URL_IN_TEXT_RE = re.compile(
+    r"https?://(?:www\.)?(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|live/|embed/))"
+    r"[A-Za-z0-9_-]{11}"
+)
+
+_STUDIO_VIDEO_EDIT_PATH_RE = re.compile(
+    r"/video/([A-Za-z0-9_-]{11})/edit/?", re.IGNORECASE
+)
+
+
 def normalize_published_video_url(raw: str) -> str:
     """Validate a real YouTube video URL by parsed host, path, and 11-char ID."""
     try:
@@ -2263,6 +2350,13 @@ def extract_published_video_url(page, previous_url: str = "") -> str:
                             return url
                 except Exception:
                     continue
+            # Studio hiện URL dạng text ("Đường liên kết của video https://youtu.be/...")
+            # chứ không còn nằm trong input/href, nên phải quét cả nội dung hộp thoại.
+            match = _PUBLISHED_URL_IN_TEXT_RE.search(dialog.inner_text() or "")
+            if match:
+                url = normalize_published_video_url(match.group(0))
+                if url:
+                    return url
     except Exception:
         pass
 
@@ -2293,10 +2387,297 @@ def extract_published_video_url(page, previous_url: str = "") -> str:
     return ""
 
 
-def discard_and_cancel_upload(page, channel_name: str = "", video_title: str = "", reason: str = "") -> None:
-    """
-    Hủy tải lên và xóa hoàn toàn video nháp trên YouTube Studio khi phát hiện vi phạm bản quyền.
-    """
+def _wait_for_publish_completion(page, previous_url: str, timeout: int = PUBLISH_CONFIRM_TIMEOUT_SECONDS) -> str:
+    """Chờ Studio hoàn tất đăng và trả URL thật; video còn xử lý có thể trả kết quả muộn."""
+    deadline = time.monotonic() + max(30, int(timeout))
+    processing_logged = False
+    while time.monotonic() < deadline:
+        url = extract_published_video_url(page, previous_url)
+        if url:
+            return url
+        try:
+            processing_dialog = page.locator("ytcp-uploads-still-processing-dialog").first
+            if (
+                not processing_logged
+                and processing_dialog.count() > 0
+                and processing_dialog.is_visible()
+            ):
+                processing_logged = True
+                add_log(
+                    "Upload",
+                    "YouTube Studio vẫn đang xử lý video sau khi bấm đăng — tiếp tục chờ hộp thoại chia sẻ.",
+                    "INFO",
+                )
+        except Exception:
+            pass
+        page.wait_for_timeout(2000)
+    return ""
+
+
+def _normalize_studio_title(value: str) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _studio_row_matches_title(row, expected_title: str) -> bool:
+    """Match a content row by its full title, avoiding substring collisions."""
+    expected = _normalize_studio_title(expected_title)
+    if not expected:
+        return False
+
+    for selector in ("#video-title", "a#video-title", "ytcp-video-title"):
+        try:
+            title = row.locator(selector).first
+            if title.count() > 0 and _normalize_studio_title(title.inner_text()) == expected:
+                return True
+        except Exception:
+            continue
+
+    try:
+        lines = [_normalize_studio_title(line) for line in (row.inner_text() or "").splitlines()]
+        return expected in lines
+    except Exception:
+        return False
+
+
+_STUDIO_DRAFT_MARKERS = (
+    "bản nháp", "draft", "đã tải được", "đang tải lên", "uploading",
+    "đang chờ xử lý", "chờ xử lý", "đang xử lý", "processing",
+)
+_STUDIO_SCHEDULE_MARKERS = ("đã lên lịch", "scheduled")
+_STUDIO_UNLISTED_MARKERS = ("không công khai", "unlisted")
+_STUDIO_PRIVATE_MARKERS = ("riêng tư", "private")
+_STUDIO_PUBLIC_MARKERS = ("công khai", "public")
+
+
+def _studio_content_sections(upload_to: str) -> tuple:
+    # Studio dùng tab Shorts ở đường dẫn /videos/short (số ít); /videos/shorts trả danh sách rỗng.
+    if str(upload_to or "").strip().casefold() == "shorts":
+        return ("short", "upload")
+    return ("upload", "short")
+
+
+def _studio_row_visibility_state(row, title: str = "") -> str:
+    """Trạng thái hiển thị của hàng Studio; rỗng nếu hàng còn nháp/đang tải."""
+    try:
+        lines = (row.inner_text() or "").splitlines()
+    except Exception:
+        return ""
+    # Bỏ dòng tiêu đề: tiêu đề có thể chứa "public"/"private"/"scheduled" và làm sai phân loại.
+    expected_title = _normalize_studio_title(title)
+    text = _normalize_studio_title(
+        "\n".join(line for line in lines if _normalize_studio_title(line) != expected_title)
+    )
+    if not text or any(marker in text for marker in _STUDIO_DRAFT_MARKERS):
+        return ""
+    if any(marker in text for marker in _STUDIO_SCHEDULE_MARKERS):
+        return "schedule"
+    if any(marker in text for marker in _STUDIO_UNLISTED_MARKERS):
+        return "unlisted"
+    if any(marker in text for marker in _STUDIO_PRIVATE_MARKERS):
+        return "private"
+    if any(marker in text for marker in _STUDIO_PUBLIC_MARKERS):
+        return "public"
+    return ""
+
+
+def _studio_row_video_id(row) -> str:
+    try:
+        edit_links = row.locator("a[href*='/video/'][href*='/edit']")
+        for link_index in range(min(edit_links.count(), 10)):
+            href = edit_links.nth(link_index).get_attribute("href") or ""
+            parts = urlsplit(href)
+            host = (parts.hostname or "").lower().rstrip(".")
+            if host and host != "studio.youtube.com":
+                continue
+            match = _STUDIO_VIDEO_EDIT_PATH_RE.fullmatch(parts.path)
+            if match:
+                return match.group(1)
+    except Exception:
+        return ""
+    return ""
+
+
+def _collect_studio_title_candidates(
+    page, channel_id: str, title: str, upload_to: str = "list", require_readable: bool = False
+) -> list:
+    """Đọc ID + trạng thái của các hàng trùng chính xác tiêu đề trên tab Video/Shorts."""
+    candidates = []
+    unreadable = []
+    for section in _studio_content_sections(upload_to):
+        content_url = f"https://studio.youtube.com/channel/{channel_id}/videos/{section}"
+        page.goto(content_url, wait_until="domcontentloaded", timeout=30000)
+        rows_ready = True
+        try:
+            page.wait_for_selector("ytcp-video-row", timeout=15000)
+        except Exception:
+            # Tab trống hoặc danh sách chậm vẫn phải được đọc một lần.
+            rows_ready = False
+            page.wait_for_timeout(1500)
+        rows = page.locator("ytcp-video-row")
+        raw_count = rows.count()
+        if require_readable and ((not rows_ready and raw_count == 0) or raw_count >= 100):
+            # Không phân biệt được tab trống với tab chưa tải xong, hoặc chưa đọc hết phân trang.
+            unreadable.append(section)
+            continue
+        for index in range(min(raw_count, 100)):
+            row = rows.nth(index)
+            if not _studio_row_matches_title(row, title):
+                continue
+            video_id = _studio_row_video_id(row)
+            if require_readable and not video_id:
+                # Hàng trùng tiêu đề nhưng không đọc được ID -> không thể loại trừ về sau.
+                unreadable.append(section)
+                break
+            candidates.append(
+                {"id": video_id, "visibility": _studio_row_visibility_state(row, title)}
+            )
+    if unreadable:
+        raise RuntimeError(
+            "Không đọc đầy đủ danh sách nội dung tab " + ", ".join(sorted(set(unreadable))) + "."
+        )
+    return candidates
+
+
+def _snapshot_studio_exact_title_ids(
+    page, channel_id: str, title: str, upload_to: str = ""
+) -> Optional[set]:
+    """Chụp ID các video trùng tiêu đề TRƯỚC khi upload để loại trừ video cũ khi xác minh."""
+    channel_id = str(channel_id or "").strip()
+    if not re.fullmatch(_CHANNEL_ID_PATTERN, channel_id, re.IGNORECASE):
+        return None
+    original_url = str(page.url or "https://studio.youtube.com")
+    try:
+        candidates = _collect_studio_title_candidates(
+            page, channel_id, title, upload_to, require_readable=True
+        )
+        return {candidate["id"] for candidate in candidates if candidate["id"]}
+    except Exception:
+        return None
+    finally:
+        try:
+            page.goto(original_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            pass
+
+
+def _find_published_video_in_studio_content(
+    page,
+    channel_id: str,
+    title: str,
+    upload_to: str = "",
+    expected_visibility: str = "",
+    known_video_ids: Optional[set] = None,
+) -> str:
+    """Bằng chứng dự phòng: đúng 1 ID không nằm trong snapshot đã quan sát được chấp nhận."""
+    channel_id = str(channel_id or "").strip()
+    if not re.fullmatch(_CHANNEL_ID_PATTERN, channel_id, re.IGNORECASE):
+        return ""
+    if known_video_ids is None:
+        # Không có snapshot trước upload thì không thể loại trừ video cũ -> fail closed.
+        return ""
+    expected = str(expected_visibility or "").strip().casefold()
+    if expected in ("scheduled", "schedule"):
+        expected = "schedule"
+    if expected not in ("public", "unlisted", "private", "schedule"):
+        return ""
+    try:
+        candidates = _collect_studio_title_candidates(
+            page, channel_id, title, upload_to, require_readable=True
+        )
+    except Exception:
+        return ""
+    new_entries = [
+        candidate
+        for candidate in candidates
+        if candidate["id"] and candidate["id"] not in known_video_ids
+    ]
+    new_ids = {candidate["id"] for candidate in new_entries}
+    # Đếm TRƯỚC khi lọc visibility: Public + Draft cùng tiêu đề vẫn là 2 ứng viên mới.
+    if len(new_ids) != 1:
+        return ""
+    video_id = next(iter(new_ids))
+    if any(
+        candidate["visibility"] != expected
+        for candidate in new_entries
+        if candidate["id"] == video_id
+    ):
+        return ""
+    return f"https://youtu.be/{video_id}"
+
+
+DISCARD_DIALOG_WAIT_TIMEOUT_MS = 8000
+
+
+def discard_and_cancel_upload(
+    page, channel_name: str = "", video_title: str = "", reason: str = ""
+) -> Dict[str, Any]:
+    """Hủy tải lên/xóa nháp; chỉ báo xóa khi đã thấy hộp thoại xác nhận và nó đóng lại."""
+    result: Dict[str, Any] = {
+        "status": "not_found",
+        "clicked": [],
+        "dialog_open": False,
+        "dialog_observed": False,
+    }
+    read_state = {"error": False}
+
+    def _visible_destructive_dialog():
+        for selector in ("tp-yt-paper-dialog:visible", "ytcp-confirmation-dialog:visible"):
+            try:
+                dialogs = page.locator(selector)
+                for index in range(min(dialogs.count(), 5)):
+                    dialog = dialogs.nth(index)
+                    text = (dialog.inner_text() or "").casefold()
+                    if any(
+                        marker in text
+                        for marker in (
+                            "xóa vĩnh viễn", "delete forever", "xóa video nháp",
+                            "hủy việc tải lên", "cancel upload", "discard",
+                        )
+                    ):
+                        return dialog
+            except Exception:
+                read_state["error"] = True
+                continue
+        return None
+
+    def _wait_destructive_dialog():
+        deadline = time.monotonic() + DISCARD_DIALOG_WAIT_TIMEOUT_MS / 1000
+        while time.monotonic() < deadline:
+            dialog = _visible_destructive_dialog()
+            if dialog is not None:
+                return dialog
+            page.wait_for_timeout(500)
+        return _visible_destructive_dialog()
+
+    def _click_visible(locator, label: str) -> bool:
+        try:
+            if locator.count() > 0 and locator.is_visible():
+                human_move_and_click(page, locator, delay_after=1200)
+                result["clicked"].append(label)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _dialog_has_confirm(dialog) -> bool:
+        try:
+            button = dialog.locator("#confirm-button").first
+            return button.count() > 0 and button.is_visible()
+        except Exception:
+            read_state["error"] = True
+            return False
+
+    def _finish(status: str, message: str, level: str) -> Dict[str, Any]:
+        result["status"] = status
+        add_log(
+            "CopyrightGuardian",
+            message,
+            level,
+            channel_name=channel_name,
+            video_title=video_title,
+        )
+        return result
+
     try:
         add_log(
             "CopyrightGuardian",
@@ -2311,42 +2692,84 @@ def discard_and_cancel_upload(page, channel_name: str = "", video_title: str = "
             "ytcp-icon-button#close-button, #close-button, ytcp-button#close-button, "
             "[aria-label*='Close' i], [aria-label*='Đóng' i], [aria-label*='Cancel' i]"
         ).first
-        if close_btn.count() > 0 and close_btn.is_visible():
-            human_move_and_click(page, close_btn, delay_after=1500)
+        _click_visible(close_btn, "close")
 
-        discard_btn = page.locator(
-            "ytcp-button#delete-button, ytcp-button:has-text('Delete video'), "
-            "ytcp-button:has-text('Xóa video'), ytcp-button:has-text('Discard changes'), "
-            "ytcp-button:has-text('Hủy thay đổi'), ytcp-button:has-text('Delete'), "
-            "ytcp-button:has-text('Xóa'), ytcp-button:has-text('Discard'), "
-            "ytcp-button:has-text('Hủy')"
-        ).first
-        if discard_btn.count() > 0 and discard_btn.is_visible():
-            human_move_and_click(page, discard_btn, delay_after=1500)
+        dialog = _wait_destructive_dialog()
+        if dialog is None and not read_state["error"]:
+            open_delete_btn = page.locator(
+                "ytcp-button#delete-button, ytcp-button:has-text('Delete video'), "
+                "ytcp-button:has-text('Xóa video')"
+            ).first
+            if _click_visible(open_delete_btn, "open-delete"):
+                dialog = _wait_destructive_dialog()
 
-        confirm_chk = page.locator(
+        if dialog is None:
+            result["dialog_open"] = bool(_visible_destructive_dialog())
+            if read_state["error"]:
+                return _finish(
+                    "uncertain",
+                    "⚠️ Không đọc được hộp thoại xác nhận hủy/xóa trên Studio. "
+                    "Hãy mở YouTube Studio kiểm tra và xóa thủ công nếu còn.",
+                    "WARNING",
+                )
+            return _finish(
+                "not_found",
+                "⚠️ Không quan sát thấy hộp thoại xác nhận hủy/xóa bản nháp trên Studio. "
+                "Đã dừng thao tác để tránh báo xóa sai; hãy mở Studio kiểm tra thủ công.",
+                "WARNING",
+            )
+
+        result["dialog_observed"] = True
+
+        if not _dialog_has_confirm(dialog):
+            discard_btn = dialog.locator(
+                "ytcp-button#delete-button, ytcp-button:has-text('Delete forever'), "
+                "ytcp-button:has-text('Xóa vĩnh viễn'), ytcp-button:has-text('Discard changes'), "
+                "ytcp-button:has-text('Hủy thay đổi'), ytcp-button:has-text('Discard')"
+            ).first
+            _click_visible(discard_btn, "delete")
+            dialog = _visible_destructive_dialog() or dialog
+
+        confirm_chk = dialog.locator(
             "tp-yt-paper-checkbox#confirm-checkbox, tp-yt-paper-checkbox:has-text('understand'), "
             "tp-yt-paper-checkbox:has-text('hiểu'), tp-yt-paper-checkbox"
         ).first
-        if confirm_chk.count() > 0 and confirm_chk.is_visible():
-            human_move_and_click(page, confirm_chk, delay_after=800)
+        _click_visible(confirm_chk, "confirm-checkbox")
 
-        del_forever_btn = page.locator(
-            "ytcp-button#confirm-button, ytcp-button:has-text('Delete forever'), "
-            "ytcp-button:has-text('Xóa vĩnh viễn'), ytcp-button:has-text('Delete')"
+        del_forever_btn = dialog.locator(
+            "#confirm-button, ytcp-button:has-text('Delete forever'), "
+            "ytcp-button:has-text('Xóa vĩnh viễn')"
         ).first
-        if del_forever_btn.count() > 0 and del_forever_btn.is_visible():
-            human_move_and_click(page, del_forever_btn, delay_after=2000)
+        confirm_clicked = _click_visible(del_forever_btn, "confirm-delete")
 
         page.wait_for_timeout(3000)
-        add_log(
-            "CopyrightGuardian",
-            "✅ Đã hủy tải lên và xóa sạch bản nháp video khỏi Studio thành công!",
+        read_state["error"] = False
+        result["dialog_open"] = _visible_destructive_dialog() is not None
+        final_read_error = read_state["error"]
+
+        if not confirm_clicked:
+            return _finish(
+                "uncertain" if result["clicked"] else "not_found",
+                "⚠️ Đã thấy hộp thoại hủy/xóa nhưng không bấm được nút xác nhận. "
+                "Hãy mở YouTube Studio kiểm tra và xóa thủ công nếu còn.",
+                "WARNING",
+            )
+        if final_read_error or result["dialog_open"]:
+            return _finish(
+                "uncertain",
+                "⚠️ Đã bấm xác nhận hủy/xóa nhưng CHƯA xác minh được hộp thoại đã đóng. "
+                "Hãy mở YouTube Studio kiểm tra và xóa thủ công nếu còn.",
+                "WARNING",
+            )
+        return _finish(
+            "deleted",
+            "✅ Đã hủy tải lên và xóa bản nháp video khỏi Studio "
+            "(đã thấy hộp thoại xác nhận và hộp thoại đã đóng).",
             "INFO",
-            channel_name=channel_name,
-            video_title=video_title,
         )
     except Exception as e:
+        result["status"] = "failed"
+        result["error"] = str(e)
         add_log(
             "CopyrightGuardian",
             f"❌ Không hủy/xóa được bản nháp sau cảnh báo bản quyền ({e}). "
@@ -2355,6 +2778,7 @@ def discard_and_cancel_upload(page, channel_name: str = "", video_title: str = "
             channel_name=channel_name,
             video_title=video_title,
         )
+    return result
 
 
 class _StudioBrowserSession:
@@ -2402,7 +2826,11 @@ class _StudioBrowserSession:
                     video_title=self.metadata.get("title", ""),
                 )
             self.is_mobile_mode = False
-            self._lease = AntidetectBrowserLease(self.antidetect_profile_id, stop_if_started=True)
+            self._lease = AntidetectBrowserLease(
+                self.antidetect_profile_id,
+                stop_if_started=True,
+                hide_window=self.hide_browser,
+            )
             self._lease.__enter__()
             self.context = self._lease.tracked_context
             self.page = self._lease.page
@@ -2603,10 +3031,26 @@ def upload_via_playwright_studio(
                     video_title=metadata.get("title", ""),
                 )
 
+                known_video_ids = _snapshot_studio_exact_title_ids(
+                    page,
+                    active_channel.get("channel_id", ""),
+                    metadata.get("title", ""),
+                    metadata.get("upload_to", ""),
+                )
+                if known_video_ids is None:
+                    add_log(
+                        "Upload",
+                        "Không đọc được danh sách video hiện có để đối chiếu — chỉ chấp nhận bằng chứng "
+                        "từ hộp thoại chia sẻ, không dùng fallback danh sách nội dung.",
+                        "WARNING",
+                        channel_name=channel.get("name", ""),
+                        video_title=metadata.get("title", ""),
+                    )
+
                 if progress_callback:
                     progress_callback(30, "Mở hộp thoại tải video lên...")
 
-                create_btn = page.locator("#create-icon, ytcp-button#create-icon, [aria-label*='Create' i], [aria-label*='Tạo' i]").first
+                create_btn = page.locator(STUDIO_CREATE_BUTTON_SELECTOR).first
                 create_btn.wait_for(state="visible", timeout=30000)
                 human_move_and_click(page, create_btn, delay_after=0)
                 upload_menu = page.locator(
@@ -2617,7 +3061,7 @@ def upload_via_playwright_studio(
 
                 file_input = page.locator("input[type='file']").first
                 file_input.wait_for(state="attached", timeout=15000)
-                file_input.set_input_files(video_path, timeout=30000)
+                attach_upload_file(page, file_input, video_path)
                 draft_created = True
                 if progress_callback:
                     progress_callback(40, "Đang chuyển file lên YouTube Studio...")
@@ -2650,9 +3094,11 @@ def upload_via_playwright_studio(
                         "tp-yt-paper-radio-button:has-text('No, it\\'s not made for kids'), "
                         "tp-yt-paper-radio-button:has-text('Không, nội dung này không dành cho trẻ em')"
                     ).first
-                _set_radio_and_verify(
-                    page, mfk_radio, bool(metadata.get("made_for_kids")), "Dành cho trẻ em"
-                )
+                # Radio đã được chọn theo đúng giá trị mong muốn, vì vậy điều kiện
+                # xác minh là chính radio đó ĐƯỢC tích (expected=True), không phải
+                # giá trị tùy chọn — passes bool(made_for_kids) từng làm bước này
+                # "pass" mà không thực sự tích chọn.
+                _set_radio_and_verify(page, mfk_radio, True, "Dành cho trẻ em")
 
                 # Mở rộng phần "Hiển thị thêm" (Show more) TRƯỚC để nhìn thấy mục Giới hạn độ tuổi & Nhãn AI
                 human_scroll(page, delta_y=300)
@@ -2687,9 +3133,7 @@ def upload_via_playwright_studio(
                             "tp-yt-paper-radio-button[name='VIDEO_AGE_RESTRICTION_NONE'], "
                             "tp-yt-paper-radio-button[name='VIDEO_AGE_RESTRICTION_NOT_RESTRICTED']"
                         ).first
-                    _set_radio_and_verify(
-                        page, age_radio, bool(metadata.get("age_restriction")), "Giới hạn độ tuổi"
-                    )
+                    _set_radio_and_verify(page, age_radio, True, "Giới hạn độ tuổi")
                 except Exception as age_err:
                     raise RuntimeError(
                         f"Không xác nhận được lựa chọn Giới hạn độ tuổi trên Studio: {age_err}. "
@@ -2706,17 +3150,19 @@ def upload_via_playwright_studio(
                         _log_optional_step_failure("tải thumbnail", thumb_err, channel, metadata)
 
                 human_scroll(page, delta_y=220)
+                # Studio đặt tên radio là VIDEO_HAS_ALTERED_CONTENT_*; dạng không có "HAS_"
+                # từng khiến bước này báo "Không tìm thấy lựa chọn 'Nhãn nội dung AI'".
                 if metadata.get("altered_content"):
                     alt_radio = page.locator(
+                        "tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_YES'], "
                         "tp-yt-paper-radio-button[name='VIDEO_ALTERED_CONTENT_YES']"
                     ).first
                 else:
                     alt_radio = page.locator(
+                        "tp-yt-paper-radio-button[name='VIDEO_HAS_ALTERED_CONTENT_NO'], "
                         "tp-yt-paper-radio-button[name='VIDEO_ALTERED_CONTENT_NO']"
                     ).first
-                _set_radio_and_verify(
-                    page, alt_radio, bool(metadata.get("altered_content")), "Nhãn nội dung AI"
-                )
+                _set_radio_and_verify(page, alt_radio, True, "Nhãn nội dung AI")
 
                 if metadata["tags"]:
                     tags_input = page.locator("input[aria-label*='Tags' i], input[aria-label*='Thẻ' i], #text-input").first
@@ -2869,7 +3315,7 @@ def upload_via_playwright_studio(
                     )
                     raise RuntimeError(checks_error)
 
-                checks_elapsed = int(time.time() - start_wait)
+                checks_elapsed = int(time.monotonic() - start_wait)
                 add_log(
                     "Checks",
                     f"✅ Kiểm duyệt YouTube hoàn tất sau ~{checks_elapsed}s: KHÔNG có cảnh báo chặn đăng."
@@ -3015,17 +3461,21 @@ def upload_via_playwright_studio(
                 human_move_and_click(page, done_btn, delay_after=3000)
                 # Từ đây video có thể đã được gửi đăng: TUYỆT ĐỐI không tự xóa nháp.
 
-                # Chờ hộp thoại chia sẻ để lấy URL video THẬT làm bằng chứng đăng thành công.
-                try:
-                    share_dialog = page.locator("ytcp-video-share-dialog").first
-                    share_dialog.wait_for(state="visible", timeout=20000)
-                except Exception as dialog_err:
-                    _log_optional_step_failure("chờ hộp thoại chia sẻ sau khi đăng", dialog_err, channel, metadata)
-
                 if progress_callback:
                     progress_callback(96, "Đã gửi yêu cầu; đang xác minh URL video từ Studio...")
 
-                verified_url = extract_published_video_url(page, studio_url_before_publish) or video_url
+                verified_url = _wait_for_publish_completion(
+                    page, studio_url_before_publish, PUBLISH_CONFIRM_TIMEOUT_SECONDS
+                ) or video_url
+                if not verified_url:
+                    verified_url = _find_published_video_in_studio_content(
+                        page,
+                        active_channel.get("channel_id", ""),
+                        metadata.get("title", ""),
+                        metadata.get("upload_to", ""),
+                        metadata.get("privacy_status", ""),
+                        known_video_ids,
+                    )
 
                 # Đóng hộp thoại xác nhận hoàn tất của Studio để Cookie phiên kịp đồng bộ
                 try:
@@ -3034,17 +3484,15 @@ def upload_via_playwright_studio(
                         "ytcp-uploads-still-processing-dialog #close-button, "
                         "ytcp-button#close-icon-button"
                     ).first
-                    close_share_dialog.wait_for(state="visible", timeout=15000)
-                    human_move_and_click(page, close_share_dialog, delay_after=0)
+                    if close_share_dialog.count() > 0 and close_share_dialog.is_visible():
+                        human_move_and_click(page, close_share_dialog, delay_after=0)
                 except Exception as dialog_err:
                     _log_optional_step_failure("đóng hộp thoại xác nhận đăng", dialog_err, channel, metadata)
 
                 if not verified_url:
-                    verified_url = extract_published_video_url(page, studio_url_before_publish)
-
-                if not verified_url:
                     uncertain_msg = (
-                        "Đã bấm Xuất bản/Lên lịch nhưng KHÔNG đọc được URL video thật từ YouTube Studio. "
+                        "Đã bấm Xuất bản/Lên lịch nhưng KHÔNG đọc được URL video thật từ hộp thoại hoặc "
+                        "danh sách Nội dung (Video/Shorts) của YouTube Studio. "
                         "Không thể xác minh video đã đăng thành công — hãy mở Studio kiểm tra trực tiếp "
                         "trước khi chạy lại để tránh đăng trùng."
                     )
