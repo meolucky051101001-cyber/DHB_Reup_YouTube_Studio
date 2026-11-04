@@ -157,7 +157,11 @@ class FailClosedSourceTests(unittest.TestCase):
 
     def test_age_restriction_is_fail_closed(self):
         self.assertNotIn("VIDEO_AGE_RESTRICTION_SELF", self.uploader)
-        self.assertIn('page, age_radio, bool(metadata.get("age_restriction"))', self.uploader)
+        # Radio được chọn đã mang giá trị mong muốn nên điều kiện xác minh là
+        # chính nó ĐƯỢC tích; truyền bool(age_restriction) từng làm lựa chọn
+        # "Không giới hạn" (mặc định đã tích) bị đòi KHÔNG được tích -> fail.
+        self.assertIn("page, age_radio, True,", self.uploader)
+        self.assertNotIn('page, age_radio, bool(metadata.get("age_restriction"))', self.uploader)
         self.assertIn('age_group.wait_for(state="visible", timeout=10000)', self.uploader)
         self.assertIn("raise RuntimeError(\n                        f\"Không xác nhận được lựa chọn Giới hạn độ tuổi", self.uploader)
 

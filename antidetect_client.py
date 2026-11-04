@@ -18,7 +18,7 @@ import requests
 
 DEFAULT_ANTIDETECT_HOME = Path(
     os.environ.get("ANTIDETECT_HOME")
-    or r"C:\Users\admin\Documents\antigravity\blissful-maxwell\antidetect_python"
+    or r"C:\Projects\Tools\Antidetect Python"
 )
 HEALTH_APPLICATION = "antidetect-python"
 _HTTP_TIMEOUT = 15.0
@@ -376,10 +376,12 @@ class AntidetectBrowserLease:
         *,
         client: Optional[AntidetectClient] = None,
         stop_if_started: bool = True,
+        hide_window: bool = False,
     ):
         self.profile_id = str(profile_id)
         self.client = client or AntidetectClient()
         self.stop_if_started = stop_if_started
+        self.hide_window = hide_window
         self._playwright = None
         self._browser = None
         self._pages: List[Any] = []
@@ -414,10 +416,39 @@ class AntidetectBrowserLease:
             self.context = contexts[0]
             self.tracked_context = _TrackedContext(self.context, self._pages)
             self.page = self.tracked_context.new_page()
+            # Chỉ dời cửa sổ khi chính lease khởi chạy profile; nếu người dùng
+            # đang mở sẵn trình duyệt thì không đụng vào cửa sổ của họ.
+            if self.hide_window and self._started_by_us:
+                self._move_windows_offscreen()
             return self
         except Exception:
             self._cleanup()
             raise
+
+    def _move_windows_offscreen(self):
+        """Dời cửa sổ Chrome ra ngoài mọi màn hình; không đổi fingerprint/trạng thái tab."""
+        moved = set()
+        for page in list(self.context.pages):
+            try:
+                session = self.context.new_cdp_session(page)
+            except Exception:
+                continue
+            try:
+                window_id = (session.send("Browser.getWindowForTarget") or {}).get("windowId")
+                if window_id is None or window_id in moved:
+                    continue
+                moved.add(window_id)
+                session.send(
+                    "Browser.setWindowBounds",
+                    {"windowId": window_id, "bounds": {"left": -3200, "top": -3200}},
+                )
+            except Exception:
+                continue
+            finally:
+                try:
+                    session.detach()
+                except Exception:
+                    pass
 
     def _connect_cdp(self):
         last_error: Optional[Exception] = None

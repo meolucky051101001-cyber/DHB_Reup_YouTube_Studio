@@ -214,14 +214,33 @@ class _FakePage:
         return self.closed
 
 
+class _FakeCdpSession:
+    def __init__(self, calls):
+        self.calls = calls
+        self.detached = False
+
+    def send(self, method, params=None):
+        self.calls.append((method, params))
+        if method == "Browser.getWindowForTarget":
+            return {"windowId": 7}
+        return {}
+
+    def detach(self):
+        self.detached = True
+
+
 class _FakeContext:
     def __init__(self):
         self.pages = []
+        self.cdp_calls = []
 
     def new_page(self):
         page = _FakePage()
         self.pages.append(page)
         return page
+
+    def new_cdp_session(self, page):
+        return _FakeCdpSession(self.cdp_calls)
 
 
 class _FakeBrowser:
@@ -272,11 +291,13 @@ class _FakeClient:
 
 
 class AntidetectLeaseTests(unittest.TestCase):
-    def _lease(self, start_result, state=None, failures=0):
+    def _lease(self, start_result, state=None, failures=0, hide_window=False):
         context = _FakeContext()
         fake_pw = _FakePlaywright(context, failures)
         client = _FakeClient(start_result, state)
-        lease = ac.AntidetectBrowserLease("ad-1", client=client)
+        lease = ac.AntidetectBrowserLease(
+            "ad-1", client=client, hide_window=hide_window
+        )
         return lease, fake_pw, client, context
 
     def test_fresh_launch_lease_stops_profile_on_exit(self):
@@ -341,6 +362,38 @@ class AntidetectLeaseTests(unittest.TestCase):
         self.assertIn("9333", message)
         self.assertIn("sau 3 lần thử", message)
         self.assertEqual(len(fake_pw.chromium.calls), 3)
+
+    def test_hidden_lease_moves_started_window_offscreen(self):
+        start = {
+            "success": True,
+            "port": 9222,
+            "pid": 4321,
+            "ws_endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+        }
+        lease, fake_pw, _, context = self._lease(
+            start, state={"id": "ad-1", "status": "stopped"}, hide_window=True
+        )
+        with mock.patch("playwright.sync_api.sync_playwright", return_value=fake_pw):
+            with lease:
+                pass
+        bounds_calls = [
+            call for call in context.cdp_calls if call[0] == "Browser.setWindowBounds"
+        ]
+        self.assertEqual(len(bounds_calls), 1)
+        self.assertEqual(bounds_calls[0][1]["bounds"], {"left": -3200, "top": -3200})
+
+    def test_hidden_lease_keeps_already_running_window_in_place(self):
+        start = {"success": True, "port": 9222, "already_running": True}
+        lease, fake_pw, _, context = self._lease(
+            start, state={"id": "ad-1", "status": "running"}, hide_window=True
+        )
+        with mock.patch("playwright.sync_api.sync_playwright", return_value=fake_pw):
+            with lease:
+                pass
+        self.assertEqual(
+            [call for call in context.cdp_calls if call[0] == "Browser.setWindowBounds"],
+            [],
+        )
 
 
 class LeaseOwnershipTests(unittest.TestCase):
@@ -484,9 +537,10 @@ class UploaderAntidetectTests(unittest.TestCase):
         created = {}
 
         class FakeLease:
-            def __init__(self, profile_id, stop_if_started=True):
+            def __init__(self, profile_id, stop_if_started=True, hide_window=False):
                 created["profile_id"] = profile_id
                 created["stop_if_started"] = stop_if_started
+                created["hide_window"] = hide_window
                 self.tracked_context = object()
                 self.page = object()
                 created["tracked_context"] = self.tracked_context
@@ -519,6 +573,7 @@ class UploaderAntidetectTests(unittest.TestCase):
         chrome.assert_not_called()
         self.assertEqual(created["profile_id"], "ad-1")
         self.assertTrue(created["stop_if_started"])
+        self.assertTrue(created["hide_window"])
         self.assertTrue(created["closed"])
 
     def test_open_login_dispatches_to_antidetect_without_chrome_lookup(self):
