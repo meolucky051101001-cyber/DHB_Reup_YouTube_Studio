@@ -5,6 +5,7 @@
 - POST /api/antidetect/sync nhận {"scan_channels": true} để chạy luồng đầy đủ.
 - Không mở trình duyệt thật, không gọi Antidetect thật (stub + mock hoàn toàn).
 """
+import os
 import shutil
 import sys
 import tempfile
@@ -15,6 +16,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# Import app sau khi đã tắt worker nền + lock thật (xem app.py).
+os.environ["DHB_DISABLE_BACKGROUND_TASKS"] = "1"
 
 import database
 from fastapi.testclient import TestClient
@@ -86,6 +90,9 @@ def setUpModule():
     database.init_db()
     import app
     app_module = app
+    app_module.APP_DB_PATH = database.APP_DB_PATH
+    app_module.APP_DATA_DIR = database.APP_DATA_DIR
+    app_module.APP_TEMP_DIR = database.APP_TEMP_DIR
     client = TestClient(app_module.app, base_url="http://127.0.0.1:8686")
 
 

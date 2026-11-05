@@ -1522,6 +1522,14 @@ class PipelineManager:
                 conn_f.close()
                 fresh_item = dict(f_row) if f_row else item
 
+                # Radio 18+ của Studio chưa được xác minh (HANDOVER v7). Chặn trước
+                # khi giữ reservation/gọi uploader để không tạo bản nháp rác.
+                if bool(fresh_item.get("age_restriction")):
+                    raise RuntimeError(
+                        "Chưa hỗ trợ xác minh giới hạn độ tuổi 18+ trên YouTube Studio. "
+                        "Đã dừng trước khi nạp file. Hãy tắt giới hạn tuổi hoặc probe lại DOM/selector trước."
+                    )
+
                 reservation_key, reservation_result = _acquire_content_reservation(
                     item_id,
                     token,
@@ -1639,12 +1647,14 @@ class PipelineManager:
                     is_flagged = bool(pub_res.get("flagged_copyright", False))
                     is_uncertain = bool(pub_res.get("published_uncertain", False))
                     warning_msg = pub_res.get("warning_message", "")
+                    discard_status = str(pub_res.get("discard_status") or "").strip().lower()
                 else:
                     pub_url = str(pub_res)
                     is_cancelled = False
                     is_flagged = False
                     is_uncertain = False
                     warning_msg = ""
+                    discard_status = ""
 
                 raw_pub_url = str(pub_url or "").strip()
                 pub_url = normalize_published_video_url(raw_pub_url)
@@ -1656,7 +1666,7 @@ class PipelineManager:
                     )
                 result_unverified = is_uncertain or not pub_url
 
-                if is_cancelled:
+                if is_cancelled and discard_status == "deleted":
                     _update_row(
                         upload_progress=100,
                         status="Đã Hủy (Dính Bản Quyền)",
@@ -1667,6 +1677,28 @@ class PipelineManager:
                         "Upload",
                         f"🛑 ĐÃ HỦY ĐĂNG lên kênh [{channel['name']}] do CẢNH BÁO VI PHẠM BẢN QUYỀN: {warning_msg}",
                         "WARNING",
+                        channel_name=channel["name"],
+                        video_title=title,
+                    )
+                elif is_cancelled:
+                    # Đã hủy thao tác đăng nhưng chưa chứng minh được bản nháp đã bị xóa.
+                    # Không báo "Đã Hủy" sạch sẽ; giữ reservation để đối soát thủ công.
+                    unverified_msg = warning_msg or (
+                        "Đã hủy thao tác đăng do cảnh báo bản quyền nhưng chưa xác minh được "
+                        "việc xóa bản nháp trên YouTube Studio."
+                    )
+                    _update_row(
+                        upload_progress=100,
+                        status="NeedsReview",
+                        error_message=unverified_msg,
+                    )
+                    reservation_keep = True
+                    _finish_upload_attempt(upload_attempt_id, "NeedsReview", error_message=unverified_msg)
+                    add_log(
+                        "Upload",
+                        f"⚠️ Đã hủy thao tác đăng do cảnh báo bản quyền nhưng CHƯA xác minh được việc xóa "
+                        f"bản nháp trên kênh [{channel['name']}]; cần kiểm tra Studio: {unverified_msg}",
+                        "ERROR",
                         channel_name=channel["name"],
                         video_title=title,
                     )

@@ -256,6 +256,97 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                 )
                 upload.assert_called_once()
 
+    def _process_with_upload_result(self, db_path, upload_result):
+        manager = pipeline_manager.PipelineManager()
+        with mock.patch.object(pipeline_manager, "get_conn", side_effect=self._connect(db_path)), \
+                mock.patch.object(pipeline_manager, "add_log"), \
+                mock.patch.object(pipeline_manager, "get_settings", return_value={}), \
+                mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
+                mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value=True), \
+                mock.patch.object(
+                    pipeline_manager, "upload_video_to_youtube", return_value=upload_result
+                ) as upload, \
+                mock.patch.object(pipeline_manager, "_record_upload_finished_safely"):
+            manager.process_single_item(
+                1, do_download=False, do_render=False, do_upload=True,
+                stop_event=threading.Event(),
+            )
+        return upload
+
+    def test_verified_discard_is_reported_as_cancelled_and_releases_reservation(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = self._make_db(td)
+            self._process_with_upload_result(db_path, {
+                "cancelled": True,
+                "url": "",
+                "flagged_copyright": True,
+                "discard_status": "deleted",
+                "warning_message": "Phát hiện cảnh báo vi phạm bản quyền.",
+            })
+
+            conn = sqlite3.connect(db_path)
+            status = conn.execute("SELECT status FROM video_queue WHERE id = 1").fetchone()[0]
+            attempt = conn.execute(
+                "SELECT outcome FROM upload_attempts WHERE queue_id = 1"
+            ).fetchone()[0]
+            reservation = conn.execute(
+                "SELECT state FROM content_reservations WHERE queue_id = 1"
+            ).fetchone()
+            history_count = conn.execute("SELECT COUNT(*) FROM published_history").fetchone()[0]
+            conn.close()
+
+            self.assertEqual(status, "Đã Hủy (Dính Bản Quyền)")
+            self.assertEqual(attempt, "Cancelled")
+            self.assertIsNone(reservation)
+            self.assertEqual(history_count, 0)
+
+    def test_unverified_discard_is_held_for_manual_review(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = self._make_db(td)
+            self._process_with_upload_result(db_path, {
+                "cancelled": True,
+                "url": "",
+                "flagged_copyright": True,
+                "discard_status": "uncertain",
+                "warning_message": "Đã hủy thao tác đăng nhưng chưa xác minh được việc xóa bản nháp.",
+            })
+
+            conn = sqlite3.connect(db_path)
+            status = conn.execute("SELECT status FROM video_queue WHERE id = 1").fetchone()[0]
+            attempt = conn.execute(
+                "SELECT outcome FROM upload_attempts WHERE queue_id = 1"
+            ).fetchone()[0]
+            reservation = conn.execute(
+                "SELECT state FROM content_reservations WHERE queue_id = 1"
+            ).fetchone()[0]
+            conn.close()
+
+            self.assertEqual(status, "NeedsReview")
+            self.assertEqual(attempt, "NeedsReview")
+            self.assertEqual(reservation, "NeedsReview")
+
+    def test_age_restriction_is_blocked_before_uploader_is_called(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = self._make_db(td)
+            conn = sqlite3.connect(db_path)
+            conn.execute("ALTER TABLE video_queue ADD COLUMN age_restriction INTEGER DEFAULT 0")
+            conn.execute("UPDATE video_queue SET age_restriction = 1 WHERE id = 1")
+            conn.commit()
+            conn.close()
+
+            upload = self._process_with_upload_result(db_path, {"url": "https://youtu.be/never"})
+
+            conn = sqlite3.connect(db_path)
+            status = conn.execute("SELECT status FROM video_queue WHERE id = 1").fetchone()[0]
+            reservation = conn.execute(
+                "SELECT state FROM content_reservations WHERE queue_id = 1"
+            ).fetchone()
+            conn.close()
+
+            upload.assert_not_called()
+            self.assertEqual(status, "Error")
+            self.assertIsNone(reservation)
+
     def test_uploader_exception_keeps_reservation_for_review(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = self._make_db(td)

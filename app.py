@@ -93,12 +93,20 @@ from storage_manager import (
     storage_overview,
 )
 
-try:
-    # Own the local DB before migration/recovery. A second server process must
-    # never clear claims or touch jobs managed by the first one.
-    _APP_INSTANCE_LOCK = acquire_app_instance_lock(APP_DATA_DIR / "app_instance.lock")
-except AppInstanceAlreadyRunning as exc:
-    raise RuntimeError(str(exc)) from exc
+BACKGROUND_TASKS_DISABLED = os.environ.get("DHB_DISABLE_BACKGROUND_TASKS", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
+if BACKGROUND_TASKS_DISABLED:
+    # Test harness đã trỏ DB sang thư mục tạm: không giữ lock thật và không chạy worker nền.
+    _APP_INSTANCE_LOCK = None
+else:
+    try:
+        # Own the local DB before migration/recovery. A second server process must
+        # never clear claims or touch jobs managed by the first one.
+        _APP_INSTANCE_LOCK = acquire_app_instance_lock(APP_DATA_DIR / "app_instance.lock")
+    except AppInstanceAlreadyRunning as exc:
+        raise RuntimeError(str(exc)) from exc
 
 init_db()
 pipeline_manager.clear_stale_claims()
@@ -225,6 +233,64 @@ def _ensure_destination_not_active(row: Dict[str, Any], destination_changed: boo
         raise HTTPException(409, f"Video #{row.get('id')} đang được worker giữ; không thể đổi kênh đích lúc này.")
 
 
+_QUEUE_BUSY_STATUS_PREFIXES = (
+    "Uploading", "Đang đăng",
+    "Rendering", "Đang Render",
+    "Downloading", "Đang tải",
+    "Chờ giãn cách",
+)
+
+
+def _normalize_queue_ids(ids) -> List[int]:
+    normalized = []
+    for value in ids or []:
+        try:
+            item_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if item_id > 0:
+            normalized.append(item_id)
+    return list(dict.fromkeys(normalized))
+
+
+def _blocked_queue_rows(conn, ids) -> List[str]:
+    normalized = _normalize_queue_ids(ids)
+    if not normalized:
+        return []
+    placeholders = ",".join("?" for _ in normalized)
+    rows = conn.execute(
+        f"SELECT id, status, claim_token, "
+        f"(SELECT state FROM content_reservations cr WHERE cr.queue_id = video_queue.id "
+        f"ORDER BY CASE state WHEN 'NeedsReview' THEN 0 ELSE 1 END LIMIT 1) AS reservation_state "
+        f"FROM video_queue WHERE id IN ({placeholders})",
+        normalized,
+    ).fetchall()
+    blocked = []
+    for row in rows:
+        status = str(row["status"] or "").strip()
+        reservation_state = str(row["reservation_state"] or "").strip()
+        if (
+            str(row["claim_token"] or "").strip()
+            or status.startswith(_QUEUE_BUSY_STATUS_PREFIXES)
+            or status == "NeedsReview"
+            or reservation_state
+        ):
+            reason = "cần đối soát" if status == "NeedsReview" or reservation_state == "NeedsReview" else "đang bị giữ"
+            blocked.append(f"#{row['id']} ({status or reason}; {reason})")
+    return blocked
+
+
+def _ensure_queue_items_idle(conn, ids, action: str):
+    blocked = _blocked_queue_rows(conn, ids)
+    if blocked:
+        raise HTTPException(
+            409,
+            f"Không thể {action} vì còn video đang xử lý hoặc cần đối soát: {', '.join(blocked[:5])}"
+            + ("..." if len(blocked) > 5 else "")
+            + ". Hãy bấm Dừng và chờ luồng hiện tại kết thúc rồi thử lại.",
+        )
+
+
 # Kiểm tra trùng + ghi queue phải liền mạch, trong khi ffprobe được chạy song song bên ngoài lock
 _import_insert_lock = threading.Lock()
 
@@ -240,8 +306,9 @@ def _housekeeping_worker():
             add_log("Housekeeping", f"Lỗi vòng bảo trì định kỳ: {e}", "WARNING")
 
 
-threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
-pipeline_manager.start_monitor_supervisor()
+if not BACKGROUND_TASKS_DISABLED:
+    threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
+    pipeline_manager.start_monitor_supervisor()
 
 APP_BUILD_VERSION = "2026.11.04-p7-fix2"
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
@@ -284,23 +351,41 @@ def _redact_json_value(value: Any, secrets: List[str]) -> Any:
     return value
 
 
+_FRAME_DENY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+}
+
+
+def _apply_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    for key, value in _FRAME_DENY_HEADERS.items():
+        response.headers.setdefault(key, value)
+    return response
+
+
 @app.middleware("http")
 async def guard_local_api(request: Request, call_next):
     if not is_allowed_host(request.headers.get("host", "")):
-        return JSONResponse({"detail": "Host không hợp lệ — tool chỉ phục vụ localhost."}, status_code=403)
+        return _apply_security_headers(
+            JSONResponse({"detail": "Host không hợp lệ — tool chỉ phục vụ localhost."}, status_code=403)
+        )
 
     path = request.url.path
     if path.startswith("/api/") and path not in TOKEN_EXEMPT_PATHS:
         if request.method in STATE_CHANGING_METHODS and not is_same_local_origin(
             request.headers.get("origin", ""), request.headers.get("host", "")
         ):
-            return JSONResponse({"detail": "Origin không hợp lệ — chặn yêu cầu cross-site."}, status_code=403)
+            return _apply_security_headers(
+                JSONResponse({"detail": "Origin không hợp lệ — chặn yêu cầu cross-site."}, status_code=403)
+            )
         token = _extract_api_token(request)
         if not token_matches(token, API_TOKEN):
-            return JSONResponse({"detail": "Thiếu hoặc sai API token cục bộ."}, status_code=401)
+            return _apply_security_headers(
+                JSONResponse({"detail": "Thiếu hoặc sai API token cục bộ."}, status_code=401)
+            )
 
-    response = await call_next(request)
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response = _apply_security_headers(await call_next(request))
     content_type = response.headers.get("content-type", "").lower()
     if (
         path != "/api/auth/token"
@@ -321,12 +406,13 @@ async def guard_local_api(request: Request, call_next):
         except Exception:
             # The endpoint may already have completed a mutation. Do not return
             # the consumed body (which may contain credentials) or imply success.
-            safe_response = JSONResponse(
-                {"detail": "Không thể tạo phản hồi JSON an toàn."},
-                status_code=500,
-                background=response.background,
+            safe_response = _apply_security_headers(
+                JSONResponse(
+                    {"detail": "Không thể tạo phản hồi JSON an toàn."},
+                    status_code=500,
+                    background=response.background,
+                )
             )
-            safe_response.headers["X-Content-Type-Options"] = "nosniff"
 
         # Preserve repeated headers such as Set-Cookie, while dropping metadata
         # that describes the old representation or encoding.
@@ -538,14 +624,27 @@ def api_create_project(data: Dict[str, Any] = Body(...)):
 @app.delete("/api/projects/{name}")
 def api_delete_project(name: str):
     conn = get_conn()
-    total_projects = conn.execute("SELECT COUNT(*) as c FROM projects").fetchone()["c"]
-    if total_projects <= 1:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        total_projects = conn.execute("SELECT COUNT(*) as c FROM projects").fetchone()["c"]
+        if total_projects <= 1:
+            raise HTTPException(400, "Cần giữ lại ít nhất 1 dự án để làm việc.")
+        queue_ids = [
+            int(row["id"])
+            for row in conn.execute("SELECT id FROM video_queue WHERE project_name = ?", (name,)).fetchall()
+        ]
+        _ensure_queue_items_idle(conn, queue_ids, f"xóa dự án [{name}]")
+        conn.execute("DELETE FROM video_queue WHERE project_name = ?", (name,))
+        conn.execute("DELETE FROM projects WHERE name = ?", (name,))
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        raise HTTPException(400, "Cần giữ lại ít nhất 1 dự án để làm việc.")
-    conn.execute("DELETE FROM video_queue WHERE project_name = ?", (name,))
-    conn.execute("DELETE FROM projects WHERE name = ?", (name,))
-    conn.commit()
-    conn.close()
     return {"ok": True}
 
 
@@ -1339,55 +1438,69 @@ def api_shorts_boost(data: Dict[str, Any] = Body(...)):
     ids = data.get("ids") or []
     if not ids:
         return {"ok": False, "updated": 0}
+    normalized = _normalize_queue_ids(ids)
+    if not normalized:
+        return {"ok": False, "updated": 0}
     conn = get_conn()
-    updated_count = 0
-    for item_id in ids:
-        row = conn.execute("SELECT id, title, render_config_json FROM video_queue WHERE id = ?", (item_id,)).fetchone()
-        if not row:
-            continue
-        title = (row["title"] or "").strip()
-        # Đảm bảo có #shorts trong tiêu đề, nếu dài quá thì cắt gọt < 55 ký tự để không bị nút mobile che khuất
-        if "#shorts" not in title.lower():
-            if len(title) > 45:
-                title = title[:45].strip() + " #shorts"
-            else:
-                title = f"{title} #shorts".strip()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_queue_items_idle(conn, normalized, "bật Shorts boost")
+        updated_count = 0
+        for item_id in normalized:
+            row = conn.execute("SELECT id, title, render_config_json FROM video_queue WHERE id = ?", (item_id,)).fetchone()
+            if not row:
+                continue
+            title = (row["title"] or "").strip()
+            # Đảm bảo có #shorts trong tiêu đề, nếu dài quá thì cắt gọt < 55 ký tự để không bị nút mobile che khuất
+            if "#shorts" not in title.lower():
+                if len(title) > 45:
+                    title = title[:45].strip() + " #shorts"
+                else:
+                    title = f"{title} #shorts".strip()
 
-        cfg = {}
-        try:
-            if row["render_config_json"]:
-                cfg = json.loads(row["render_config_json"])
-        except Exception:
             cfg = {}
+            try:
+                if row["render_config_json"]:
+                    cfg = json.loads(row["render_config_json"])
+            except Exception:
+                cfg = {}
 
-        cfg["enforce_shorts_duration"] = True
-        cfg["shorts_visual_pop"] = True
-        cfg["shorts_fit_mode"] = "speedup"
-        try:
-            cfg["speed"] = normalize_render_speed(cfg.get("speed", 1.0))
-        except ValueError:
-            cfg["speed"] = 1.0
-        if cfg["speed"] < 1.05:
-            cfg["speed"] = 1.05
-        cfg["hflip"] = True
-        cfg["audio_pitch_shift"] = True
+            cfg["enforce_shorts_duration"] = True
+            cfg["shorts_visual_pop"] = True
+            cfg["shorts_fit_mode"] = "speedup"
+            try:
+                cfg["speed"] = normalize_render_speed(cfg.get("speed", 1.0))
+            except ValueError:
+                cfg["speed"] = 1.0
+            if cfg["speed"] < 1.05:
+                cfg["speed"] = 1.05
+            cfg["hflip"] = True
+            cfg["audio_pitch_shift"] = True
 
-        conn.execute(
-            """
-            UPDATE video_queue
-            SET upload_to = 'Shorts',
-                render_mode = 'shorts_9_16',
-                emulate_mobile = 0,
-                resolution = '1080p',
-                title = ?,
-                render_config_json = ?
-            WHERE id = ?
-            """,
-            (title, json.dumps(cfg, ensure_ascii=False), item_id)
-        )
-        updated_count += 1
-    conn.commit()
-    conn.close()
+            cur = conn.execute(
+                """
+                UPDATE video_queue
+                SET upload_to = 'Shorts',
+                    render_mode = 'shorts_9_16',
+                    emulate_mobile = 0,
+                    resolution = '1080p',
+                    title = ?,
+                    render_config_json = ?
+                WHERE id = ? AND COALESCE(claim_token, '') = ''
+                """,
+                (title, json.dumps(cfg, ensure_ascii=False), item_id)
+            )
+            if cur.rowcount == 1:
+                updated_count += 1
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     return {"ok": True, "updated": updated_count}
 
 
@@ -1521,53 +1634,28 @@ def api_delete_queue_items(data: Dict[str, Any] = Body(...)):
     if not ids:
         return {"ok": True, "deleted": 0}
 
-    BUSY_STATUS_PREFIXES = (
-        "Uploading", "Đang đăng",
-        "Rendering", "Đang Render",
-        "Downloading", "Đang tải",
-        "Chờ giãn cách",
-    )
+    normalized = _normalize_queue_ids(ids)
+    if not normalized:
+        return {"ok": True, "deleted": 0}
     conn = get_conn()
-    placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"SELECT id, status, claim_token, "
-        f"(SELECT state FROM content_reservations cr WHERE cr.queue_id = video_queue.id "
-        f"ORDER BY CASE state WHEN 'NeedsReview' THEN 0 ELSE 1 END LIMIT 1) AS reservation_state "
-        f"FROM video_queue WHERE id IN ({placeholders})",
-        ids,
-    ).fetchall()
-
-    deletable, blocked = [], []
-    for r in rows:
-        status = (r["status"] or "").strip()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         # claim_token khác rỗng = một worker (batch/monitor) đang giữ video này —
         # xóa ngay lúc này sẽ khiến worker ghi vào dòng đã mất hoặc đăng video không còn hàng đợi.
-        if (
-            (r["claim_token"] or "").strip()
-            or status.startswith(BUSY_STATUS_PREFIXES)
-            or status == "NeedsReview"
-            or r["reservation_state"]
-        ):
-            reason = "cần đối soát" if status == "NeedsReview" or r["reservation_state"] == "NeedsReview" else "đang bị giữ"
-            blocked.append(f"#{r['id']} ({status or reason}; {reason})")
-        else:
-            deletable.append(r["id"])
-
-    if blocked:
+        _ensure_queue_items_idle(conn, normalized, "xóa")
+        placeholders = ",".join("?" for _ in normalized)
+        cur = conn.execute(f"DELETE FROM video_queue WHERE id IN ({placeholders})", normalized)
+        deleted = int(cur.rowcount or 0)
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        raise HTTPException(
-            409,
-            f"Không xóa được {len(blocked)} video đang xử lý hoặc cần đối soát: {', '.join(blocked[:5])}"
-            + ("..." if len(blocked) > 5 else "")
-            + ". Hãy bấm Dừng và chờ luồng hiện tại kết thúc rồi xóa lại.",
-        )
-
-    if deletable:
-        del_placeholders = ",".join("?" for _ in deletable)
-        conn.execute(f"DELETE FROM video_queue WHERE id IN ({del_placeholders})", deletable)
-    conn.commit()
-    conn.close()
-    return {"ok": True, "deleted": len(deletable)}
+    return {"ok": True, "deleted": deleted}
 
 
 @app.get("/api/queue/{item_id}/stream")
@@ -1610,28 +1698,42 @@ def api_auto_schedule(data: Dict[str, Any] = Body(...)):
         # upload từng video mất thời gian, lịch sát "bây giờ" sẽ bị YouTube từ chối khi đến lượt đăng
         curr = datetime.now() + timedelta(minutes=60)
 
+    normalized = _normalize_queue_ids(ids)
+    if not normalized:
+        raise HTTPException(400, "Danh sách ID video không hợp lệ.")
     conn = get_conn()
-    first_dt = last_dt = None
-    for item_id in ids:
-        curr_str = curr.strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute(
-            "UPDATE video_queue SET schedule_time = ?, visibility = 'schedule', is_premiere = ? WHERE id = ?",
-            (curr_str, is_premiere, item_id),
-        )
-        if first_dt is None:
-            first_dt = curr
-        last_dt = curr
-        curr += timedelta(minutes=interval_minutes)
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_queue_items_idle(conn, normalized, "lên lịch")
+        first_dt = last_dt = None
+        for item_id in normalized:
+            curr_str = curr.strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "UPDATE video_queue SET schedule_time = ?, visibility = 'schedule', is_premiere = ? "
+                "WHERE id = ? AND COALESCE(claim_token, '') = ''",
+                (curr_str, is_premiere, item_id),
+            )
+            if first_dt is None:
+                first_dt = curr
+            last_dt = curr
+            curr += timedelta(minutes=interval_minutes)
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     add_log(
         "Scheduler",
-        f"Đã lên lịch giãn cách cho {len(ids)} video: từ {first_dt:%Y-%m-%d %H:%M} đến {last_dt:%Y-%m-%d %H:%M} (cách nhau {interval_minutes} phút).",
+        f"Đã lên lịch giãn cách cho {len(normalized)} video: từ {first_dt:%Y-%m-%d %H:%M} đến {last_dt:%Y-%m-%d %H:%M} (cách nhau {interval_minutes} phút).",
         "SUCCESS",
     )
     return {
         "ok": True,
-        "scheduled": len(ids),
+        "scheduled": len(normalized),
         "interval_minutes": interval_minutes,
         "first_time": first_dt.strftime("%Y-%m-%d %H:%M:%S"),
         "last_time": last_dt.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2672,29 +2774,34 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
     if not isinstance(find_str, str) or not isinstance(replace_str, str) or len(find_str) > 5000 or len(replace_str) > 5000:
         raise HTTPException(400, "Chuỗi tìm/thay thế phải là văn bản tối đa 5000 ký tự.")
 
-    conn = get_conn()
-    if ids:
-        placeholders = ",".join("?" for _ in ids)
-        rows = conn.execute(f"SELECT * FROM video_queue WHERE id IN ({placeholders})", ids).fetchall()
-    else:
-        project_name = data.get("project_name") or "Default"
-        rows = conn.execute("SELECT * FROM video_queue WHERE project_name = ?", (project_name,)).fetchall()
-
     updated = 0
     provider_counts: Dict[str, int] = {}
     fallback_count = 0
     links_preserved = 0
     failed_items = []
+    conn = get_conn()
     try:
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            rows = conn.execute(f"SELECT * FROM video_queue WHERE id IN ({placeholders})", ids).fetchall()
+        else:
+            project_name = data.get("project_name") or "Default"
+            rows = conn.execute("SELECT * FROM video_queue WHERE project_name = ?", (project_name,)).fetchall()
+
+        _ensure_queue_items_idle(conn, [int(r["id"]) for r in rows], "biên tập AI")
+
         for r in rows:
             item = dict(r)
             if mode == "batch_edit":
                 old_val = item.get(edit_field) or ""
                 new_val = apply_batch_text_edit(old_val, edit_op, find_str, replace_str)
-                conn.execute(
-                    f"UPDATE video_queue SET {edit_field} = ? WHERE id = ?",
+                cur = conn.execute(
+                    f"UPDATE video_queue SET {edit_field} = ? WHERE id = ? AND COALESCE(claim_token, '') = ''",
                     (new_val, item["id"]),
                 )
+                if cur.rowcount != 1:
+                    failed_items.append({"id": int(item["id"]), "error": "Video đã được worker giữ trong lúc xử lý; bỏ qua."})
+                    continue
                 updated += 1
             else:
                 try:
@@ -2709,10 +2816,14 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
                 except SourceLinksTooLongError as exc:
                     failed_items.append({"id": int(item["id"]), "error": str(exc)})
                     continue
-                conn.execute(
-                    "UPDATE video_queue SET title = ?, description = ?, tags = ? WHERE id = ?",
+                cur = conn.execute(
+                    "UPDATE video_queue SET title = ?, description = ?, tags = ? "
+                    "WHERE id = ? AND COALESCE(claim_token, '') = ''",
                     (res["title"], res["description"], res["tags"], item["id"]),
                 )
+                if cur.rowcount != 1:
+                    failed_items.append({"id": int(item["id"]), "error": "Video đã được worker giữ trong lúc xử lý; bỏ qua."})
+                    continue
                 actual_provider = str(res.get("provider_used") or provider)
                 provider_counts[actual_provider] = provider_counts.get(actual_provider, 0) + 1
                 fallback_count += int(bool(res.get("fallback")))

@@ -718,6 +718,19 @@ class PreflightAndProxyTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 yu._parse_channel_proxy({"proxy": value})
 
+    def test_studio_upload_rejects_age_restriction_before_browser_launch(self):
+        with mock.patch.object(yu, "get_settings") as get_settings, \
+                mock.patch("playwright.sync_api.sync_playwright") as sync_playwright:
+            with self.assertRaises(RuntimeError) as raised:
+                yu.upload_via_playwright_studio(
+                    "C:/khong-ton-tai.mp4",
+                    {"title": "Video", "age_restriction": True},
+                    {"name": "Kênh", "channel_id": CHANNEL_ID},
+                )
+        self.assertIn("giới hạn độ tuổi", str(raised.exception))
+        get_settings.assert_not_called()
+        sync_playwright.assert_not_called()
+
     def test_api_unsupported_metadata_is_rejected_before_file_exists(self):
         with self.assertRaises(RuntimeError) as raised:
             yu.validate_upload_preflight(
