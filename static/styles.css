@@ -714,6 +714,16 @@ tbody tr:hover {
   gap: 12px;
 }
 
+#modal-bulk-description button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+#bulk-desc-preview td {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .modal-footer {
   padding: 14px 18px;
   border-top: 1px solid var(--border);

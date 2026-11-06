@@ -2715,6 +2715,278 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int],
     return result
 
 
+def _description_video_id(value: Any) -> Optional[int]:
+    if type(value) is int:
+        return value if 0 < value <= 9223372036854775807 else None
+    if isinstance(value, str) and re.fullmatch(r"#?[0-9]{1,19}", value.strip()):
+        return _description_video_id(int(value.strip().lstrip("#")))
+    if type(value) is float and value.is_integer():
+        return _description_video_id(int(value))
+    return None
+
+
+def _description_excel_entries(raw: bytes) -> List[Dict[str, Any]]:
+    from zipfile import ZipFile
+    from openpyxl import load_workbook
+
+    wb = None
+    try:
+        with ZipFile(io.BytesIO(raw)) as archive:
+            if sum(info.file_size for info in archive.infolist()) > 64 * 1024 * 1024:
+                raise HTTPException(400, "File Excel sau giải nén quá lớn (tối đa 64 MB).")
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=False, keep_links=False)
+        sheet = next(
+            (wb[name] for name in ("Danh sách", "Danh sach", "Danh sách video", "Queue") if name in wb.sheetnames),
+            next((ws for ws in wb.worksheets if _excel_key(ws.title) not in ("huong dan", "guide")), None),
+        )
+        if sheet is None:
+            raise HTTPException(400, "File Excel không có sheet dữ liệu.")
+        sheet.reset_dimensions()
+        lookup = {
+            _excel_key(alias): field
+            for field in ("id", "description")
+            for alias in _EXCEL_FIELD_ALIASES[field]
+        }
+        columns = {}
+        header_row = 0
+        for row_idx, cells in enumerate(sheet.iter_rows(max_row=20, max_col=80), 1):
+            columns = {}
+            for col_idx, cell in enumerate(cells):
+                field = lookup.get(_excel_key(cell.value))
+                if field:
+                    columns.setdefault(field, col_idx)
+            if "id" in columns and "description" in columns:
+                header_row = row_idx
+                break
+        if not header_row:
+            raise HTTPException(400, "File cần có cột 'ID' và 'Mô tả' (hoặc 'Description').")
+
+        entries = []
+        for row_idx, cells in enumerate(
+            sheet.iter_rows(min_row=header_row + 1, max_col=max(columns.values()) + 1), header_row + 1,
+        ):
+            id_cell, description_cell = cells[columns["id"]], cells[columns["description"]]
+            if id_cell.value in (None, "") and description_cell.value in (None, ""):
+                continue
+            if id_cell.data_type in ("f", "e") or description_cell.data_type in ("f", "e"):
+                raise HTTPException(400, f"Dòng {row_idx}: hãy chuyển công thức/lỗi Excel thành giá trị trước khi nhập.")
+            entries.append({
+                "line": row_idx,
+                "id": id_cell.value,
+                "description": "" if description_cell.value is None else str(description_cell.value).strip(),
+            })
+            if len(entries) > 5000:
+                raise HTTPException(400, "File có hơn 5000 dòng dữ liệu; hãy chia nhỏ file trước khi nhập.")
+        if not entries:
+            raise HTTPException(400, "File Excel không có dòng mô tả nào.")
+        return entries
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, "Không đọc được file Excel. Hãy chọn file .xlsx/.xlsm hợp lệ.") from exc
+    finally:
+        if wb is not None:
+            wb.close()
+
+
+def _bulk_description_worker(
+    entries: List[Dict[str, Any]],
+    project_name: str,
+    selected_ids: List[int],
+    preview_only: bool = True,
+    preview_revision: str = "",
+) -> Dict[str, Any]:
+    if not isinstance(entries, list) or not entries:
+        raise HTTPException(400, "Chưa có mô tả nào để xử lý.")
+    if len(entries) > 5000:
+        raise HTTPException(400, "Mỗi lượt chỉ xử lý tối đa 5000 mô tả.")
+    if not isinstance(project_name, str) or not project_name.strip():
+        raise HTTPException(400, "Thiếu dự án cần cập nhật.")
+    if not isinstance(selected_ids, list) or len(selected_ids) > 5000 or any(
+        type(item_id) is not int or _description_video_id(item_id) is None for item_id in selected_ids
+    ):
+        raise HTTPException(400, "Danh sách video phải gồm ID nguyên dương, tối đa 5000 mục.")
+    if type(preview_only) is not bool:
+        raise HTTPException(400, "preview_only phải là true hoặc false.")
+    if not preview_only and (not isinstance(preview_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", preview_revision)):
+        raise HTTPException(400, "Cần xem trước mô tả trước khi lưu.")
+
+    normalized = []
+    id_counts: Dict[int, int] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not isinstance(entry.get("description"), str):
+            raise HTTPException(400, f"Dữ liệu mô tả dòng {index + 1} phải là văn bản.")
+        item_id = _description_video_id(entry.get("id"))
+        line = entry.get("line", index + 1)
+        if type(line) is not int or line <= 0:
+            raise HTTPException(400, "Số dòng mô tả không hợp lệ.")
+        normalized.append({"id": item_id, "line": line, "description": entry["description"].strip()})
+        if item_id is not None:
+            id_counts[item_id] = id_counts.get(item_id, 0) + 1
+
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN" if preview_only else "BEGIN IMMEDIATE")
+        project_rows = conn.execute(
+            "SELECT id, description, status, claim_token, "
+            "EXISTS(SELECT 1 FROM content_reservations cr WHERE cr.queue_id = video_queue.id) AS reserved "
+            "FROM video_queue WHERE project_name = ? ORDER BY id ASC",
+            (project_name,),
+        ).fetchall()
+        if not project_rows:
+            raise HTTPException(404, "Dự án chưa có video nào.")
+        current_by_id = {int(row["id"]): dict(row) for row in project_rows}
+        if selected_ids:
+            target_pool = {item_id for item_id in selected_ids if item_id in current_by_id}
+            if not target_pool:
+                raise HTTPException(400, "Các dòng đã chọn không thuộc dự án hiện tại.")
+        else:
+            target_pool = set(current_by_id)
+
+        baseline = [
+            (item_id, current_by_id[item_id]["description"], current_by_id[item_id]["status"],
+             bool(current_by_id[item_id]["claim_token"]), bool(current_by_id[item_id]["reserved"]))
+            for item_id in sorted(id_counts) if item_id in target_pool
+        ]
+        revision = hashlib.sha256(json.dumps(
+            [project_name, sorted(selected_ids), normalized, baseline], ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        if not preview_only and preview_revision != revision:
+            raise HTTPException(409, "Dữ liệu hoặc trạng thái video đã thay đổi. Hãy xem trước lại; chưa lưu mô tả nào.")
+
+        results: List[Dict[str, Any]] = []
+        candidates: Dict[int, Dict[str, Any]] = {}
+        matched = 0
+        unchanged = 0
+        for entry in normalized:
+            line = entry["line"]
+            item_id = entry["id"]
+            description = entry["description"]
+            result: Dict[str, Any] = {
+                "line": line,
+                "queue_id": item_id,
+                "state": "ready",
+                "reason": "",
+                "preview": description[:160],
+            }
+            results.append(result)
+            current = current_by_id.get(item_id) if item_id is not None else None
+            if item_id is None:
+                result.update(state="error", reason="ID video thiếu hoặc không phải số nguyên dương.")
+                continue
+            if current is None or item_id not in target_pool:
+                result.update(state="skipped", reason="ID không thuộc dự án hoặc không nằm trong các video đã chọn.")
+                continue
+            if id_counts[item_id] > 1:
+                result.update(state="error", reason=f"ID #{item_id} bị lặp; không áp dụng các dòng trùng ID.")
+                continue
+            if not description:
+                result.update(state="skipped", reason="Mô tả trống; giữ nguyên mô tả hiện tại.")
+                continue
+            if len(description) > 5000:
+                result.update(state="error", reason="Mô tả vượt quá 5000 ký tự.")
+                continue
+            status = str(current.get("status") or "").strip()
+            if (
+                str(current.get("claim_token") or "").strip()
+                or status.startswith(_QUEUE_BUSY_STATUS_PREFIXES)
+                or status == "NeedsReview"
+                or current["reserved"]
+            ):
+                result.update(state="error", reason="Video đang được xử lý hoặc cần đối soát.")
+                continue
+            matched += 1
+            if str(current.get("description") or "").strip() == description:
+                unchanged += 1
+                result["state"] = "unchanged"
+                continue
+            candidates[item_id] = {"result": result, "description": description}
+
+        updated = 0
+        if not preview_only and candidates:
+            _ensure_queue_items_idle(conn, list(candidates), "ghi mô tả hàng loạt")
+            for item_id, candidate in candidates.items():
+                cur = conn.execute(
+                    "UPDATE video_queue SET description = ? WHERE id = ? AND COALESCE(claim_token, '') = ''",
+                    (candidate["description"], item_id),
+                )
+                row_result = candidate["result"]
+                if cur.rowcount == 1:
+                    updated += 1
+                    row_result["state"] = "updated"
+                else:
+                    row_result.update(state="error", reason="Video vừa được worker giữ; chưa cập nhật.")
+        if not preview_only:
+            conn.commit()
+
+        error_count = sum(row["state"] == "error" for row in results)
+        skipped = sum(row["state"] == "skipped" for row in results)
+        pending = sum(row["state"] == "ready" for row in results)
+        response = {
+            "ok": pending > 0 if preview_only else updated > 0,
+            "preview_only": preview_only,
+            "total_rows": len(entries),
+            "preview_revision": revision,
+            "matched": matched,
+            "unchanged": unchanged,
+            "pending": pending,
+            "updated": updated,
+            "skipped": skipped,
+            "error_count": error_count,
+            "rows": results[:200],
+        }
+        if not preview_only:
+            add_log(
+                "Excel",
+                f"Ghi mô tả hàng loạt: cập nhật {updated}, giữ nguyên {unchanged}, bỏ qua {skipped}, lỗi {error_count}.",
+                "SUCCESS" if updated else "WARNING",
+            )
+        return response
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@app.post("/api/queue/bulk-descriptions")
+async def api_bulk_descriptions(data: Dict[str, Any] = Body(...)):
+    return await run_in_threadpool(
+        _bulk_description_worker,
+        data.get("items"),
+        data.get("project_name"),
+        data.get("ids", []),
+        data.get("preview_only", True),
+        data.get("preview_revision", ""),
+    )
+
+
+@app.post("/api/queue/import-descriptions")
+async def api_import_descriptions(
+    file: UploadFile = File(...),
+    project_name: str = Form(...),
+    ids: str = Form("[]"),
+    preview_only: bool = Form(True),
+    preview_revision: str = Form(""),
+):
+    filename = (file.filename or "").strip()
+    if not filename.lower().endswith((".xlsx", ".xlsm")):
+        raise HTTPException(400, "Vui lòng chọn file .xlsx hoặc .xlsm; file .xls cũ chưa được hỗ trợ.")
+    try:
+        selected_ids = json.loads(ids)
+    except ValueError as exc:
+        raise HTTPException(400, "Danh sách ID video không hợp lệ.") from exc
+    raw = await file.read(20 * 1024 * 1024 + 1)
+    if not raw:
+        raise HTTPException(400, "File Excel rỗng.")
+    if len(raw) > 20 * 1024 * 1024:
+        raise HTTPException(400, "File Excel quá lớn (tối đa 20 MB).")
+    entries = await run_in_threadpool(_description_excel_entries, raw)
+    return await run_in_threadpool(
+        _bulk_description_worker, entries, project_name.strip(), selected_ids, preview_only, preview_revision,
+    )
+
+
 @app.post("/api/queue/import-excel")
 async def api_import_excel(
     file: UploadFile = File(...),

@@ -2272,6 +2272,217 @@ async function handleImportExcel(event) {
   }
 }
 
+let gBulkDescriptionIds = [];
+let gBulkDescriptionMode = 'manual';
+let gBulkDescriptionProject = '';
+let gBulkDescriptionBusy = false;
+let gBulkDescriptionPending = null;
+
+function openBulkDescriptionModal() {
+  if (gBulkDescriptionBusy) return;
+  const ids = getTargetIdsOrAlert();
+  if (!ids.length) {
+    alert('Không có video nào để ghi mô tả.');
+    return;
+  }
+  const byId = new Map((gQueueItems || []).map(item => [Number(item.id), item]));
+  const items = ids.map(id => byId.get(Number(id))).filter(Boolean);
+  if (!items.length) {
+    alert('Không tìm thấy dữ liệu các video đã chọn. Hãy tải lại hàng đợi.');
+    return;
+  }
+
+  gBulkDescriptionIds = items.map(item => Number(item.id));
+  gBulkDescriptionProject = document.getElementById('sel-project').value;
+  document.getElementById('bulk-desc-target').textContent =
+    `${items.length} video ${gSelectedIds.size ? 'đã chọn' : 'đang hiển thị'}. Chỉ sửa mô tả trong hàng đợi; không cập nhật video đã đăng trên YouTube. Tiêu đề, kênh và lịch đăng được giữ nguyên.`;
+  const container = document.getElementById('bulk-desc-manual-rows');
+  container.replaceChildren();
+  items.forEach(item => {
+    const wrapper = document.createElement('div');
+    const label = document.createElement('label');
+    label.textContent = `#${item.id} — ${item.title || 'Không có tiêu đề'}`;
+    const input = document.createElement('textarea');
+    input.rows = 3;
+    input.className = 'bulk-desc-input';
+    input.id = `bulk-description-${item.id}`;
+    label.htmlFor = input.id;
+    input.oninput = invalidateBulkDescriptionPreview;
+    input.dataset.id = String(item.id);
+    input.value = item.description || '';
+    input.maxLength = 5000;
+    wrapper.appendChild(label);
+    wrapper.appendChild(input);
+    container.appendChild(wrapper);
+  });
+  document.getElementById('bulk-desc-excel-file').value = '';
+  document.getElementById('bulk-desc-shared').value = '';
+  setBulkDescriptionMode('manual');
+  document.getElementById('modal-bulk-description').style.display = 'flex';
+  document.getElementById('bulk-desc-shared').focus();
+}
+
+function closeBulkDescriptionModal() {
+  if (gBulkDescriptionBusy) return;
+  invalidateBulkDescriptionPreview();
+  document.getElementById('modal-bulk-description').style.display = 'none';
+}
+
+function invalidateBulkDescriptionPreview() {
+  gBulkDescriptionPending = null;
+  document.getElementById('bulk-desc-apply').disabled = true;
+  document.getElementById('bulk-desc-preview').replaceChildren();
+}
+
+function fillSharedBulkDescription() {
+  const value = document.getElementById('bulk-desc-shared').value.trim();
+  if (!value) return alert('Hãy nhập mô tả dùng chung.');
+  document.querySelectorAll('#bulk-desc-manual-rows textarea').forEach(input => { input.value = value; });
+  invalidateBulkDescriptionPreview();
+}
+
+function setBulkDescriptionBusy(busy) {
+  gBulkDescriptionBusy = busy;
+  document.getElementById('modal-bulk-description').setAttribute('aria-busy', String(busy));
+  document.querySelectorAll('#modal-bulk-description button, #modal-bulk-description input, #modal-bulk-description textarea')
+    .forEach(element => { element.disabled = busy; });
+  document.getElementById('bulk-desc-apply').disabled = busy || !gBulkDescriptionPending;
+}
+
+function setBulkDescriptionMode(mode) {
+  if (gBulkDescriptionBusy) return;
+  gBulkDescriptionMode = mode === 'excel' ? 'excel' : 'manual';
+  const isExcel = gBulkDescriptionMode === 'excel';
+  document.getElementById('bulk-desc-manual-panel').style.display = isExcel ? 'none' : 'block';
+  document.getElementById('bulk-desc-excel-panel').style.display = isExcel ? 'block' : 'none';
+  document.getElementById('bulk-desc-manual-tab').className = isExcel ? 'btn btn-outline btn-sm' : 'btn btn-primary btn-sm';
+  document.getElementById('bulk-desc-excel-tab').className = isExcel ? 'btn btn-primary btn-sm' : 'btn btn-outline btn-sm';
+  invalidateBulkDescriptionPreview();
+}
+
+function createBulkDescriptionSender() {
+  const projectName = gBulkDescriptionProject;
+  const ids = gBulkDescriptionIds.slice();
+  if (gBulkDescriptionMode === 'excel') {
+    const fileInput = document.getElementById('bulk-desc-excel-file');
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) throw new Error('Hãy chọn file Excel có cột ID và Mô tả.');
+    return (previewOnly, revision = '') => {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('project_name', projectName);
+      formData.append('ids', JSON.stringify(ids));
+      formData.append('preview_only', previewOnly ? 'true' : 'false');
+      formData.append('preview_revision', revision);
+      return apiFetch('/api/queue/import-descriptions', { method: 'POST', body: formData });
+    };
+  }
+
+  const items = Array.from(document.querySelectorAll('#bulk-desc-manual-rows .bulk-desc-input'))
+    .map(input => ({
+      id: Number(input.dataset.id),
+      description: input.value.trim(),
+    }))
+    .filter(item => item.description);
+  if (!items.length) throw new Error('Hãy nhập ít nhất một mô tả.');
+  return (previewOnly, revision = '') => apiFetch('/api/queue/bulk-descriptions', {
+    method: 'POST',
+    body: JSON.stringify({
+      project_name: projectName,
+      ids,
+      items,
+      preview_only: previewOnly,
+      preview_revision: revision,
+    }),
+  });
+}
+
+function renderBulkDescriptionPreview(data) {
+  const container = document.getElementById('bulk-desc-preview');
+  container.replaceChildren();
+  const summary = document.createElement('div');
+  summary.style.marginBottom = '8px';
+  summary.textContent = data.preview_only
+    ? `Xem trước: ${data.pending || 0} dòng sẽ đổi, ${data.unchanged || 0} dòng giữ nguyên, ${data.skipped || 0} dòng bỏ qua, ${data.error_count || 0} dòng lỗi.`
+    : `Kết quả: đã cập nhật ${data.updated || 0}, giữ nguyên ${data.unchanged || 0}, bỏ qua ${data.skipped || 0}, lỗi ${data.error_count || 0}.`;
+  container.appendChild(summary);
+  const note = document.createElement('div');
+  note.textContent = 'Xem nhanh tối đa 100 dòng, 160 ký tự mỗi mô tả; nội dung đầy đủ sẽ được lưu.';
+  note.style.color = 'var(--text-muted)';
+  container.appendChild(note);
+
+  const rows = data.rows || [];
+  if (!rows.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'table-wrap';
+  wrap.style.maxHeight = '260px';
+  const table = document.createElement('table');
+  const head = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  ['ID', 'Trạng thái', 'Mô tả / lý do'].forEach(text => {
+    const cell = document.createElement('th');
+    cell.textContent = text;
+    headRow.appendChild(cell);
+  });
+  head.appendChild(headRow);
+  table.appendChild(head);
+  const body = document.createElement('tbody');
+  const labels = { ready: 'Sẽ cập nhật', updated: 'Đã cập nhật', unchanged: 'Giữ nguyên', skipped: 'Bỏ qua', error: 'Lỗi' };
+  rows.slice(0, 100).forEach(row => {
+    const tr = document.createElement('tr');
+    [row.queue_id ? `#${row.queue_id}` : `Dòng ${row.line}`, labels[row.state] || row.state, row.reason || row.preview || ''].forEach(text => {
+      const td = document.createElement('td');
+      td.textContent = String(text);
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  });
+  table.appendChild(body);
+  wrap.appendChild(table);
+  container.appendChild(wrap);
+}
+
+async function previewBulkDescriptions() {
+  if (gBulkDescriptionBusy) return;
+  invalidateBulkDescriptionPreview();
+  setBulkDescriptionBusy(true);
+  try {
+    const send = createBulkDescriptionSender();
+    const preview = await send(true);
+    renderBulkDescriptionPreview(preview);
+    if (preview.pending > 0) gBulkDescriptionPending = { send, preview };
+    document.getElementById('bulk-desc-preview').scrollIntoView({ block: 'nearest' });
+  } catch (e) {
+    alert('Lỗi xem trước mô tả: ' + e.message);
+  } finally {
+    setBulkDescriptionBusy(false);
+  }
+}
+
+async function saveBulkDescriptions() {
+  if (gBulkDescriptionBusy || !gBulkDescriptionPending) return;
+  const { send, preview } = gBulkDescriptionPending;
+  const message = `Sẽ cập nhật ${preview.pending} mô tả; giữ nguyên ${preview.unchanged || 0}, bỏ qua ${preview.skipped || 0}, lỗi ${preview.error_count || 0}.\n\nXác nhận chỉ lưu mô tả trong hàng đợi?`;
+  if (!confirm(message)) return;
+  setBulkDescriptionBusy(true);
+  try {
+    const result = await send(false, preview.preview_revision);
+    gBulkDescriptionPending = null;
+    renderBulkDescriptionPreview(result);
+    await loadQueue(true);
+    const current = new Map(gQueueItems.map(item => [Number(item.id), item.description || '']));
+    document.querySelectorAll('#bulk-desc-manual-rows textarea').forEach(input => {
+      if (current.has(Number(input.dataset.id))) input.value = current.get(Number(input.dataset.id));
+    });
+    showToast(`Đã cập nhật ${result.updated || 0} mô tả.`, 'success');
+  } catch (e) {
+    invalidateBulkDescriptionPreview();
+    alert('Lỗi ghi mô tả hàng loạt: ' + e.message);
+  } finally {
+    setBulkDescriptionBusy(false);
+  }
+}
+
 function exportCsv() {
   const proj = document.getElementById('sel-project').value || 'Default';
   downloadWithToken(`/api/queue/export-csv?project=${encodeURIComponent(proj)}`, 'YouTube_Queue.csv');

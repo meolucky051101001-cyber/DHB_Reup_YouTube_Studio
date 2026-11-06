@@ -518,6 +518,7 @@
                   </div>
                   <button class="btn btn-outline btn-sm" style="color:#34d399; border-color:rgba(52,211,153,0.45);" onclick="exportExcel()" title="Xuất Excel các dòng đang chọn (hoặc cả dự án) để sửa tiêu đề/lịch riêng từng video">📥 Xuất Excel</button>
                   <button class="btn btn-outline btn-sm" style="color:#34d399; border-color:rgba(52,211,153,0.45);" onclick="triggerImportExcel()" title="Nhập Excel để cập nhật hàng loạt tiêu đề, mô tả, lịch, kênh...">📤 Nhập Excel</button>
+                  <button class="btn btn-outline btn-sm" onclick="openBulkDescriptionModal()" title="Ghi mô tả cho nhiều video bằng nhập tay hoặc file Excel">Mô tả hàng loạt</button>
                   <button class="btn btn-outline btn-sm" onclick="exportCsv()" title="Xuất danh sách sang file CSV">📥 Xuất CSV</button>
                   <button class="btn btn-outline btn-sm" onclick="triggerImportCsv()" title="Nhập danh sách từ file CSV">📤 Nhập CSV</button>
                   <input type="file" id="file-import-excel" accept=".xlsx,.xlsm" style="display:none;" onchange="handleImportExcel(event)" />
@@ -1433,6 +1434,47 @@
     </section>
 
   </main>
+
+  <div id="modal-bulk-description" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="bulk-desc-title">
+    <div class="modal-content" style="max-width:960px;">
+      <div class="modal-header">
+        <h3 id="bulk-desc-title">Ghi mô tả hàng loạt</h3>
+        <button class="btn btn-outline btn-sm" onclick="closeBulkDescriptionModal()" aria-label="Đóng hộp mô tả">×</button>
+      </div>
+      <div class="modal-body">
+        <div id="bulk-desc-target" class="form-group" style="color:var(--text-muted);"></div>
+        <div class="form-group" style="display:flex; gap:8px;">
+          <button type="button" id="bulk-desc-manual-tab" class="btn btn-primary btn-sm" onclick="setBulkDescriptionMode('manual')">Nhập tay</button>
+          <button type="button" id="bulk-desc-excel-tab" class="btn btn-outline btn-sm" onclick="setBulkDescriptionMode('excel')">Tải từ Excel</button>
+        </div>
+        <div id="bulk-desc-manual-panel">
+          <div class="form-group">
+            <label for="bulk-desc-shared">Mô tả dùng chung (tùy chọn, tối đa 5000 ký tự):</label>
+            <textarea id="bulk-desc-shared" rows="3" maxlength="5000" placeholder="Nhập một mô tả để điền cho toàn bộ video trong danh sách bên dưới..."></textarea>
+            <button class="btn btn-outline btn-sm" onclick="fillSharedBulkDescription()">Điền cho tất cả các dòng bên dưới</button>
+          </div>
+          <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">
+            Chỉnh mô tả cho từng video. Dòng để trống sẽ được bỏ qua, không xóa mô tả hiện tại.
+          </div>
+          <div id="bulk-desc-manual-rows" style="max-height:430px; overflow:auto; display:grid; gap:10px;"></div>
+        </div>
+        <div id="bulk-desc-excel-panel" style="display:none;">
+          <div class="form-group" style="font-size:12px; color:var(--text-muted);">
+            File .xlsx/.xlsm cần có cột <strong>ID</strong> và <strong>Mô tả</strong> (hoặc <strong>Description</strong>). Các cột khác được bỏ qua; mỗi ID chỉ xuất hiện một lần.
+          </div>
+          <div class="form-group" style="font-size:12px; color:var(--text-muted);">Có thể dùng file từ nút Xuất Excel của hàng đợi. Ô trống giữ nguyên mô tả; tối đa 5000 dòng và 20 MB. Hãy chuyển công thức thành giá trị trước khi nhập.</div>
+          <label for="bulk-desc-excel-file">Chọn file mô tả:</label>
+          <input type="file" id="bulk-desc-excel-file" accept=".xlsx,.xlsm" onchange="invalidateBulkDescriptionPreview()" />
+        </div>
+        <div id="bulk-desc-preview" style="margin-top:14px;" aria-live="polite"></div>
+      </div>
+      <div class="modal-footer" style="display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap;">
+        <button class="btn btn-outline" onclick="closeBulkDescriptionModal()">Đóng</button>
+        <button class="btn btn-outline" id="bulk-desc-save" onclick="previewBulkDescriptions()">Xem trước</button>
+        <button class="btn btn-primary" id="bulk-desc-apply" onclick="saveBulkDescriptions()" disabled>Áp dụng mô tả</button>
+      </div>
+    </div>
+  </div>
 
   <!-- ==========================================
        MODAL: CHỈNH SỬA CHI TIẾT VIDEO, PROFILE & ĐỘ PHÂN GIẢI
