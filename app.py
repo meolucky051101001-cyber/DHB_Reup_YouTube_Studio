@@ -1998,7 +1998,7 @@ def _excel_datetime(value: Any) -> Optional[datetime]:
     if not text:
         return None
     try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))  # noqa: FURB162 - supports Python 3.10
         if parsed.tzinfo is not None:
             parsed = parsed.astimezone(datetime.now().astimezone().tzinfo).replace(tzinfo=None)
         return parsed.replace(microsecond=0)
@@ -2429,13 +2429,17 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int],
             row_errors: List[str] = []
             row_warnings: List[str] = []
 
-            def row_error(message: str):
-                row_errors.append(message)
-                errors.append(f"Dòng {row['row']} (#{item_id}): {message}")
+            def row_error(
+                message: str, *, _row_errors=row_errors, _row=row, _item_id=item_id
+            ):
+                _row_errors.append(message)
+                errors.append(f"Dòng {_row['row']} (#{_item_id}): {message}")
 
-            def row_warning(message: str):
-                row_warnings.append(message)
-                warn(f"Dòng {row['row']} (#{item_id}): {message}")
+            def row_warning(
+                message: str, *, _row_warnings=row_warnings, _row=row, _item_id=item_id
+            ):
+                _row_warnings.append(message)
+                warn(f"Dòng {_row['row']} (#{_item_id}): {message}")
 
             title = values.get("title")
             if title is not None and str(title).strip() != "":
@@ -2631,7 +2635,7 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int],
         adjusted = 0
         scheduled_entries.sort(key=lambda pair: pair[1])
         for idx in range(1, len(scheduled_entries)):
-            prev_id, prev_dt = scheduled_entries[idx - 1]
+            _prev_id, prev_dt = scheduled_entries[idx - 1]
             item_id, item_dt = scheduled_entries[idx]
             min_dt = prev_dt + timedelta(minutes=30)
             if item_dt < min_dt:

@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import pipeline_manager as pm
-import render_engine as render_engine
+import render_engine
 
 
 def _filter_complex_of(cmd):

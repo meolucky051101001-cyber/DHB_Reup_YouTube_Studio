@@ -2,7 +2,7 @@
 
 import os
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -114,7 +114,7 @@ def storage_overview(retention_days: int = DEFAULT_RETENTION_DAYS) -> Dict[str, 
     temp_usage = _directory_size(roots[0])
     output_usage = _directory_size(roots[1])
     free_values = [int(shutil.disk_usage(str(root)).free) for root in roots]
-    cutoff = datetime.utcnow() - timedelta(days=retention)
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=retention)
     cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_conn()
@@ -176,7 +176,9 @@ def cleanup_managed_artifacts(
     retention = int(retention_days)
     if retention < 1 or retention > 365:
         raise ValueError("Thời hạn lưu phải nằm trong khoảng 1–365 ngày.")
-    cutoff_text = (datetime.utcnow() - timedelta(days=retention)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_text = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=retention)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
     roots = _storage_roots()
     conn = get_conn()

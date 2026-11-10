@@ -1641,7 +1641,9 @@ def _verify_api_video(http, video_id: str, access_token: str, metadata: Dict[str
             if not raw_publish_at:
                 raise RuntimeError("YouTube không trả lại thời gian công bố đã hẹn.")
             try:
-                actual_publish_at = datetime.fromisoformat(raw_publish_at.replace("Z", "+00:00"))
+                actual_publish_at = datetime.fromisoformat(
+                    raw_publish_at.replace("Z", "+00:00")  # noqa: FURB162 - supports Python 3.10
+                )
                 expected_publish_at = datetime.fromisoformat(
                     str(metadata.get("schedule_time") or "").replace(" ", "T")
                 ).astimezone()

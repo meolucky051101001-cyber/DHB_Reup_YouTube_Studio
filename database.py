@@ -858,7 +858,7 @@ def public_settings(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 def validate_public_settings(settings: Any) -> Dict[str, Any]:
     """Validate the small, supported set of settings writable from the local API."""
     if not isinstance(settings, dict):
-        raise ValueError("Cấu hình phải là một object JSON.")
+        raise ValueError("Cấu hình phải là một object JSON.")  # noqa: TRY004 - API maps validation errors to 400
     unknown = sorted(str(key) for key in settings if key not in PUBLIC_SETTING_KEYS)
     if unknown:
         secret_names = [key for key in unknown if is_secret_setting_key(key)]
@@ -895,13 +895,13 @@ def validate_public_settings(settings: Any) -> Dict[str, Any]:
 
 def validate_secret_settings(settings: Any) -> Dict[str, str]:
     if not isinstance(settings, dict) or not settings:
-        raise ValueError("Cần gửi ít nhất một khóa bí mật để lưu.")
+        raise ValueError("Cần gửi ít nhất một khóa bí mật để lưu.")  # noqa: TRY004 - API maps validation errors to 400
     result: Dict[str, str] = {}
     for key, value in settings.items():
         if key not in SECRET_SETTING_KEYS:
             raise ValueError(f"Không hỗ trợ lưu khóa bí mật {key}.")
         if not isinstance(value, str):
-            raise ValueError(f"Giá trị {key} phải là chuỗi.")
+            raise ValueError(f"Giá trị {key} phải là chuỗi.")  # noqa: TRY004 - API maps validation errors to 400
         normalized = value.strip()
         if not normalized:
             continue

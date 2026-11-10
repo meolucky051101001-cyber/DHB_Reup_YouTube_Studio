@@ -31,7 +31,7 @@ class AppInstanceLock:
         handle = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            handle = open(self.path, "a+b")
+            handle = open(self.path, "a+b")  # noqa: SIM115 - retain the handle until release() unlocks it
             handle.seek(0, os.SEEK_END)
             if handle.tell() == 0:
                 handle.write(b"\0")
@@ -93,8 +93,9 @@ class AppInstanceLock:
             with _local_guard:
                 _local_locks.discard(self._key)
 
-    def __enter__(self) -> "AppInstanceLock":
-        return self.acquire()
+    def __enter__(self) -> "AppInstanceLock":  # noqa: PYI034 - runtime context manager returns the lock owner
+        self.acquire()
+        return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.release()

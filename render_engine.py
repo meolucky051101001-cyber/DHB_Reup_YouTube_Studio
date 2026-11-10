@@ -53,6 +53,7 @@ def _terminate_ffmpeg_proc(proc: subprocess.Popen, timeout: float = 5.0):
                 stderr=subprocess.DEVNULL,
                 timeout=timeout,
                 shell=False,
+                check=False,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
         except Exception:
@@ -801,9 +802,9 @@ def render_video(
 
         extra_inputs: list = []
         if bg_music_path:
-            brand_segments, draw_chain, brand_label, input_count = _build_branding(cfg, "vpre", 2, extra_inputs, h_shorts)
+            brand_segments, draw_chain, brand_label, _input_count = _build_branding(cfg, "vpre", 2, extra_inputs, h_shorts)
         else:
-            brand_segments, draw_chain, brand_label, input_count = _build_branding(
+            brand_segments, draw_chain, brand_label, _input_count = _build_branding(
                 cfg, "vpre", 1 + (0 if has_audio else 1), extra_inputs, h_shorts
             )
         tail_filters = ",".join(draw_chain + ["format=yuv420p"])
@@ -874,7 +875,7 @@ def render_video(
                 f"[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1[vpre]"
             )
             extra_inputs = []
-            brand_segments, draw_chain, brand_label, input_count = _build_branding(
+            brand_segments, draw_chain, brand_label, _input_count = _build_branding(
                 cfg, "vpre", 2 + (0 if has_audio else 1), extra_inputs, 720
             )
             tail_filters = ",".join(draw_chain + ["format=yuv420p"])
@@ -912,7 +913,7 @@ def render_video(
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2[vpre]"
         )
         extra_inputs = []
-        brand_segments, draw_chain, brand_label, input_count = _build_branding(
+        brand_segments, draw_chain, brand_label, _input_count = _build_branding(
             cfg, "vpre", 1 + (0 if has_audio else 1), extra_inputs, 1080
         )
         tail_filters = ",".join(draw_chain + ["format=yuv420p"])
@@ -962,9 +963,9 @@ def render_video(
 
         extra_inputs = []
         if bg_music_path:
-            brand_segments, draw_chain, brand_label, input_count = _build_branding(cfg, "vpre", 2, extra_inputs, h_res)
+            brand_segments, draw_chain, brand_label, _input_count = _build_branding(cfg, "vpre", 2, extra_inputs, h_res)
         else:
-            brand_segments, draw_chain, brand_label, input_count = _build_branding(
+            brand_segments, draw_chain, brand_label, _input_count = _build_branding(
                 cfg, "vpre", 1 + (0 if has_audio else 1), extra_inputs, h_res
             )
         tail_filters = ",".join(draw_chain + ["format=yuv420p"])
@@ -1210,6 +1211,7 @@ def generate_thumbnail_from_video(
             stderr=subprocess.DEVNULL,
             timeout=60,
             shell=False,
+            check=False,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         if res.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 0:

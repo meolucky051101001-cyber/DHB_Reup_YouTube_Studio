@@ -1036,8 +1036,9 @@ class ExcelImportWorkerTests(unittest.TestCase):
             self.assertTrue(rows[rid]["schedule_time"])
 
     def test_worker_rejects_garbage_bytes(self):
-        with self.assertRaises(Exception):
+        with self.assertRaises(self.app.HTTPException) as raised:
             self.app._excel_import_worker(b"khong-phai-excel", "Dự án Test", [])
+        self.assertEqual(raised.exception.status_code, 400)
 
 
 if __name__ == "__main__":
