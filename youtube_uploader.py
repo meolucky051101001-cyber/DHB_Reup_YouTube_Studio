@@ -18,6 +18,7 @@ from config import (
 )
 from database import add_log, get_settings
 from antidetect_client import (
+    AntidetectNotReady,
     AntidetectBrowserLease,
     AntidetectClient,
     resolve_antidetect_profile_id,
@@ -1744,6 +1745,8 @@ def _upload_via_youtube_api_with_session(
     if progress_callback:
         progress_callback(5, "Khởi tạo phiên tải lên YouTube API...")
 
+    if channel.get("_verify_approval"):
+        channel["_verify_approval"]()
     init_resp = http.post(init_url, headers=headers, json=body, timeout=30)
     if init_resp.status_code not in (200, 201):
         raise RuntimeError(f"YouTube API từ chối khởi tạo upload ({init_resp.status_code}): {init_resp.text}")
@@ -2418,7 +2421,7 @@ def _normalize_studio_title(value: str) -> str:
     return " ".join(str(value or "").split()).casefold()
 
 
-def _studio_row_matches_title(row, expected_title: str) -> bool:
+def _studio_row_matches_title(row, expected_title: str, *, require_readable: bool = False) -> bool:
     """Match a content row by its full title, avoiding substring collisions."""
     expected = _normalize_studio_title(expected_title)
     if not expected:
@@ -2427,11 +2430,15 @@ def _studio_row_matches_title(row, expected_title: str) -> bool:
     for selector in ("#video-title", "a#video-title", "ytcp-video-title"):
         try:
             title = row.locator(selector).first
-            if title.count() > 0 and _normalize_studio_title(title.inner_text()) == expected:
-                return True
+            if title.count() > 0:
+                actual = _normalize_studio_title(title.inner_text(timeout=2500))
+                if actual:
+                    return actual == expected
         except Exception:
             continue
 
+    if require_readable:
+        raise RuntimeError("Không đọc được tiêu đề của một hàng trong YouTube Studio.")
     try:
         lines = [_normalize_studio_title(line) for line in (row.inner_text() or "").splitlines()]
         return expected in lines
@@ -2497,6 +2504,50 @@ def _studio_row_video_id(row) -> str:
     return ""
 
 
+_STUDIO_EMPTY_HEADER = "ytcp-video-section-content#video-list .no-content > .no-content-header"
+_STUDIO_TABLE_FOOTER = "ytcp-video-section-content#video-list ytcp-table-footer"
+_STUDIO_FOOTER_RANGE = re.compile(
+    r"(?m)^\s*(\d+)\s*[-–—]\s*(\d+)\s*/\s*(?:khoảng\s*)?(\d+)\s*$"
+)
+_STUDIO_EMPTY_MESSAGE = re.compile(
+    r"(?:(?:[^.!?]*\b(?:videos?|shorts?|live streams?|phát trực tiếp)\b[^.!?]*"
+    r"(?:will (?:appear|show up) here|sẽ xuất hiện ở đây))"
+    r"|(?:no videos(?: yet)?|chưa có video|không có video))[.!]?"
+)
+
+
+def _studio_content_tab_is_complete(
+    page, content_url: str, row_count: int, expected_start: int = 1
+) -> bool:
+    current = urlsplit(str(page.url or ""))
+    expected = urlsplit(content_url)
+    if (
+        (current.scheme, current.netloc, current.path) != (expected.scheme, expected.netloc, expected.path)
+        or parse_qs(current.query, keep_blank_values=True).get("filter", ["[]"]) != ["[]"]
+    ):
+        # Studio can redirect to another channel or restore a filter.
+        return False
+    if row_count == 0:
+        header = page.locator(_STUDIO_EMPTY_HEADER).first
+        return bool(
+            header.count() and header.is_visible()
+            and _STUDIO_EMPTY_MESSAGE.fullmatch(_normalize_studio_title(header.inner_text(timeout=2500)))
+        )
+    footer = page.locator(_STUDIO_TABLE_FOOTER).first
+    if not footer.count() or not footer.is_visible():
+        return False
+    match = _STUDIO_FOOTER_RANGE.search(footer.inner_text(timeout=2500))
+    if not match:
+        return False
+    start, end, total = map(int, match.groups())
+    return (
+        start == expected_start
+        and end >= start
+        and end - start + 1 == row_count
+        and total >= end
+    )
+
+
 def _collect_studio_title_candidates(
     page, channel_id: str, title: str, upload_to: str = "list", require_readable: bool = False
 ) -> list:
@@ -2506,31 +2557,96 @@ def _collect_studio_title_candidates(
     for section in _studio_content_sections(upload_to):
         content_url = f"https://studio.youtube.com/channel/{channel_id}/videos/{section}"
         page.goto(content_url, wait_until="domcontentloaded", timeout=30000)
-        rows_ready = True
-        try:
-            page.wait_for_selector("ytcp-video-row", timeout=15000)
-        except Exception:
-            # Tab trống hoặc danh sách chậm vẫn phải được đọc một lần.
-            rows_ready = False
-            page.wait_for_timeout(1500)
-        rows = page.locator("ytcp-video-row")
-        raw_count = rows.count()
-        if require_readable and ((not rows_ready and raw_count == 0) or raw_count >= 100):
-            # Không phân biệt được tab trống với tab chưa tải xong, hoặc chưa đọc hết phân trang.
-            unreadable.append(section)
-            continue
-        for index in range(min(raw_count, 100)):
-            row = rows.nth(index)
-            if not _studio_row_matches_title(row, title):
-                continue
-            video_id = _studio_row_video_id(row)
-            if require_readable and not video_id:
-                # Hàng trùng tiêu đề nhưng không đọc được ID -> không thể loại trừ về sau.
+        expected_start = 1
+        previous_footer = ""
+        reported_total = None
+        page_index = 0
+        while True:
+            try:
+                page.wait_for_selector(f"ytcp-video-row, {_STUDIO_EMPTY_HEADER}", timeout=15000)
+            except Exception:
+                if require_readable:
+                    unreadable.append(section)
+                    break
+                page.wait_for_timeout(1500)
+            rows = page.locator("ytcp-video-row")
+            raw_count = rows.count()
+            footer = page.locator(_STUDIO_TABLE_FOOTER).first
+            footer_text = footer.inner_text(timeout=2500) if footer.count() else ""
+            if require_readable:
+                if not _studio_content_tab_is_complete(page, content_url, raw_count, expected_start):
+                    unreadable.append(section)
+                    break
+                if raw_count:
+                    match = _STUDIO_FOOTER_RANGE.search(footer_text)
+                    page_total = int(match[3]) if match else -1
+                    if reported_total is None:
+                        reported_total = page_total
+                    elif page_total != reported_total:
+                        unreadable.append(section)
+                        break
+            for index in range(min(raw_count, 100)):
+                row = rows.nth(index)
+                if not _studio_row_matches_title(row, title, require_readable=require_readable):
+                    continue
+                video_id = _studio_row_video_id(row)
+                if require_readable and not video_id:
+                    # A matching title without a video ID cannot be safely deduplicated.
+                    unreadable.append(section)
+                    break
+                candidates.append(
+                    {"id": video_id, "visibility": _studio_row_visibility_state(row, title)}
+                )
+            if unreadable and unreadable[-1] == section:
+                break
+            if require_readable and rows.count() != raw_count:
                 unreadable.append(section)
                 break
-            candidates.append(
-                {"id": video_id, "visibility": _studio_row_visibility_state(row, title)}
+            if not require_readable or raw_count == 0:
+                break
+
+            next_page = page.locator(f"{_STUDIO_TABLE_FOOTER} ytcp-icon-button#navigate-after").first
+            if not next_page.count():
+                unreadable.append(section)
+                break
+            is_disabled = next_page.evaluate(
+                "element => element.disabled === true || element.hasAttribute('disabled') "
+                "|| element.getAttribute('aria-disabled') === 'true'"
             )
+            if is_disabled:
+                break
+            match = _STUDIO_FOOTER_RANGE.search(footer_text)
+            if not match:
+                unreadable.append(section)
+                break
+            next_start = int(match[2]) + 1
+            previous_first_id = _studio_row_video_id(rows.first)
+            page_index += 1
+            if page_index >= 100:
+                unreadable.append(section)
+                break
+            previous_footer = footer_text
+            next_page.click()
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                page.wait_for_timeout(250)
+                updated_footer = page.locator(_STUDIO_TABLE_FOOTER).first
+                updated_text = updated_footer.inner_text(timeout=2500) if updated_footer.count() else ""
+                updated_range = _STUDIO_FOOTER_RANGE.search(updated_text)
+                updated_rows = page.locator("ytcp-video-row")
+                updated_first_id = _studio_row_video_id(updated_rows.first) if updated_rows.count() else ""
+                if (
+                    updated_text != previous_footer
+                    and updated_range
+                    and int(updated_range[1]) == next_start
+                    and updated_first_id
+                    and updated_first_id != previous_first_id
+                ):
+                    expected_start = next_start
+                    break
+            else:
+                unreadable.append(section)
+                break
     if unreadable:
         raise RuntimeError(
             "Không đọc đầy đủ danh sách nội dung tab " + ", ".join(sorted(set(unreadable))) + "."
@@ -2567,6 +2683,9 @@ def _find_published_video_in_studio_content(
     upload_to: str = "",
     expected_visibility: str = "",
     known_video_ids: Optional[set] = None,
+    *,
+    attempts: int = 1,
+    on_observation: Optional[Callable[[str], None]] = None,
 ) -> str:
     """Bằng chứng dự phòng: đúng 1 ID không nằm trong snapshot đã quan sát được chấp nhận."""
     channel_id = str(channel_id or "").strip()
@@ -2580,29 +2699,59 @@ def _find_published_video_in_studio_content(
         expected = "schedule"
     if expected not in ("public", "unlisted", "private", "schedule"):
         return ""
+    observed_ids = set()
+    for index in range(attempts):
+        result, url = "unreadable", ""
+        try:
+            candidates = _collect_studio_title_candidates(
+                page, channel_id, title, upload_to, require_readable=True
+            )
+        except Exception:
+            pass
+        else:
+            new_entries = [row for row in candidates if row["id"] and row["id"] not in known_video_ids]
+            observed_ids.update(row["id"] for row in new_entries)
+            states = {row["visibility"] for row in new_entries}
+            if len(observed_ids) > 1:
+                result = "ambiguous"
+            elif not new_entries:
+                result = "not_visible"
+            elif states == {expected}:
+                result, url = "confirmed", f"https://youtu.be/{next(iter(observed_ids))}"
+            elif states - {expected, ""}:
+                result = "wrong_visibility"
+            else:
+                result = "pending"
+        if on_observation:
+            on_observation(result)
+        if url or result in ("ambiguous", "wrong_visibility"):
+            return url
+        if index + 1 < attempts:
+            page.wait_for_timeout(4000)
+    return ""
+
+
+def _verify_published_video_on_fresh_tab(context, channel_id, metadata, known_video_ids):
+    if known_video_ids is None:
+        return ""
+    page = None
     try:
-        candidates = _collect_studio_title_candidates(
-            page, channel_id, title, upload_to, require_readable=True
+        page = context.new_page()
+        return _find_published_video_in_studio_content(
+            page, channel_id, metadata.get("title", ""), metadata.get("upload_to", ""),
+            metadata.get("privacy_status", ""), known_video_ids, attempts=3,
+            on_observation=lambda result: add_log(
+                "Upload", f"Kết quả đọc danh sách Studio sau lưu: {result}", "INFO", phase="VerifyingResult"
+            ),
         )
     except Exception:
         return ""
-    new_entries = [
-        candidate
-        for candidate in candidates
-        if candidate["id"] and candidate["id"] not in known_video_ids
-    ]
-    new_ids = {candidate["id"] for candidate in new_entries}
-    # Đếm TRƯỚC khi lọc visibility: Public + Draft cùng tiêu đề vẫn là 2 ứng viên mới.
-    if len(new_ids) != 1:
-        return ""
-    video_id = next(iter(new_ids))
-    if any(
-        candidate["visibility"] != expected
-        for candidate in new_entries
-        if candidate["id"] == video_id
-    ):
-        return ""
-    return f"https://youtu.be/{video_id}"
+    finally:
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
 
 
 DISCARD_DIALOG_WAIT_TIMEOUT_MS = 8000
@@ -2831,7 +2980,12 @@ class _StudioBrowserSession:
                 stop_if_started=True,
                 hide_window=self.hide_browser,
             )
-            self._lease.__enter__()
+            try:
+                self._lease.__enter__()
+            except Exception:
+                if self._lease.cleanup_unconfirmed:
+                    self.channel["_upload_cleanup_unconfirmed"] = True
+                raise
             self.context = self._lease.tracked_context
             self.page = self._lease.page
             self.init_scripts = []
@@ -2913,18 +3067,25 @@ class _StudioBrowserSession:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
+    def require_ready(self):
+        if self._lease is not None:
+            self._lease.require_ready()
+
     def close(self):
         if self._closed:
             return
         self._closed = True
         if self._lease is not None:
             self._lease.__exit__(None, None, None)
+            if self._lease.cleanup_unconfirmed:
+                self.channel["_upload_cleanup_unconfirmed"] = True
             self._lease = None
             return
         if self.context is not None:
             try:
                 self.context.close()
             except Exception as close_err:
+                self.channel["_upload_cleanup_unconfirmed"] = True
                 _log_optional_step_failure("đóng Chrome sau khi upload", close_err, self.channel, self.metadata)
         if self._pw is not None:
             try:
@@ -3069,6 +3230,10 @@ def upload_via_playwright_studio(
 
                 file_input = page.locator("input[type='file']").first
                 file_input.wait_for(state="attached", timeout=15000)
+                browser_session.require_ready()
+                if channel.get("_verify_approval"):
+                    channel["_verify_approval"]()
+                _verify_studio_channel_id(_read_active_studio_account(page), channel)
                 attach_upload_file(page, file_input, video_path)
                 draft_created = True
                 if progress_callback:
@@ -3474,6 +3639,14 @@ def upload_via_playwright_studio(
                 done_btn.wait_for(state="visible", timeout=15000)
                 if not done_btn.is_enabled():
                     raise RuntimeError("Nút Xuất bản/Lên lịch chưa sẵn sàng trên YouTube Studio.")
+                try:
+                    browser_session.require_ready()
+                except AntidetectNotReady as exc:
+                    draft_preserve_for_review = True
+                    raise RuntimeError("CDP mất sẵn sàng sau khi gửi file. Cần đối soát bản nháp.") from exc
+                if channel.get("_verify_approval"):
+                    channel["_verify_approval"]()
+                _verify_studio_channel_id(_read_active_studio_account(page), channel)
                 studio_url_before_publish = str(page.url or "")
                 if progress_callback:
                     progress_callback(92, "Đang gửi yêu cầu Xuất bản/Lên lịch lên YouTube Studio...")
@@ -3490,12 +3663,10 @@ def upload_via_playwright_studio(
                     page, studio_url_before_publish, PUBLISH_CONFIRM_TIMEOUT_SECONDS
                 ) or video_url
                 if not verified_url:
-                    verified_url = _find_published_video_in_studio_content(
-                        page,
+                    verified_url = _verify_published_video_on_fresh_tab(
+                        context,
                         active_channel.get("channel_id", ""),
-                        metadata.get("title", ""),
-                        metadata.get("upload_to", ""),
-                        metadata.get("privacy_status", ""),
+                        metadata,
                         known_video_ids,
                     )
 
@@ -3552,7 +3723,7 @@ def upload_via_playwright_studio(
                     "warning_message": "",
                     "published_uncertain": False,
                 }
-            except Exception:
+            except Exception as exc:
                 # Upload gãy giữa chừng SAU KHI đã nạp file: dọn BẢN NHÁP trong Studio
                 # để kênh không tồn video rác (rủi ro bị đánh giá spam).
                 # Nếu đã bấm Xuất bản/Lên lịch thì KHÔNG xóa — tránh xóa nhầm video đã đăng.
@@ -3606,6 +3777,8 @@ def upload_via_playwright_studio(
                         channel_name=channel.get("name", ""),
                         video_title=metadata.get("title", ""),
                     )
+                if draft_created and isinstance(exc, AntidetectNotReady):
+                    raise RuntimeError("Mất CDP sau khi nạp file. Cần đối soát Studio.") from exc
                 raise
 
 

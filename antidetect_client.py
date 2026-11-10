@@ -6,6 +6,7 @@ Chrome bằng user_data_dir của Antidetect.
 """
 import ctypes
 import json
+import logging
 import os
 import time
 from ctypes import wintypes
@@ -30,6 +31,12 @@ _CDP_RETRY_BASE_DELAY_SEC = 0.8
 
 class AntidetectError(RuntimeError):
     """Lỗi có thông điệp an toàn để hiển thị cho người vận hành (không chứa secret)."""
+
+
+class AntidetectNotReady(AntidetectError):
+    def __init__(self, message, start_result=None):
+        super().__init__(message)
+        self.start_result = start_result or {}
 
 
 def _read_antidetect_runtime(data_dir: Path) -> Dict[str, Any]:
@@ -293,26 +300,43 @@ class AntidetectClient:
 
     def start_profile(self, profile_id: str, url: Optional[str] = None) -> Dict[str, Any]:
         params = {"url": url} if url else None
-        data = self._request(
-            "POST",
-            f"/api/profiles/{quote(str(profile_id), safe='')}/start",
-            params=params,
-            timeout=_START_TIMEOUT,
-        )
+        try:
+            data = self._request(
+                "POST",
+                f"/api/profiles/{quote(str(profile_id), safe='')}/start",
+                params=params,
+                timeout=_START_TIMEOUT,
+            )
+        except AntidetectError as exc:
+            raise AntidetectNotReady(str(exc)) from exc
         if not isinstance(data, dict) or not data.get("success"):
             detail = (data or {}).get("error") if isinstance(data, dict) else ""
-            raise AntidetectError(detail or "Antidetect không khởi chạy được profile.")
-        if not data.get("port"):
-            state = self.get_profile_state(profile_id) or {}
-            data = {**data, "port": state.get("port")}
-        if not data.get("port"):
-            raise AntidetectError("Antidetect không trả về cổng CDP của profile.")
+            raise AntidetectNotReady(detail or "Antidetect không khởi chạy được profile.", data if isinstance(data, dict) else None)
+        health = data.get("cdp_health") or {}
+        if (data.get("profile_id", profile_id) != profile_id or data.get("degraded")
+                or data.get("cdp_ready") is False or data.get("configuration_verified") is False
+                or (data.get("launched_now") is True and
+                    (data.get("cdp_ready") is not True or data.get("configuration_verified") is not True))
+                or not isinstance(data.get("port"), int) or not 0 < data["port"] < 65536
+                or health.get("state") != "healthy" or not health.get("launch_id")):
+            raise AntidetectNotReady("Profile Antidetect chưa xác minh được cấu hình hoặc CDP.", data)
         return data
 
-    def stop_profile(self, profile_id: str) -> Dict[str, Any]:
+    def require_ready(self, profile_id: str, launch_id: str, port: int):
+        try:
+            state = self.get_profile_state(profile_id) or {}
+        except AntidetectError as exc:
+            raise AntidetectNotReady(str(exc)) from exc
+        health = state.get("cdp_health") or {}
+        if (not launch_id or state.get("status") != "running" or state.get("port") != port
+                or health.get("launch_id") != launch_id or health.get("state") != "healthy"):
+            raise AntidetectNotReady("Phiên Antidetect đã thay đổi hoặc CDP không còn sẵn sàng.")
+
+    def stop_profile(self, profile_id: str, *, expected_launch_id: str = "") -> Dict[str, Any]:
         data = self._request(
             "POST",
-            f"/api/profiles/{quote(str(profile_id), safe='')}/stop",
+            f"/api/profiles/{quote(str(profile_id), safe='')}/stop" + ("/owned" if expected_launch_id else ""),
+            params={"expected_launch_id": expected_launch_id} if expected_launch_id else None,
             timeout=45.0,
         )
         if isinstance(data, dict) and data.get("success") is False:
@@ -333,11 +357,13 @@ class AntidetectClient:
 class _TrackedContext:
     """Bọc context CDP để chỉ đóng những tab do tool này tạo ra."""
 
-    def __init__(self, context, pages: List[Any]):
+    def __init__(self, context, pages: List[Any], require_ready):
         self._context = context
         self._pages = pages
+        self._require_ready = require_ready
 
     def new_page(self):
+        self._require_ready()
         page = self._context.new_page()
         self._pages.append(page)
         return page
@@ -345,21 +371,6 @@ class _TrackedContext:
     def __getattr__(self, name):
         return getattr(self._context, name)
 
-
-def _lease_started_by_us(
-    start_result: Dict[str, Any], state_known: bool, was_running: bool
-) -> bool:
-    """Lease có tự khởi chạy profile không, chỉ dựa vào dữ liệu cấu trúc.
-
-    API mới trả ``pid``/``ws_endpoint`` khi khởi chạy mới và ``already_running``
-    khi dùng lại phiên có sẵn; không phụ thuộc câu chữ ``message``. Với API cũ
-    không có các trường này, dùng trạng thái profile đọc trước khi start.
-    """
-    if start_result.get("already_running") is True:
-        return False
-    if start_result.get("pid") or start_result.get("ws_endpoint"):
-        return True
-    return bool(state_known and not was_running)
 
 
 class AntidetectBrowserLease:
@@ -391,21 +402,19 @@ class AntidetectBrowserLease:
         self.tracked_context = None
         self.page = None
         self.port = None
+        self.launch_id = ""
+        self.cleanup_unconfirmed = False
 
     def __enter__(self):
-        state_known = False
-        was_running = False
         try:
-            state = self.client.get_profile_state(self.profile_id)
-            state_known = state is not None
-            was_running = bool(state and state.get("status") == "running")
-        except AntidetectError:
-            state_known = False
-
-        try:
-            res = self.client.start_profile(self.profile_id)
+            try:
+                res = self.client.start_profile(self.profile_id)
+            except AntidetectNotReady as exc:
+                self._set_owner(exc.start_result)
+                raise
+            self._set_owner(res)
             self.port = int(res["port"])
-            self._started_by_us = _lease_started_by_us(res, state_known, was_running)
+            self.require_ready()
 
             from playwright.sync_api import sync_playwright
             self._playwright = sync_playwright().start()
@@ -414,7 +423,7 @@ class AntidetectBrowserLease:
             if not contexts:
                 raise AntidetectError("Không tìm thấy context trình duyệt của profile Antidetect.")
             self.context = contexts[0]
-            self.tracked_context = _TrackedContext(self.context, self._pages)
+            self.tracked_context = _TrackedContext(self.context, self._pages, self.require_ready)
             self.page = self.tracked_context.new_page()
             # Chỉ dời cửa sổ khi chính lease khởi chạy profile; nếu người dùng
             # đang mở sẵn trình duyệt thì không đụng vào cửa sổ của họ.
@@ -424,6 +433,13 @@ class AntidetectBrowserLease:
         except Exception:
             self._cleanup()
             raise
+
+    def _set_owner(self, result):
+        self.launch_id = str((result.get("cdp_health") or {}).get("launch_id") or "")
+        self._started_by_us = bool(self.launch_id and result.get("launched_now") is True)
+
+    def require_ready(self):
+        self.client.require_ready(self.profile_id, self.launch_id, self.port)
 
     def _move_windows_offscreen(self):
         """Dời cửa sổ Chrome ra ngoài mọi màn hình; không đổi fingerprint/trạng thái tab."""
@@ -484,7 +500,7 @@ class AntidetectBrowserLease:
                 if page is not None and not page.is_closed():
                     page.close()
             except Exception:
-                pass
+                self.cleanup_unconfirmed = True
         self._pages.clear()
         if self._playwright is not None:
             try:
@@ -495,9 +511,11 @@ class AntidetectBrowserLease:
         self._browser = None
         if self.stop_if_started and self._started_by_us:
             try:
-                self.client.stop_profile(self.profile_id)
+                self.client.stop_profile(self.profile_id, expected_launch_id=self.launch_id)
+                self.cleanup_unconfirmed = False
             except Exception:
-                pass
+                self.cleanup_unconfirmed = True
+                logging.getLogger(__name__).warning("Không xác nhận được cleanup phiên Antidetect do lease mở.")
             self._started_by_us = False
 
 

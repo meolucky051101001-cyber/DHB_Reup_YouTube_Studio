@@ -12,6 +12,7 @@ from typing import List, Dict, Any, Optional
 from urllib.parse import urlsplit
 from content_identity import normalize_source_url
 from phase4_rules import GROUP_SCHEMA_VERSION, normalize_group_names, serialize_group_names
+from upload_approval import init_approval_schema
 
 from config import (
     APP_DATA_DIR,
@@ -425,6 +426,20 @@ def init_db():
     _add_col_if_missing("chrome_profiles", "login_status", "TEXT DEFAULT ''")
     _add_col_if_missing("chrome_profiles", "last_login_check", "TEXT DEFAULT ''")
     _add_col_if_missing("chrome_profiles", "antidetect_profile_id", "TEXT DEFAULT ''")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS upload_slot (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            state TEXT NOT NULL,
+            owner TEXT,
+            process_id INTEGER,
+            queue_id INTEGER,
+            attempt_id INTEGER,
+            started_at REAL,
+            finished_at REAL,
+            cooldown_until REAL
+        )
+    """)
+    conn.execute("INSERT OR IGNORE INTO upload_slot (id, state) VALUES (1, 'idle')")
     _add_col_if_missing("monitors", "last_heartbeat_at", "TEXT DEFAULT ''")
     _add_col_if_missing("system_logs", "run_id", "TEXT DEFAULT ''")
     _add_col_if_missing("system_logs", "queue_id", "INTEGER DEFAULT NULL")
@@ -443,6 +458,8 @@ def init_db():
 
     # Sửa default legacy 1 -> 0 (Monitor và mọi INSERT thiếu cột phải chạy Desktop)
     emulate_default_fixed = _fix_video_queue_emulate_default(conn, cur)
+    init_approval_schema(conn)
+    conn.execute("INSERT OR IGNORE INTO app_schema_versions (schema_key, version) VALUES ('upload_hardening', 1)")
 
     # Nhóm kênh mặc định chỉ có MỘT tên chuẩn 'Mặc định'; dữ liệu cũ ghi 'Default'
     # từng được pipeline tự thay thế ngầm, dễ đăng nhầm nhóm — chuẩn hóa một lần.
