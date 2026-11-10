@@ -2508,13 +2508,14 @@ def _studio_row_video_id(row) -> str:
 _STUDIO_EMPTY_HEADER = "ytcp-video-section-content#video-list .no-content > .no-content-header"
 _STUDIO_TABLE_FOOTER = "ytcp-video-section-content#video-list ytcp-table-footer"
 _STUDIO_FOOTER_RANGE = re.compile(
-    r"(?mi)^[ \t]*(\d+)[ \t]*[-–—][ \t]*(\d+)[ \t]*(?:/|of)[ \t]*(\d+)[ \t]*$"
+    r"(?mi)^[ \t]*(\d+)[ \t]*[-–—][ \t]*(\d+)[ \t]*(?:/|of)[ \t]*"
+    r"(?P<approximate>(?:khoảng|about)[ \t]+)?(?P<total>\d+)[ \t]*$"
 )
 _STUDIO_PAGE_ROW_LIMIT = 100
 _STUDIO_EMPTY_MESSAGE = re.compile(
     r"(?:(?:[^.!?]*\b(?:videos?|shorts?|live streams?|phát trực tiếp)\b[^.!?]*"
     r"(?:will (?:appear|show up) here|sẽ xuất hiện ở đây))"
-    r"|(?:no videos(?: yet)?|chưa có video|không có video))[.!]?"
+    r"|(?:no videos(?: yet)?|no content|chưa có video|không có video|không có nội dung))[.!]?"
 )
 
 
@@ -2541,13 +2542,13 @@ def _studio_content_tab_is_complete(
     match = _STUDIO_FOOTER_RANGE.search(footer.inner_text(timeout=2500))
     if not match:
         return False
-    start, end, total = map(int, match.groups())
+    start, end, total = int(match[1]), int(match[2]), int(match["total"])
     return (
         start == expected_start
         and end >= start
         and row_count <= _STUDIO_PAGE_ROW_LIMIT
         and end - start + 1 == row_count
-        and total >= end
+        and (match["approximate"] or total >= end)
     )
 
 
@@ -2564,12 +2565,13 @@ def _collect_studio_title_candidates(
         previous_footer = ""
         reported_total = None
         page_index = 0
+        first_ids = set()
         while True:
             try:
                 page.wait_for_selector(f"ytcp-video-row, {_STUDIO_EMPTY_HEADER}", timeout=15000)
             except Exception:
                 if require_readable:
-                    unreadable.append(section)
+                    unreadable.append((section, "rows_timeout"))
                     break
                 page.wait_for_timeout(1500)
             rows = page.locator("ytcp-video-row")
@@ -2578,16 +2580,27 @@ def _collect_studio_title_candidates(
             footer_text = footer.inner_text(timeout=2500) if footer.count() else ""
             if require_readable:
                 if not _studio_content_tab_is_complete(page, content_url, raw_count, expected_start):
-                    unreadable.append(section)
+                    unreadable.append((section, "range_or_route_invalid"))
                     break
                 if raw_count:
                     match = _STUDIO_FOOTER_RANGE.search(footer_text)
-                    page_total = int(match[3]) if match else -1
-                    if reported_total is None:
-                        reported_total = page_total
-                    elif page_total != reported_total:
-                        unreadable.append(section)
+                    if not match:
+                        unreadable.append((section, "footer_changed"))
                         break
+                    if not match["approximate"]:
+                        page_total = int(match["total"])
+                        if reported_total is not None and page_total != reported_total:
+                            unreadable.append((section, "total_changed"))
+                            break
+                        reported_total = page_total
+                    elif reported_total is not None:
+                        unreadable.append((section, "total_became_approximate"))
+                        break
+                    first_id = _studio_row_video_id(rows.first)
+                    if page_index and (not first_id or first_id in first_ids):
+                        unreadable.append((section, "page_identity_invalid"))
+                        break
+                    first_ids.add(first_id)
             for index in range(min(raw_count, _STUDIO_PAGE_ROW_LIMIT)):
                 row = rows.nth(index)
                 if not _studio_row_matches_title(row, title, require_readable=require_readable):
@@ -2595,45 +2608,49 @@ def _collect_studio_title_candidates(
                 video_id = _studio_row_video_id(row)
                 if require_readable and not video_id:
                     # A matching title without a video ID cannot be safely deduplicated.
-                    unreadable.append(section)
+                    unreadable.append((section, "matching_video_without_id"))
                     break
                 candidates.append(
                     {"id": video_id, "visibility": _studio_row_visibility_state(row, title)}
                 )
-            if unreadable and unreadable[-1] == section:
+            if unreadable and unreadable[-1][0] == section:
                 break
             if require_readable and rows.count() != raw_count:
-                unreadable.append(section)
+                unreadable.append((section, "row_count_changed"))
                 break
             if not require_readable or raw_count == 0:
                 break
 
             match = _STUDIO_FOOTER_RANGE.search(footer_text)
             if not match:
-                unreadable.append(section)
+                unreadable.append((section, "footer_unreadable"))
                 break
-            _start, end, total = map(int, match.groups())
-            if end >= total:
+            end, total = int(match[2]), int(match["total"])
+            approximate = bool(match["approximate"])
+            if not approximate and end == total:
                 break
             next_page = page.locator(f"{_STUDIO_TABLE_FOOTER} ytcp-icon-button#navigate-after").first
             if not next_page.count():
-                unreadable.append(section)
+                unreadable.append((section, "next_control_missing"))
                 break
             is_disabled = next_page.evaluate(
                 "element => element.disabled === true || element.hasAttribute('disabled') "
                 "|| element.getAttribute('aria-disabled') === 'true'"
             )
             if is_disabled:
-                unreadable.append(section)
+                # The estimate never proves the end. An explicit disabled Next
+                # control can, unless it conflicts with a much larger estimate.
+                if not approximate or total - end > _STUDIO_PAGE_ROW_LIMIT:
+                    unreadable.append((section, "next_disabled_before_end"))
                 break
             next_start = end + 1
             previous_first_id = _studio_row_video_id(rows.first)
             if not previous_first_id:
-                unreadable.append(section)
+                unreadable.append((section, "first_video_without_id"))
                 break
             page_index += 1
             if page_index >= 100:
-                unreadable.append(section)
+                unreadable.append((section, "page_limit"))
                 break
             previous_footer = footer_text
             next_page.click()
@@ -2655,11 +2672,12 @@ def _collect_studio_title_candidates(
                     expected_start = next_start
                     break
             else:
-                unreadable.append(section)
+                unreadable.append((section, "next_page_timeout"))
                 break
     if unreadable:
         raise RuntimeError(
-            "Không đọc đầy đủ danh sách nội dung tab " + ", ".join(sorted(set(unreadable))) + "."
+            "Không đọc đầy đủ danh sách nội dung tab "
+            + ", ".join(f"{section} ({reason})" for section, reason in unreadable) + "."
         )
     return candidates
 
@@ -2716,6 +2734,9 @@ def _find_published_video_in_studio_content(
             candidates = _collect_studio_title_candidates(
                 page, channel_id, title, upload_to, require_readable=True
             )
+        except RuntimeError as exc:
+            if str(exc).startswith("Không đọc đầy đủ danh sách nội dung tab "):
+                result = f"unreadable: {exc}"
         except Exception:
             pass
         else:

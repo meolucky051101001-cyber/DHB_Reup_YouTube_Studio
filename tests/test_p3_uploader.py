@@ -154,16 +154,17 @@ class _StudioPage:
 class UrlAndChecksTests(unittest.TestCase):
     def test_paginated_result_waits_for_new_rows_and_checks_all_matches(self):
         class PaginatedPage(_StudioPage):
-            def __init__(self, first_title):
+            def __init__(self, first_title, approximate=False):
                 super().__init__({"short": [_StudioRow(first_title, VIDEO_ID)], "upload": []})
                 self.second_page = False
                 self.refresh_ticks = 0
+                self.approximate = approximate
 
             def click(self):
                 self.second_page = True
 
             def evaluate(self, _script):
-                return False
+                return self.second_page and self.refresh_ticks >= 2
 
             def count(self):
                 return 1
@@ -176,7 +177,8 @@ class UrlAndChecksTests(unittest.TestCase):
             def locator(self, selector):
                 if self.section == "short" and selector == yu._STUDIO_TABLE_FOOTER:
                     start = 2 if self.second_page else 1
-                    return _StudioText(f"Rows per page:\n30\n{start} – {start} of 2")
+                    total = "/khoảng 1" if self.approximate else " of 2"
+                    return _StudioText(f"Rows per page:\n30\n{start} – {start}{total}")
                 if self.section == "short" and selector.endswith("#navigate-after"):
                     return _StudioList([self])
                 return super().locator(selector)
@@ -186,6 +188,11 @@ class UrlAndChecksTests(unittest.TestCase):
             page, CHANNEL_ID, "New short", "Shorts", "private", set()
         ), "https://youtu.be/13t572zFqlw")
         self.assertEqual(page.refresh_ticks, 2)
+        estimated = PaginatedPage("Other title", approximate=True)
+        self.assertEqual(yu._find_published_video_in_studio_content(
+            estimated, CHANNEL_ID, "New short", "Shorts", "private", set()
+        ), "https://youtu.be/13t572zFqlw")
+        self.assertEqual(estimated.refresh_ticks, 2)
         self.assertEqual(yu._find_published_video_in_studio_content(
             PaginatedPage("New short"), CHANNEL_ID, "New short", "Shorts", "private", set()
         ), "")
@@ -196,6 +203,16 @@ class UrlAndChecksTests(unittest.TestCase):
         self.assertIsNone(yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "New short", "Shorts"))
         page = _StudioPage({"short": [_StudioRow("Other title", VIDEO_ID)] * 101, "upload": []})
         self.assertIsNone(yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "New short", "Shorts"))
+
+    def test_studio_empty_content_label_observed_in_vietnamese(self):
+        class EmptyContentPage(_StudioPage):
+            def locator(self, selector):
+                if selector == yu._STUDIO_EMPTY_HEADER:
+                    return _StudioText("Không có nội dung")
+                return super().locator(selector)
+
+        page = EmptyContentPage({"short": [], "upload": []})
+        self.assertEqual(yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "New short", "Shorts"), set())
 
     def test_fresh_tab_retries_unreadable_and_pending_private_result(self):
         context = mock.Mock()
