@@ -1,7 +1,7 @@
 import json
 import re
 import urllib.parse
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 import requests
 
 from database import get_settings, add_log

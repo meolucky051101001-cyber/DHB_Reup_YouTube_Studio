@@ -300,7 +300,6 @@ def _apply_intro_outro(main_path: str, cfg, target_w: int, target_h: int, fps: i
     if not intro and not outro:
         return main_path, float(probe_video_info(main_path)["seconds"])
 
-    main_probe = probe_video_info(main_path)
     media = [m for m in (intro, Path(main_path), outro) if m]
     segment_durations = {str(m): float(probe_video_info(str(m))["seconds"]) for m in media}
     expected_duration = sum(segment_durations.values())

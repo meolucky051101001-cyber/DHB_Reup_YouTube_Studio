@@ -12,10 +12,7 @@ from typing import Callable, Dict, Any, Optional
 from urllib.parse import quote, urlsplit, parse_qs
 import requests
 
-from config import (
-    APP_PROFILES_DIR,
-    BROWSER_HOST_EXE,
-)
+from config import APP_PROFILES_DIR
 from database import add_log, get_settings
 from antidetect_client import (
     AntidetectNotReady,
@@ -2605,6 +2602,13 @@ def _collect_studio_title_candidates(
             if not require_readable or raw_count == 0:
                 break
 
+            match = _STUDIO_FOOTER_RANGE.search(footer_text)
+            if not match:
+                unreadable.append(section)
+                break
+            _start, end, total = map(int, match.groups())
+            if end >= total:
+                break
             next_page = page.locator(f"{_STUDIO_TABLE_FOOTER} ytcp-icon-button#navigate-after").first
             if not next_page.count():
                 unreadable.append(section)
@@ -2614,12 +2618,9 @@ def _collect_studio_title_candidates(
                 "|| element.getAttribute('aria-disabled') === 'true'"
             )
             if is_disabled:
-                break
-            match = _STUDIO_FOOTER_RANGE.search(footer_text)
-            if not match:
                 unreadable.append(section)
                 break
-            next_start = int(match[2]) + 1
+            next_start = end + 1
             previous_first_id = _studio_row_video_id(rows.first)
             page_index += 1
             if page_index >= 100:

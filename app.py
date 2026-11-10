@@ -4,7 +4,6 @@ import re
 import csv
 import io
 import json
-import shutil
 import hashlib
 import threading
 import subprocess
@@ -15,7 +14,6 @@ from fastapi import FastAPI, HTTPException, Body, File, UploadFile, Form, Reques
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, JSONResponse
-from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -38,7 +36,6 @@ from config import (
 from api_security import (
     generate_api_token,
     is_allowed_host,
-    is_allowed_origin,
     is_same_local_origin,
     token_matches,
 )
@@ -57,7 +54,6 @@ from database import (
     run_housekeeping,
     export_all_tables_csv,
     collect_secret_values,
-    is_secret_setting_key,
     validate_public_settings,
     validate_secret_settings,
     public_channel,
@@ -78,7 +74,7 @@ from youtube_uploader import (
     normalize_published_video_url,
 )
 from pipeline_manager import pipeline_manager, upload_slot_recovery_status, acknowledge_upload_slot_recovery
-from group_distribution import group_channel_pool, target_group_names
+from group_distribution import target_group_names
 from phase4_rules import (
     GROUP_SCHEMA_VERSION, normalize_group_names, serialize_group_names,
     validate_metadata_fields, validate_queue_fields, validate_source_url,
@@ -1544,10 +1540,6 @@ def api_edit_queue_metadata(data: Dict[str, Any] = Body(...)):
                 raise HTTPException(400, f"Không tìm thấy bộ tùy chọn đăng #{option_group_id}.")
             updates["option_group_id"] = option_group_id
 
-        destination_keys = {
-            "target_channel_id", "target_profile_name", "target_group_name", "target_group_names",
-            "target_group_names_json",
-        }
         destination_changed = False
         if "target_group_names" in data or "target_group_names_json" in data or "target_group_name" in data:
             raw_groups = data.get("target_group_names", data.get("target_group_names_json", data.get("target_group_name")))

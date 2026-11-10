@@ -1,4 +1,3 @@
-import base64
 import csv
 import json
 import os
@@ -17,12 +16,9 @@ from upload_approval import init_approval_schema
 from config import (
     APP_DATA_DIR,
     APP_DB_PATH,
-    APP_TEMP_DIR,
-    DHB_MAIN_SQLITE,
-    DHB_OPTION_SQLITE,
-    DHB_PROJECT_DIR,
+    APP_TEMP_DIR,  # noqa: F401 - compatibility surface used by tests and local integrations
     DHB_PROFILE_CHROME_DIR,
-    APP_PROFILES_DIR,
+    APP_PROFILES_DIR,  # noqa: F401 - compatibility surface used by tests and local integrations
     load_dhb_settings,
 )
 

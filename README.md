@@ -129,7 +129,7 @@ Khi sửa frontend, nhớ tăng tham số `app.js?v=N` để trình duyệt đan
 
 - [HUONG_DAN_SU_DUNG.txt](HUONG_DAN_SU_DUNG.txt) — hướng dẫn thao tác từng tab cho người vận hành.
 - [CHANGELOG.md](CHANGELOG.md) — các thay đổi theo phiên, gồm lỗi đã sửa và số lượng test.
-- [HANDOVER_PROMPT.md](HANDOVER_PROMPT.md) / [HANDOVER_PROMPT_v2.md](HANDOVER_PROMPT_v2.md) — bối cảnh bàn giao và ràng buộc khi tiếp tục phát triển.
+- [Tài liệu handover lưu trữ](docs/archive/handovers/) — các snapshot lịch sử; README và mã nguồn hiện tại mới là nguồn tham chiếu chính.
 
 ## Đường dẫn công cụ và chẩn đoán
 
