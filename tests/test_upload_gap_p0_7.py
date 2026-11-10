@@ -1,130 +1,111 @@
-import os
-import sys
+"""Persistent upload owner, cooldown and interrupted-session recovery."""
+import sqlite3
+import tempfile
 import threading
-import time
 import unittest
+from contextlib import closing
+from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+import database
 import pipeline_manager as pm
-
-
-class FakeSettingsStore:
-    def __init__(self, data=None, fail_read=False, fail_write=False):
-        self.data = dict(data or {})
-        self.fail_read = fail_read
-        self.fail_write = fail_write
-        self.writes = []
-
-    def get_settings(self):
-        if self.fail_read:
-            raise RuntimeError("database is locked")
-        return dict(self.data)
-
-    def save_settings(self, new_settings):
-        if self.fail_write:
-            raise RuntimeError("disk full")
-        self.writes.append(dict(new_settings))
-        self.data.update(new_settings)
 
 
 class UploadGapTests(unittest.TestCase):
     def setUp(self):
-        pm._UPLOAD_GAP_STATE_BROKEN = False
-        self.store = FakeSettingsStore()
-        self.patches = [
-            mock.patch.object(pm, "get_settings", self.store.get_settings),
-            mock.patch.object(pm, "save_settings", self.store.save_settings),
-            mock.patch.object(pm, "add_log", lambda *args, **kwargs: None),
-        ]
-        for patch in self.patches:
-            patch.start()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(database, "APP_DB_PATH", Path(temp.name) / "test.sqlite").start()
+        mock.patch.object(pm, "_COOLDOWN_ANCHOR", None).start()
+        mock.patch.object(pm, "_UPLOAD_GAP_STATE_BROKEN", False).start()
+        database.init_db()
+        self.wall = 100000
+        self.monotonic = 50
+        mock.patch.object(pm.time, "time", side_effect=lambda: self.wall).start()
+        mock.patch.object(pm.time, "monotonic", side_effect=lambda: self.monotonic).start()
 
-    def tearDown(self):
-        for patch in reversed(self.patches):
-            patch.stop()
-        pm._UPLOAD_GAP_STATE_BROKEN = False
+    def stop_after_wait(self):
+        stop = threading.Event()
+        stop.wait = mock.Mock(side_effect=lambda _: stop.set())
+        return stop
 
-    def test_read_returns_zero_when_never_uploaded(self):
-        self.assertEqual(pm.read_last_upload_epoch(), 0.0)
+    def test_active_owner_cannot_expire_and_cooldown_counts_from_finish(self):
+        owner = pm.reserve_upload_slot(threading.Event(), 101)
+        pm._mark_slot_entered(owner, 201)
+        self.wall += 1900
+        self.monotonic += 1900
+        self.assertFalse(pm.reserve_upload_slot(self.stop_after_wait(), 102))
+        pm._record_upload_finished_safely("A", owner, entered_uploader=True)
+        self.wall += 5000
+        self.monotonic += 1799
+        self.assertFalse(pm.reserve_upload_slot(self.stop_after_wait(), 102))
+        self.monotonic += 1
+        newer = pm.reserve_upload_slot(threading.Event(), 102)
+        self.assertNotEqual(newer, owner)
+        pm._record_upload_finished_safely("old callback", owner, entered_uploader=True)
+        self.assertEqual(pm.upload_slot_recovery_status()["queue_id"], 102)
+        self.assertEqual(pm.upload_slot_recovery_status()["state"], "active")
 
-    def test_read_raises_when_settings_unreadable(self):
-        self.store.fail_read = True
-        with self.assertRaises(pm.UploadGapStateError):
-            pm.read_last_upload_epoch()
+    def test_concurrent_workers_only_one_owner(self):
+        barrier = threading.Barrier(2)
+        owners = []
 
-    def test_read_raises_on_malformed_marker(self):
-        self.store.data[pm._LAST_UPLOAD_SETTING_KEY] = "not-a-number"
-        with self.assertRaises(pm.UploadGapStateError):
-            pm.read_last_upload_epoch()
+        def reserve(queue_id):
+            barrier.wait(2)
+            owners.append(pm.reserve_upload_slot(self.stop_after_wait(), queue_id))
 
-    def test_read_uses_later_of_start_and_finish(self):
-        self.store.data[pm._LAST_UPLOAD_SETTING_KEY] = "1000"
-        self.store.data[pm._LAST_UPLOAD_FINISHED_SETTING_KEY] = "2500"
-        self.assertEqual(pm.read_last_upload_epoch(), 2500.0)
+        threads = [threading.Thread(target=reserve, args=(idx,)) for idx in (101, 102)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(3)
+        self.assertEqual(len(owners), 2)
+        self.assertEqual(sum(bool(owner) for owner in owners), 1)
 
-    def test_gap_counts_from_finish(self):
-        now = time.time()
-        self.store.data[pm._LAST_UPLOAD_SETTING_KEY] = str(now - 40 * 60)
-        self.store.data[pm._LAST_UPLOAD_FINISHED_SETTING_KEY] = str(now - 5 * 60)
-        remaining = pm.read_upload_gap_remaining(now)
-        self.assertAlmostEqual(remaining, 25 * 60, delta=2)
-
-    def test_reserve_fails_closed_when_settings_unreadable(self):
-        self.store.fail_read = True
+    def test_recovery_requires_acknowledgment_and_keeps_cooldown(self):
+        owner = pm.reserve_upload_slot(threading.Event(), 101)
+        pm._mark_slot_entered(owner, 201)
+        with closing(database.get_conn()) as conn, conn:
+            pm._recover_upload_slot(conn)
         with self.assertRaises(pm.UploadGapStateError):
             pm.reserve_upload_slot(threading.Event())
-        self.assertEqual(self.store.writes, [])
+        status = pm.upload_slot_recovery_status()
+        self.assertEqual(status["attempt_id"], 201)
+        self.assertFalse(pm.acknowledge_upload_slot_recovery("old-approval"))
+        self.assertTrue(pm.acknowledge_upload_slot_recovery(status["recovery_id"]))
+        self.assertFalse(pm.reserve_upload_slot(self.stop_after_wait()))
 
-    def test_reserve_refuses_when_write_of_start_marker_fails(self):
-        self.store.fail_write = True
+    def test_legacy_markers_preserved_on_repeat_migration(self):
+        database.save_settings({pm._LAST_UPLOAD_SETTING_KEY: "99900", pm._LAST_UPLOAD_FINISHED_SETTING_KEY: "99990"})
+        for _ in range(2):
+            database.init_db()
+            with closing(database.get_conn()) as conn, conn:
+                pm._recover_upload_slot(conn)
+        self.assertEqual(pm.upload_slot_recovery_status()["cooldown_until"], 101790)
+        self.assertFalse(pm.reserve_upload_slot(self.stop_after_wait()))
+
+    def test_legacy_nonfinite_marker_is_invalid(self):
+        for value in ("nan", "inf", "-1", "invalid"):
+            with self.subTest(value=value), self.assertRaises(pm.UploadGapStateError):
+                pm._parse_upload_epoch(value, pm._LAST_UPLOAD_SETTING_KEY)
+
+    def test_db_failure_never_admits_and_failed_finish_keeps_owner(self):
+        with mock.patch.object(pm, "_slot_connection", side_effect=sqlite3.OperationalError("locked")):
+            with self.assertRaises(pm.UploadGapStateError):
+                pm.reserve_upload_slot(threading.Event())
+        owner = pm.reserve_upload_slot(threading.Event())
+        pm._mark_slot_entered(owner, 201)
+        with mock.patch.object(pm, "_slot_connection", side_effect=sqlite3.OperationalError("disk full")):
+            pm._record_upload_finished_safely("A", owner, entered_uploader=True)
+        self.assertEqual(pm.upload_slot_recovery_status()["state"], "active")
         with self.assertRaises(pm.UploadGapStateError):
             pm.reserve_upload_slot(threading.Event())
-        self.assertEqual(self.store.writes, [])
 
-    def test_reserve_respects_finish_marker(self):
-        now = time.time()
-        self.store.data[pm._LAST_UPLOAD_SETTING_KEY] = str(now - 40 * 60)
-        self.store.data[pm._LAST_UPLOAD_FINISHED_SETTING_KEY] = str(now - 2 * 60)
+    def test_stopped_worker_cannot_claim_and_preflight_cancel_does_not_hold_slot(self):
         stop = threading.Event()
         stop.set()
         self.assertFalse(pm.reserve_upload_slot(stop))
-        self.assertEqual(self.store.writes, [])
-
-    def test_reserve_allows_when_gap_elapsed_and_records_start(self):
-        now = time.time()
-        self.store.data[pm._LAST_UPLOAD_SETTING_KEY] = str(now - 40 * 60)
-        self.store.data[pm._LAST_UPLOAD_FINISHED_SETTING_KEY] = str(now - 30 * 60)
-        self.assertTrue(pm.reserve_upload_slot(threading.Event()))
-        self.assertEqual(len(self.store.writes), 1)
-        self.assertIn(pm._LAST_UPLOAD_SETTING_KEY, self.store.writes[0])
-        self.assertGreaterEqual(float(self.store.writes[0][pm._LAST_UPLOAD_SETTING_KEY]), now)
-
-    def test_mark_finished_writes_marker(self):
-        pm.mark_upload_finished(when=1234.5)
-        self.assertEqual(self.store.data[pm._LAST_UPLOAD_FINISHED_SETTING_KEY], "1234.5")
-
-    def test_mark_finished_failure_raises(self):
-        self.store.fail_write = True
-        with self.assertRaises(pm.UploadGapStateError):
-            pm.mark_upload_finished(when=1234.5)
-
-    def test_finish_write_failure_blocks_later_uploads(self):
-        self.store.fail_write = True
-        pm._record_upload_finished_safely("video test")
-        self.assertTrue(pm._UPLOAD_GAP_STATE_BROKEN)
-        with self.assertRaises(pm.UploadGapStateError):
-            pm.read_last_upload_epoch()
-
-    def test_reserve_waits_then_stops(self):
-        self.store.data[pm._LAST_UPLOAD_SETTING_KEY] = str(time.time() - 29 * 60)
-        stop = threading.Event()
-        threading.Timer(0.2, stop.set).start()
-        started = time.time()
-        self.assertFalse(pm.reserve_upload_slot(stop))
-        self.assertLess(time.time() - started, 5)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        owner = pm.reserve_upload_slot(threading.Event())
+        pm._record_upload_finished_safely("A", owner, entered_uploader=False)
+        self.assertEqual(pm.upload_slot_recovery_status()["state"], "idle")

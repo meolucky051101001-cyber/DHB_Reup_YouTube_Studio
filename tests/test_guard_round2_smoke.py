@@ -445,6 +445,24 @@ class SmokeTests(unittest.TestCase):
     def test_api_requires_token(self):
         self.assertEqual(client.get("/api/overview").status_code, 401)
 
+    def test_distribution_preview_id_round_trips_through_authenticated_api(self):
+        token = client.get("/api/auth/token").json()["token"]
+        headers = {"Origin": "http://127.0.0.1:8686", "Host": "127.0.0.1:8686", "X-DHB-Token": token}
+        payload = {"ids": [9001], "do_upload": True, "do_render": False}
+        approval = "4b54c28d5d224d559db0b09f5fcaf86a"
+        with mock.patch.object(app_module.pipeline_manager, "preview_distribution", return_value={
+            "items": [{"id": 9001, "blocked": False}], "preview_token": approval,
+        }):
+            preview = client.post("/api/queue/preview-distribution", headers=headers, json=payload)
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.json()["preview_id"], approval)
+        with mock.patch.object(app_module.pipeline_manager, "start_batch", return_value={
+            "ok": False, "code": "PREVIEW_STALE", "message": "Hãy xem trước lại.",
+        }) as start:
+            response = client.post("/api/pipeline/start", headers=headers, json={**payload, "preview_id": approval})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(start.call_args.kwargs["preview_token"], approval)
+
     def test_every_response_denies_framing(self):
         for response in (
             client.get("/"),

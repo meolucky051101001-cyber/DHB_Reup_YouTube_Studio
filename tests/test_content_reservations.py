@@ -245,7 +245,8 @@ class ContentReservationTests(unittest.TestCase):
 
             manager = pipeline_manager.PipelineManager()
             with mock.patch.object(pipeline_manager, "get_conn", side_effect=_connection_factory(db_path)), \
-                    mock.patch.object(pipeline_manager, "add_log"):
+                    mock.patch.object(pipeline_manager, "add_log"), \
+                    mock.patch.object(pipeline_manager, "_recover_upload_slot"):
                 manager.clear_stale_claims()
 
             conn = sqlite3.connect(db_path)

@@ -93,7 +93,10 @@ class _StudioText:
     def count(self):
         return 1
 
-    def inner_text(self):
+    def is_visible(self):
+        return True
+
+    def inner_text(self, **_kwargs):
         return self.text
 
 
@@ -120,9 +123,11 @@ class _StudioPage:
         self.section = ""
         self.visited = []
         self.url = "https://studio.youtube.com/"
+        self.footer_override = {}
 
     def goto(self, url, **_kwargs):
         self.visited.append(url)
+        self.url = url
         self.section = "short" if url.endswith("/videos/short") else "upload"
 
     def wait_for_selector(self, *_args, **_kwargs):
@@ -134,10 +139,74 @@ class _StudioPage:
     def locator(self, selector):
         if selector == "ytcp-video-row":
             return _StudioList(self.rows_by_section.get(self.section, []))
+        count = len(self.rows_by_section.get(self.section, []))
+        if selector == "ytcp-video-section-content#video-list ytcp-table-footer":
+            return _StudioText(self.footer_override.get(self.section, f"Rows per page:\n30\n1 – {count}/{count}"))
+        if selector == "ytcp-video-section-content#video-list .no-content > .no-content-header" and not count:
+            return _StudioText("Video của bạn sẽ xuất hiện ở đây")
         return _StudioList()
 
 
 class UrlAndChecksTests(unittest.TestCase):
+    def test_fresh_tab_retries_unreadable_and_pending_private_result(self):
+        context = mock.Mock()
+        observations = [
+            RuntimeError("footer still loading"),
+            [{"id": VIDEO_ID, "visibility": ""}],
+            [{"id": VIDEO_ID, "visibility": "private"}],
+        ]
+        with mock.patch.object(yu, "_collect_studio_title_candidates", side_effect=observations) as read, \
+                mock.patch.object(yu, "add_log") as log:
+            url = yu._verify_published_video_on_fresh_tab(
+                context, CHANNEL_ID, {"title": "Pilot", "privacy_status": "private"}, set()
+            )
+        self.assertEqual(url, f"https://youtu.be/{VIDEO_ID}")
+        self.assertEqual(read.call_count, 3)
+        self.assertEqual(log.call_count, 3)
+        context.new_page.assert_called_once()
+        context.new_page.return_value.close.assert_called_once()
+
+    def test_retry_never_replaces_a_previous_candidate_with_a_different_id(self):
+        observations = [
+            [{"id": VIDEO_ID, "visibility": ""}],
+            [{"id": "13t572zFqlw", "visibility": "private"}],
+        ]
+        with mock.patch.object(yu, "_collect_studio_title_candidates", side_effect=observations) as read:
+            self.assertEqual(yu._find_published_video_in_studio_content(
+                mock.Mock(), CHANNEL_ID, "Pilot", "Video", "private", set(), attempts=3
+            ), "")
+        self.assertEqual(read.call_count, 2)
+
+    def test_empty_video_tab_can_confirm_a_new_private_video(self):
+        class EmptyStudioPage(_StudioPage):
+            def wait_for_selector(self, selector, **_kwargs):
+                if not self.rows_by_section[self.section] and ".no-content" not in selector:
+                    raise TimeoutError("Empty tab has no video rows")
+
+        page = EmptyStudioPage({"upload": [], "short": [_StudioRow("Old short", VIDEO_ID)]})
+        known = yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "Pilot clip", "Video")
+        self.assertEqual(known, set())
+        page.rows_by_section["upload"] = [_StudioRow("Pilot clip", "13t572zFqlw", "Riêng tư")]
+        self.assertEqual(yu._find_published_video_in_studio_content(
+            page, CHANNEL_ID, "Pilot clip", "Video", "private", known
+        ), "https://youtu.be/13t572zFqlw")
+
+    def test_private_confirmation_rejects_incomplete_footer_or_other_channel(self):
+        page = _StudioPage({"upload": [_StudioRow("Pilot clip", VIDEO_ID, "Riêng tư")], "short": []})
+        page.footer_override["upload"] = "Số hàng mỗi trang:\n30\n1 – 1/2"
+        self.assertEqual(yu._find_published_video_in_studio_content(
+            page, CHANNEL_ID, "Pilot clip", "Video", "private", set()
+        ), "")
+        self.assertIsNone(yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "Pilot clip", "Video"))
+
+        class RedirectedStudioPage(_StudioPage):
+            def goto(self, url, **kwargs):
+                super().goto(url.replace(CHANNEL_ID, "UCbbbbbbbbbbbbbbbbbbbbbb"), **kwargs)
+
+        redirected = RedirectedStudioPage(page.rows_by_section)
+        self.assertEqual(yu._find_published_video_in_studio_content(
+            redirected, CHANNEL_ID, "Pilot clip", "Video", "private", set()
+        ), "")
     def test_video_url_parser_checks_host_route_and_id(self):
         self.assertEqual(
             yu.normalize_published_video_url(f"https://www.youtube.com/watch?v={VIDEO_ID}&t=4"),
@@ -435,7 +504,7 @@ class UrlAndChecksTests(unittest.TestCase):
         )
 
         self.assertEqual(known, {"13t572zFqlw"})
-        self.assertEqual(page.visited[-1], page.url)
+        self.assertEqual(page.visited[-1], f"https://studio.youtube.com/channel/{CHANNEL_ID}/videos/upload")
 
         class UnreadablePage(_StudioPage):
             def wait_for_selector(self, *_args, **_kwargs):

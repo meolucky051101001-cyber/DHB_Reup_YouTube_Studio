@@ -162,7 +162,9 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                     mock.patch.object(pipeline_manager, "add_log"), \
                     mock.patch.object(pipeline_manager, "get_settings", return_value={}), \
                     mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
-                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value=True), \
+                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
+                    mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
                     mock.patch.object(
                         pipeline_manager, "upload_video_to_youtube",
                         return_value={"url": "https://youtu.be/dQw4w9WgXcQ"},
@@ -195,7 +197,9 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                     mock.patch.object(pipeline_manager, "add_log"), \
                     mock.patch.object(pipeline_manager, "get_settings", return_value={}), \
                     mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
-                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value=True), \
+                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
+                    mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
                     mock.patch.object(
                         pipeline_manager, "upload_video_to_youtube",
                         return_value={"url": "https://example.com/watch?v=dQw4w9WgXcQ"},
@@ -228,7 +232,9 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                     mock.patch.object(pipeline_manager, "add_log"), \
                     mock.patch.object(pipeline_manager, "get_settings", return_value={}), \
                     mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
-                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value=True), \
+                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
+                    mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
                     mock.patch.object(
                         pipeline_manager,
                         "upload_video_to_youtube",
@@ -262,7 +268,9 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                 mock.patch.object(pipeline_manager, "add_log"), \
                 mock.patch.object(pipeline_manager, "get_settings", return_value={}), \
                 mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
-                mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value=True), \
+                mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
+                    mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
                 mock.patch.object(
                     pipeline_manager, "upload_video_to_youtube", return_value=upload_result
                 ) as upload, \
@@ -355,7 +363,9 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                     mock.patch.object(pipeline_manager, "add_log"), \
                     mock.patch.object(pipeline_manager, "get_settings", return_value={}), \
                     mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
-                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value=True), \
+                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
+                    mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
                     mock.patch.object(
                         pipeline_manager, "upload_video_to_youtube", side_effect=RuntimeError("connection lost")
                     ), \
@@ -404,7 +414,9 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                     mock.patch.object(pipeline_manager, "add_log"), \
                     mock.patch.object(pipeline_manager, "get_settings", return_value={}), \
                     mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
-                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value=True), \
+                    mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
+                    mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
                     mock.patch.object(
                         pipeline_manager, "upload_video_to_youtube",
                         return_value={"url": "https://youtu.be/9bZkp7q19f0"},

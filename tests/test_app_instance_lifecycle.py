@@ -83,7 +83,8 @@ class InterruptedJobRecoveryTests(unittest.TestCase):
             conn.close()
 
             with mock.patch.object(database, "APP_DB_PATH", db_path), \
-                    mock.patch.object(pipeline_manager, "add_log"):
+                    mock.patch.object(pipeline_manager, "add_log"), \
+                    mock.patch.object(pipeline_manager, "_recover_upload_slot"):
                 pipeline_manager.PipelineManager().clear_stale_claims()
 
             conn = sqlite3.connect(db_path)
