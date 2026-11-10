@@ -515,7 +515,7 @@ class UrlAndChecksTests(unittest.TestCase):
             yu._snapshot_studio_exact_title_ids(unreadable, CHANNEL_ID, "Fresh short #shorts", "Shorts")
         )
 
-    def test_snapshot_rejects_rows_with_unreadable_id_and_full_pagination(self):
+    def test_snapshot_rejects_rows_with_unreadable_id_and_incomplete_pagination(self):
         # Hàng trùng tiêu đề nhưng không đọc được ID: không được coi là "không có video nào".
         broken = _StudioPage({
             "short": [_StudioRow("Fresh short #shorts", "", "Công khai")],
@@ -532,9 +532,10 @@ class UrlAndChecksTests(unittest.TestCase):
             "",
         )
 
-        # 100 hàng: chưa đọc hết phân trang nên cả snapshot lẫn fallback phải fail closed.
-        many_rows = [_StudioRow(f"Video cũ {index}", f"{index:011d}") for index in range(100)]
+        # Mới đọc trang 1/4: thiếu nút chuyển trang thì snapshot phải fail closed.
+        many_rows = [_StudioRow(f"Video cũ {index}", f"{index:011d}") for index in range(30)]
         page = _StudioPage({"short": many_rows, "upload": []})
+        page.footer_override["short"] = "Rows per page:\n30\n1 – 30/100"
         self.assertIsNone(
             yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "Fresh short #shorts", "Shorts")
         )

@@ -4,7 +4,6 @@ import re
 import csv
 import io
 import json
-import shutil
 import hashlib
 import threading
 import subprocess
@@ -15,7 +14,6 @@ from fastapi import FastAPI, HTTPException, Body, File, UploadFile, Form, Reques
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, JSONResponse
-from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -38,7 +36,6 @@ from config import (
 from api_security import (
     generate_api_token,
     is_allowed_host,
-    is_allowed_origin,
     is_same_local_origin,
     token_matches,
 )
@@ -57,7 +54,6 @@ from database import (
     run_housekeeping,
     export_all_tables_csv,
     collect_secret_values,
-    is_secret_setting_key,
     validate_public_settings,
     validate_secret_settings,
     public_channel,
@@ -78,7 +74,7 @@ from youtube_uploader import (
     normalize_published_video_url,
 )
 from pipeline_manager import pipeline_manager, upload_slot_recovery_status, acknowledge_upload_slot_recovery
-from group_distribution import group_channel_pool, target_group_names
+from group_distribution import target_group_names
 from phase4_rules import (
     GROUP_SCHEMA_VERSION, normalize_group_names, serialize_group_names,
     validate_metadata_fields, validate_queue_fields, validate_source_url,
@@ -1544,10 +1540,6 @@ def api_edit_queue_metadata(data: Dict[str, Any] = Body(...)):
                 raise HTTPException(400, f"Không tìm thấy bộ tùy chọn đăng #{option_group_id}.")
             updates["option_group_id"] = option_group_id
 
-        destination_keys = {
-            "target_channel_id", "target_profile_name", "target_group_name", "target_group_names",
-            "target_group_names_json",
-        }
         destination_changed = False
         if "target_group_names" in data or "target_group_names_json" in data or "target_group_name" in data:
             raw_groups = data.get("target_group_names", data.get("target_group_names_json", data.get("target_group_name")))
@@ -2006,7 +1998,7 @@ def _excel_datetime(value: Any) -> Optional[datetime]:
     if not text:
         return None
     try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))  # noqa: FURB162 - supports Python 3.10
         if parsed.tzinfo is not None:
             parsed = parsed.astimezone(datetime.now().astimezone().tzinfo).replace(tzinfo=None)
         return parsed.replace(microsecond=0)
@@ -2437,13 +2429,17 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int],
             row_errors: List[str] = []
             row_warnings: List[str] = []
 
-            def row_error(message: str):
-                row_errors.append(message)
-                errors.append(f"Dòng {row['row']} (#{item_id}): {message}")
+            def row_error(
+                message: str, *, _row_errors=row_errors, _row=row, _item_id=item_id
+            ):
+                _row_errors.append(message)
+                errors.append(f"Dòng {_row['row']} (#{_item_id}): {message}")
 
-            def row_warning(message: str):
-                row_warnings.append(message)
-                warn(f"Dòng {row['row']} (#{item_id}): {message}")
+            def row_warning(
+                message: str, *, _row_warnings=row_warnings, _row=row, _item_id=item_id
+            ):
+                _row_warnings.append(message)
+                warn(f"Dòng {_row['row']} (#{_item_id}): {message}")
 
             title = values.get("title")
             if title is not None and str(title).strip() != "":
@@ -2639,7 +2635,7 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int],
         adjusted = 0
         scheduled_entries.sort(key=lambda pair: pair[1])
         for idx in range(1, len(scheduled_entries)):
-            prev_id, prev_dt = scheduled_entries[idx - 1]
+            _prev_id, prev_dt = scheduled_entries[idx - 1]
             item_id, item_dt = scheduled_entries[idx]
             min_dt = prev_dt + timedelta(minutes=30)
             if item_dt < min_dt:

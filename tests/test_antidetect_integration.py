@@ -6,6 +6,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 import requests
@@ -20,18 +21,18 @@ import youtube_uploader as yu
 
 
 class _Handler(BaseHTTPRequestHandler):
-    profiles = [{
+    profiles: ClassVar[list] = [{
         "id": "p-1",
         "name": "Profile Test",
         "status": "stopped",
         "port": None,
         "proxy": {"enabled": True, "host": "10.0.0.1", "port": 3128, "password": "secret"},
     }]
-    expected_auth = "Bearer test-key"
-    auth_seen = []
-    start_calls = []
-    healthy = True
-    start_response = {
+    expected_auth: ClassVar[str] = "Bearer test-key"
+    auth_seen: ClassVar[list] = []
+    start_calls: ClassVar[list] = []
+    healthy: ClassVar[bool] = True
+    start_response: ClassVar[dict] = {
         "success": True,
         "message": "Profile đã khởi chạy",
         "port": 9222,

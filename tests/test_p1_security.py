@@ -1,5 +1,4 @@
 import csv
-import os
 import sqlite3
 import sys
 import tempfile

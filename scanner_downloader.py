@@ -60,7 +60,7 @@ def detect_platform(url: str) -> str:
 def format_duration(seconds: Optional[float]) -> str:
     if not seconds or seconds <= 0:
         return "00:00:00"
-    sec = int(round(seconds))
+    sec = round(seconds)
     h = sec // 3600
     m = (sec % 3600) // 60
     s = sec % 60
@@ -92,6 +92,7 @@ def probe_video_info(file_path: str) -> Dict[str, Any]:
             errors="ignore",
             timeout=15,
             shell=False,
+            check=False,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except subprocess.TimeoutExpired as exc:
@@ -652,6 +653,7 @@ def _terminate_download_process(proc: subprocess.Popen, timeout: float = 5.0):
                 stderr=subprocess.DEVNULL,
                 timeout=timeout,
                 shell=False,
+                check=False,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
         except Exception:

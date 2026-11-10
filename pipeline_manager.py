@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from database import (
-    get_conn, add_log, get_settings, save_settings, register_managed_artifact,
+    get_conn, add_log, get_settings, register_managed_artifact,
     set_log_context, clear_log_context,
 )
 from config import APP_OUTPUT_DIR, APP_TEMP_DIR
