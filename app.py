@@ -77,7 +77,7 @@ from youtube_uploader import (
     check_oauth_token_status,
     normalize_published_video_url,
 )
-from pipeline_manager import pipeline_manager
+from pipeline_manager import pipeline_manager, upload_slot_recovery_status, acknowledge_upload_slot_recovery
 from group_distribution import group_channel_pool, target_group_names
 from phase4_rules import (
     GROUP_SCHEMA_VERSION, normalize_group_names, serialize_group_names,
@@ -451,6 +451,8 @@ async def safe_validation_exception_handler(request: Request, exc: RequestValida
 
 @app.exception_handler(Exception)
 async def safe_internal_exception_handler(request: Request, exc: Exception):
+    if str(exc) == "UPLOAD_BINDING_BUSY":
+        return JSONResponse({"detail": "Kênh hoặc profile đang được giữ bởi lượt xử lý hoặc reservation."}, status_code=409)
     try:
         add_log("API", f"Unhandled {type(exc).__name__}: {exc}", "ERROR", error_code="ERR_INTERNAL")
     except Exception:
@@ -3335,6 +3337,15 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
             "Không hỗ trợ bỏ qua chống trùng cho cả batch. Hãy cho phép đăng lại từng item kèm lý do.",
         )
 
+    if do_up:
+        preview_token = data.get("preview_id")
+        result = pipeline_manager.start_batch(
+            ids, do_dl, do_rd, do_up, preview_token=preview_token if isinstance(preview_token, str) else "",
+        )
+        if result.get("code") == "PREVIEW_STALE":
+            return JSONResponse({**result, "detail": result["message"]}, status_code=409)
+        return result
+
     run_ids = []
     skipped = []
     for item_id in ids:
@@ -3379,17 +3390,35 @@ def api_preview_distribution(data: Dict[str, Any] = Body(...)):
         ids = list(dict.fromkeys(int(value) for value in raw_ids))
     except (TypeError, ValueError):
         raise HTTPException(400, "Danh sách ID video không hợp lệ.")
-    items = pipeline_manager.preview_distribution(ids)
+    preview = pipeline_manager.preview_distribution(ids, [
+        bool(data.get(key, True)) for key in ("do_download", "do_render", "do_upload")
+    ])
+    items = preview["items"]
     blocked = sum(bool(item.get("blocked")) for item in items)
     warnings = sum(len(item.get("warnings") or []) for item in items)
     return {
         "ok": blocked == 0,
         "items": items,
+        "preview_id": preview["preview_token"],
         "total": len(items),
         "blocked": blocked,
         "warning_count": warnings,
         "assignment_persists_on_retry": True,
     }
+
+
+@app.get("/api/pipeline/upload-slot")
+def api_upload_slot_status():
+    return upload_slot_recovery_status()
+
+
+@app.post("/api/pipeline/upload-slot/acknowledge")
+def api_acknowledge_upload_slot(data: Dict[str, Any] = Body(...)):
+    if data.get("previous_session_closed") is not True or not isinstance(data.get("recovery_id"), str):
+        raise HTTPException(400, "Hãy xác nhận phiên upload cũ đã kết thúc.")
+    if not acknowledge_upload_slot_recovery(data["recovery_id"]):
+        raise HTTPException(409, "Trạng thái lượt upload đã thay đổi. Hãy kiểm tra lại.")
+    return {"ok": True}
 
 
 @app.post("/api/pipeline/stop")
@@ -3558,9 +3587,11 @@ def api_create_profile(data: Dict[str, Any] = Body(...)):
     conn = get_conn()
     conn.execute(
         """
-        INSERT OR REPLACE INTO chrome_profiles
+        INSERT INTO chrome_profiles
             (name, path, proxy, source, note, antidetect_profile_id)
         VALUES (?, ?, ?, 'Local', ?, '')
+        ON CONFLICT(name) DO UPDATE SET path=excluded.path, proxy=excluded.proxy,
+            source=excluded.source, note=excluded.note, antidetect_profile_id=excluded.antidetect_profile_id
         """,
         (name, p_path, proxy, note),
     )

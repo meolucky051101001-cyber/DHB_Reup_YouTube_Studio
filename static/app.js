@@ -2592,6 +2592,7 @@ function findChannelIdBlockers(ids, forceReupload) {
 }
 
 async function startPipeline(doDownload, doRender, doUpload, overrideIds = null) {
+  let previewToken = '';
   let ids;
   if (Array.isArray(overrideIds) && overrideIds.length > 0) {
     ids = overrideIds.slice();
@@ -2618,14 +2619,16 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
     }
     try {
       const preview = await apiFetch('/api/queue/preview-distribution', {
-        method: 'POST', body: JSON.stringify({ ids }),
+        method: 'POST',
+        body: JSON.stringify({ ids, do_download: doDownload, do_render: doRender, do_upload: doUpload }),
       });
       const previewText = formatDistributionPreview(preview);
       if (preview.blocked) {
         alert(`⛔ Có ${preview.blocked} video chưa đủ điều kiện. Sửa các dòng bị chặn rồi xem lại preview.\n\n${previewText}`);
         return;
       }
-      if (!confirm(`Preview phân phối trước khi chạy:\n\n${previewText}\n\nXác nhận dùng đúng các kênh và lịch này?`)) return;
+      if (!preview.preview_id || !await showDistributionDialog(previewText, true)) return;
+      previewToken = preview.preview_id;
     } catch (e) {
       alert('Không xem được preview phân phối: ' + e.message);
       return;
@@ -2641,11 +2644,15 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
         do_render: doRender,
         do_upload: doUpload,
         force_reupload: false,
+        preview_id: previewToken,
       }),
     });
     if (!res.ok) {
       alert(res.message);
       return;
+    }
+    if (res.replayed && res.state === 'interrupted') {
+      alert('Lượt trước đã bị ngắt. Hãy kiểm tra hàng đợi và xem trước lại các video chưa đăng.');
     }
     if (res.skipped && res.skipped.length) {
       showToast(res.message || `Đã bỏ qua ${res.skipped.length} video đã đăng/đang upload dở.`, 'warning');
@@ -2657,16 +2664,53 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
 
 function formatDistributionPreview(preview) {
   const rows = (preview && preview.items) || [];
-  const lines = rows.slice(0, 30).map(item => {
-    const target = item.channel_name ? `${item.channel_name} (#${item.channel_id})` : 'chưa có kênh';
+  const profiles = new Map();
+  const channels = new Map();
+  const lines = rows.map(item => {
+    const target = item.channel_name ? `${item.channel_name} (${item.youtube_channel_id || '#' + item.channel_id})` : 'chưa có kênh';
+    const profile = [item.profile_name, item.antidetect_profile_id].filter(Boolean).join(' / ') || 'profile mặc định';
+    if (!item.blocked) {
+      profiles.set(profile, (profiles.get(profile) || 0) + 1);
+      channels.set(target, (channels.get(target) || 0) + 1);
+    }
     const groups = item.groups && item.groups.length ? ` · nhóm ${item.groups.join(' + ')}` : '';
     const schedule = item.visibility === 'schedule' ? ` · ⏰ ${item.schedule_time || 'thiếu lịch'}` : ` · ${item.visibility}`;
     const prefix = item.blocked ? '⛔' : '•';
     const suffix = [...(item.reasons || []), ...(item.warnings || []).map(w => `cảnh báo: ${w}`)];
-    return `${prefix} #${item.id} ${item.title || ''} → ${target}${groups}${schedule}${suffix.length ? `\n    ${suffix.join('; ')}` : ''}`;
+    return `${prefix} #${item.id} ${item.title || ''} → ${target} · ${profile}${groups}${schedule}${suffix.length ? `\n    ${suffix.join('; ')}` : ''}`;
   });
-  if (rows.length > 30) lines.push(`… còn ${rows.length - 30} video.`);
-  return lines.join('\n');
+  const totals = entries => Array.from(entries, ([name, count]) => `${name}: ${count}`).join('\n');
+  return `Theo profile\n${totals(profiles)}\n\nTheo kênh\n${totals(channels)}\n\n${lines.join('\n')}`;
+}
+
+function showDistributionDialog(text, canStart = false) {
+  const dialog = document.createElement('dialog');
+  dialog.setAttribute('aria-label', 'Xem trước phân công YouTube');
+  dialog.style.cssText = 'max-width: min(1000px, 92vw); padding: 1rem;';
+  const content = document.createElement('pre');
+  content.style.cssText = 'white-space: pre-wrap; overflow: auto; max-height: 65vh;';
+  content.textContent = text;
+  const actions = document.createElement('form');
+  actions.method = 'dialog';
+  const close = document.createElement('button');
+  close.value = 'close';
+  close.textContent = 'Đóng';
+  actions.append(close);
+  if (canStart) {
+    const start = document.createElement('button');
+    start.value = 'start';
+    start.textContent = 'Xác nhận phân công và chạy';
+    actions.append(start);
+  }
+  dialog.append(content, actions);
+  document.body.append(dialog);
+  return new Promise(resolve => {
+    dialog.addEventListener('close', () => {
+      resolve(dialog.returnValue === 'start');
+      dialog.remove();
+    }, { once: true });
+    dialog.showModal();
+  });
 }
 
 async function previewSelectedDistribution() {
@@ -2676,7 +2720,7 @@ async function previewSelectedDistribution() {
     const preview = await apiFetch('/api/queue/preview-distribution', {
       method: 'POST', body: JSON.stringify({ ids }),
     });
-    alert(`Preview ${preview.total} video · bị chặn ${preview.blocked} · cảnh báo ${preview.warning_count}:\n\n${formatDistributionPreview(preview)}`);
+    await showDistributionDialog(`Preview ${preview.total} video · bị chặn ${preview.blocked} · cảnh báo ${preview.warning_count}\n\n${formatDistributionPreview(preview)}`);
   } catch (e) { alert('Không xem được preview: ' + e.message); }
 }
 
@@ -2689,6 +2733,35 @@ async function stopPipeline() {
     await loadLogs();
   } catch (e) {
     showToast('❌ Lỗi dừng tiến trình: ' + e.message, 'error');
+  }
+}
+
+async function reviewUploadSlot() {
+  try {
+    const slot = await apiFetch('/api/pipeline/upload-slot');
+    if (slot.state === 'recovery_required') {
+      const confirmed = confirm(
+        `Lượt upload của video #${slot.queue_id} cần phục hồi.\n\n` +
+        'Hãy kiểm tra Studio và đóng tab của lượt upload cũ trước khi xác nhận. ' +
+        'Sau khi xác nhận, tool chờ 30 phút. Video cần đối soát vẫn giữ nguyên trạng thái.\n\n' +
+        'Bạn đã kiểm tra và phiên upload cũ đã kết thúc?'
+      );
+      if (!confirmed) return;
+      await apiFetch('/api/pipeline/upload-slot/acknowledge', {
+        method: 'POST', body: JSON.stringify({ recovery_id: slot.recovery_id, previous_session_closed: true }),
+      });
+      showToast('Đã xác nhận phục hồi. Lượt tiếp theo chờ ít nhất 30 phút.');
+      return;
+    }
+    if (slot.state === 'active') {
+      alert(`Video #${slot.queue_id} đang giữ lượt upload.`);
+    } else if (slot.state === 'cooldown') {
+      alert('Đang kiểm tra khoảng nghỉ 30 phút trước lượt tiếp theo.');
+    } else {
+      alert('Lượt upload đang trống.');
+    }
+  } catch (e) {
+    alert('Không đọc được trạng thái lượt upload: ' + e.message);
   }
 }
 

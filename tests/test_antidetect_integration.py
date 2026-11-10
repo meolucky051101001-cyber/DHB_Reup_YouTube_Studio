@@ -37,6 +37,8 @@ class _Handler(BaseHTTPRequestHandler):
         "port": 9222,
         "pid": 4321,
         "ws_endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+            "launched_now": True, "cdp_ready": True, "configuration_verified": True,
+            "cdp_health": {"state": "healthy", "launch_id": "launch-1"},
     }
 
     def log_message(self, *args):
@@ -103,6 +105,8 @@ class AntidetectClientHTTPTests(unittest.TestCase):
             "port": 9222,
             "pid": 4321,
             "ws_endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+            "launched_now": True, "cdp_ready": True, "configuration_verified": True,
+            "cdp_health": {"state": "healthy", "launch_id": "launch-1"},
         }
 
     def _client(self, key="test-key"):
@@ -285,8 +289,11 @@ class _FakeClient:
     def start_profile(self, profile_id, url=None):
         return dict(self.start_result)
 
-    def stop_profile(self, profile_id):
-        self.stop_calls.append(profile_id)
+    def require_ready(self, profile_id, launch_id, port):
+        return None
+
+    def stop_profile(self, profile_id, *, expected_launch_id):
+        self.stop_calls.append((profile_id, expected_launch_id))
         return {"success": True}
 
 
@@ -307,6 +314,8 @@ class AntidetectLeaseTests(unittest.TestCase):
             "port": 9222,
             "pid": 4321,
             "ws_endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+            "launched_now": True, "cdp_ready": True, "configuration_verified": True,
+            "cdp_health": {"state": "healthy", "launch_id": "launch-1"},
         }
         lease, fake_pw, client, context = self._lease(
             start, state={"id": "ad-1", "status": "stopped"}
@@ -314,7 +323,7 @@ class AntidetectLeaseTests(unittest.TestCase):
         with mock.patch("playwright.sync_api.sync_playwright", return_value=fake_pw):
             with lease:
                 self.assertIsNotNone(lease.page)
-        self.assertEqual(client.stop_calls, ["ad-1"])
+        self.assertEqual(client.stop_calls, [("ad-1", "launch-1")])
         self.assertTrue(all(page.closed for page in context.pages))
         self.assertTrue(fake_pw.stopped)
 
@@ -369,6 +378,8 @@ class AntidetectLeaseTests(unittest.TestCase):
             "port": 9222,
             "pid": 4321,
             "ws_endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+            "launched_now": True, "cdp_ready": True, "configuration_verified": True,
+            "cdp_health": {"state": "healthy", "launch_id": "launch-1"},
         }
         lease, fake_pw, _, context = self._lease(
             start, state={"id": "ad-1", "status": "stopped"}, hide_window=True
@@ -394,22 +405,6 @@ class AntidetectLeaseTests(unittest.TestCase):
             [call for call in context.cdp_calls if call[0] == "Browser.setWindowBounds"],
             [],
         )
-
-
-class LeaseOwnershipTests(unittest.TestCase):
-    def test_fresh_launch_fields_win_over_message_wording(self):
-        self.assertTrue(
-            ac._lease_started_by_us({"pid": 1, "message": "Profile đang chạy"}, True, True)
-        )
-
-    def test_already_running_flag_wins_over_pid(self):
-        self.assertFalse(ac._lease_started_by_us({"already_running": True, "pid": 1}, True, False))
-
-    def test_legacy_response_uses_pre_start_state_not_message(self):
-        legacy = {"success": True, "message": "profile đang chạy", "port": 9222}
-        self.assertFalse(ac._lease_started_by_us(legacy, True, True))
-        self.assertTrue(ac._lease_started_by_us(legacy, True, False))
-        self.assertFalse(ac._lease_started_by_us(legacy, False, False))
 
 
 class AntidetectConfigTests(unittest.TestCase):
@@ -537,6 +532,7 @@ class UploaderAntidetectTests(unittest.TestCase):
         created = {}
 
         class FakeLease:
+            cleanup_unconfirmed = False
             def __init__(self, profile_id, stop_if_started=True, hide_window=False):
                 created["profile_id"] = profile_id
                 created["stop_if_started"] = stop_if_started

@@ -1,11 +1,13 @@
 import json
 import hashlib
+import math
 import os
 import shutil
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -21,6 +23,8 @@ from ai_engine import ai_optimize_youtube_metadata
 from youtube_uploader import upload_video_to_youtube, validate_upload_preflight, normalize_published_video_url
 from content_identity import normalize_source_url, sha256_file, source_dedupe_key
 from group_distribution import choose_target_channel, target_group_names
+from upload_approval import PreviewStale, approval_item, asset_stamps, encode
+from antidetect_client import AntidetectNotReady
 from phase4_rules import (
     GROUP_SCHEMA_VERSION, serialize_group_names, validate_metadata_fields,
     validate_queue_fields, validate_source_url,
@@ -44,6 +48,7 @@ UPLOAD_MIN_GAP_SECONDS = 30 * 60
 _LAST_UPLOAD_SETTING_KEY = "last_upload_started_epoch"
 _LAST_UPLOAD_FINISHED_SETTING_KEY = "last_upload_finished_epoch"
 _UPLOAD_GAP_LOCK = threading.Lock()
+_COOLDOWN_ANCHOR = None
 # Fail-closed trong tiến trình hiện tại: nếu không ghi được mốc kết thúc upload,
 # mọi lượt đăng sau bị chặn cho tới khi khởi động lại tool và kiểm tra lại.
 _UPLOAD_GAP_STATE_BROKEN = False
@@ -513,7 +518,7 @@ def _parse_upload_epoch(raw, key: str) -> float:
         raise UploadGapStateError(
             f"Mốc giãn cách '{key}' không hợp lệ ({raw!r}) — không thể xác minh an toàn."
         ) from exc
-    if value < 0:
+    if not math.isfinite(value) or value < 0:
         raise UploadGapStateError(
             f"Mốc giãn cách '{key}' âm ({raw!r}) — không thể xác minh an toàn."
         )
@@ -542,36 +547,138 @@ def read_last_upload_epoch() -> float:
 
 def read_upload_gap_remaining(now: Optional[float] = None) -> float:
     """Số giây còn phải chờ trước lượt upload kế tiếp (âm = đã đủ giãn cách)."""
+    global _COOLDOWN_ANCHOR
     current = time.time() if now is None else float(now)
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT cooldown_until FROM upload_slot WHERE id = 1").fetchone()
+        if row and row["cooldown_until"] is not None:
+            until = row["cooldown_until"]
+            remaining = until - current
+            with _UPLOAD_GAP_LOCK:
+                if _COOLDOWN_ANCHOR is None:
+                    _COOLDOWN_ANCHOR = (until, time.monotonic() + UPLOAD_MIN_GAP_SECONDS)
+                anchor_until, deadline = _COOLDOWN_ANCHOR
+                if anchor_until == until:
+                    remaining = max(remaining, deadline - time.monotonic())
+            return remaining
     return read_last_upload_epoch() + UPLOAD_MIN_GAP_SECONDS - current
 
 
-def mark_upload_finished(when: Optional[float] = None) -> None:
-    """Ghi mốc kết thúc lượt upload thật; raise UploadGapStateError nếu không ghi được."""
-    timestamp = time.time() if when is None else float(when)
+def _slot_connection():
+    conn = get_conn()
     try:
-        save_settings({_LAST_UPLOAD_FINISHED_SETTING_KEY: str(timestamp)})
-    except Exception as exc:
-        raise UploadGapStateError(f"Không ghi được mốc kết thúc upload: {exc}") from exc
+        conn.execute("PRAGMA synchronous=FULL")
+    except Exception:
+        conn.close()
+        raise
+    return conn
 
 
-def _record_upload_finished_safely(title: str) -> None:
-    """Ghi mốc kết thúc sau khi uploader trả về; lỗi ghi sẽ chặn mọi lượt đăng sau."""
-    global _UPLOAD_GAP_STATE_BROKEN
+def _slot_finished(conn, owner, when, *, recovery=False):
+    state = "recovery_required" if recovery else "active"
+    return conn.execute(
+        "UPDATE upload_slot SET state = 'cooldown', owner = NULL, finished_at = ?, cooldown_until = ? "
+        "WHERE id = 1 AND state = ? AND owner = ?",
+        (when, when + UPLOAD_MIN_GAP_SECONDS, state, owner),
+    ).rowcount == 1
+
+
+def _record_upload_finished_safely(title, owner, *, entered_uploader, cleanup_unconfirmed=False):
+    global _UPLOAD_GAP_STATE_BROKEN, _COOLDOWN_ANCHOR
     try:
-        mark_upload_finished()
+        with _UPLOAD_GAP_LOCK, closing(_slot_connection()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if cleanup_unconfirmed:
+                conn.execute(
+                    "UPDATE upload_slot SET state = 'recovery_required' WHERE id = 1 AND state = 'active' AND owner = ?",
+                    (owner,),
+                )
+            elif entered_uploader:
+                now = time.time()
+                if _slot_finished(conn, owner, now):
+                    _COOLDOWN_ANCHOR = (now + UPLOAD_MIN_GAP_SECONDS, time.monotonic() + UPLOAD_MIN_GAP_SECONDS)
+            else:
+                conn.execute(
+                    "UPDATE upload_slot SET state = CASE WHEN cooldown_until IS NULL THEN 'idle' ELSE 'cooldown' END, "
+                    "owner = NULL WHERE id = 1 AND state = 'active' AND owner = ? AND attempt_id IS NULL", (owner,),
+                )
     except Exception as exc:
         _UPLOAD_GAP_STATE_BROKEN = True
         try:
-            add_log(
-                "Upload",
-                f"❌ Không ghi được mốc kết thúc upload của '{title}': {exc}. "
-                "Các lượt đăng tiếp theo bị chặn để bảo vệ kênh; hãy khởi động lại tool sau khi kiểm tra ổ đĩa/DB.",
-                "ERROR",
-                video_title=title,
-            )
+            add_log("Upload", f"Không ghi được kết thúc lượt upload: {exc}", "ERROR", video_title=title)
         except Exception:
             pass
+
+
+def _mark_slot_entered(owner, attempt_id):
+    with closing(_slot_connection()) as conn, conn:
+        if not conn.execute(
+            "UPDATE upload_slot SET attempt_id = ? WHERE id = 1 AND state = 'active' AND owner = ?",
+            (attempt_id, owner),
+        ).rowcount:
+            raise UploadGapStateError("Không còn quyền sử dụng lượt upload.")
+
+
+def _recover_upload_slot(conn):
+    global _COOLDOWN_ANCHOR
+    # Called at startup while the application holds its data-directory singleton.
+    conn.execute("UPDATE upload_approvals SET state = 'interrupted' WHERE state = 'accepted'")
+    row = conn.execute("SELECT * FROM upload_slot WHERE id = 1").fetchone()
+    if row["state"] == "active":
+        if row["attempt_id"] is None:
+            conn.execute("UPDATE upload_slot SET state = 'idle', owner = NULL WHERE id = 1")
+        else:
+            conn.execute("UPDATE upload_slot SET state = 'recovery_required' WHERE id = 1")
+    elif row["state"] == "idle" and row["started_at"] is None:
+        settings = dict(conn.execute(
+            "SELECT key, value FROM app_settings WHERE key IN (?, ?)",
+            (_LAST_UPLOAD_SETTING_KEY, _LAST_UPLOAD_FINISHED_SETTING_KEY),
+        ).fetchall())
+        started = _parse_upload_epoch(settings.get(_LAST_UPLOAD_SETTING_KEY), _LAST_UPLOAD_SETTING_KEY)
+        finished = _parse_upload_epoch(settings.get(_LAST_UPLOAD_FINISHED_SETTING_KEY), _LAST_UPLOAD_FINISHED_SETTING_KEY)
+        interrupted = conn.execute(
+            "SELECT id, last_attempt_id FROM video_queue WHERE status LIKE 'Uploading%' "
+            "OR status LIKE 'Đang đăng%' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if interrupted:
+            conn.execute(
+                "UPDATE upload_slot SET state = 'recovery_required', owner = ?, queue_id = ?, attempt_id = ?, started_at = ? "
+                "WHERE id = 1",
+                (uuid.uuid4().hex, interrupted[0], interrupted[1], started),
+            )
+        elif started or finished:
+            marker = max(started, finished)
+            conn.execute(
+                "UPDATE upload_slot SET state = 'cooldown', started_at = ?, finished_at = ?, cooldown_until = ? WHERE id = 1",
+                (started, finished, marker + UPLOAD_MIN_GAP_SECONDS),
+            )
+    until = conn.execute("SELECT cooldown_until FROM upload_slot WHERE id = 1 AND state = 'cooldown'").fetchone()
+    if until and until[0] is not None:
+        _COOLDOWN_ANCHOR = (until[0], time.monotonic() + UPLOAD_MIN_GAP_SECONDS)
+
+
+def upload_slot_recovery_status():
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT state, owner, queue_id, attempt_id, cooldown_until FROM upload_slot WHERE id = 1").fetchone()
+        return {
+            "state": row["state"], "queue_id": row["queue_id"], "attempt_id": row["attempt_id"],
+            "cooldown_until": row["cooldown_until"],
+            "recovery_id": _log_run_id(row["owner"]) if row["state"] == "recovery_required" else None,
+        }
+
+
+def acknowledge_upload_slot_recovery(recovery_id):
+    global _COOLDOWN_ANCHOR
+    with _UPLOAD_GAP_LOCK, closing(_slot_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT owner FROM upload_slot WHERE id = 1 AND state = 'recovery_required'").fetchone()
+        if not row or _log_run_id(row["owner"]) != recovery_id:
+            return False
+        now = time.time()
+        if not _slot_finished(conn, row["owner"], now, recovery=True):
+            return False
+        _COOLDOWN_ANCHOR = (now + UPLOAD_MIN_GAP_SECONDS, time.monotonic() + UPLOAD_MIN_GAP_SECONDS)
+        return True
 
 
 def release_item_claim(item_id: int, token: str):
@@ -594,32 +701,43 @@ def release_item_claim(item_id: int, token: str):
             pass
 
 
-def reserve_upload_slot(stop_event: threading.Event) -> bool:
-    """
-    Giữ chỗ một lượt upload và bảo đảm cách lượt trước >= 30 phút, tính từ
-    mốc muộn hơn giữa lúc bắt đầu và lúc kết thúc upload trước.
-    Mốc lưu trong app_settings nên đúng cả khi restart hoặc chạy nhiều luồng.
-    Trả về False nếu bị dừng trong lúc chờ; raise UploadGapStateError nếu
-    không đọc/ghi được mốc (fail closed — tuyệt đối không đăng).
-    """
-    while True:
-        with _UPLOAD_GAP_LOCK:
-            now = time.time()
-            remaining = read_upload_gap_remaining(now)
-            if remaining <= 0:
-                try:
-                    save_settings({_LAST_UPLOAD_SETTING_KEY: str(now)})
-                except Exception as exc:
-                    raise UploadGapStateError(f"Không ghi được mốc bắt đầu upload: {exc}") from exc
-                return True
-
-        deadline = time.time() + remaining
-        while time.time() < deadline:
-            if stop_event.is_set():
-                return False
-            time.sleep(min(1.0, max(0.0, deadline - time.time())))
-        if stop_event.is_set():
-            return False
+def reserve_upload_slot(stop_event: threading.Event, queue_id=None):
+    """Return a durable ownership token. Elapsed time cannot expire an active owner."""
+    global _COOLDOWN_ANCHOR
+    while not stop_event.is_set():
+        try:
+            with _UPLOAD_GAP_LOCK, closing(_slot_connection()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                if _UPLOAD_GAP_STATE_BROKEN:
+                    raise UploadGapStateError("Trạng thái lượt upload chưa được xác nhận.")
+                row = conn.execute("SELECT * FROM upload_slot WHERE id = 1").fetchone()
+                if row["state"] == "recovery_required":
+                    raise UploadGapStateError("Cần đối soát và xác nhận phiên upload cũ đã dừng.")
+                if row["state"] != "active":
+                    now = time.time()
+                    until = row["cooldown_until"]
+                    remaining = (until - now) if until is not None else 0
+                    if until is not None:
+                        if _COOLDOWN_ANCHOR is None:
+                            # A restart has no monotonic proof for the persisted cooldown.
+                            _COOLDOWN_ANCHOR = (until, time.monotonic() + UPLOAD_MIN_GAP_SECONDS)
+                        anchor_until, deadline = _COOLDOWN_ANCHOR
+                        if anchor_until == until:
+                            remaining = max(remaining, deadline - time.monotonic())
+                    if remaining <= 0 and not stop_event.is_set():
+                        owner = uuid.uuid4().hex
+                        conn.execute(
+                            "UPDATE upload_slot SET state = 'active', owner = ?, process_id = ?, queue_id = ?, "
+                            "attempt_id = NULL, started_at = ?, cooldown_until = NULL WHERE id = 1",
+                            (owner, os.getpid(), queue_id, now),
+                        )
+                        return owner
+        except UploadGapStateError:
+            raise
+        except Exception as exc:
+            raise UploadGapStateError(f"Không xác minh được lượt upload: {exc}") from exc
+        stop_event.wait(0.5)
+    return False
 
 
 class PipelineManager:
@@ -654,9 +772,16 @@ class PipelineManager:
         trình cũ dừng. Job đó cần đối soát thay vì retry tự động. Download/render
         bị ngắt có thể được chạy lại từ file nguồn còn lưu.
         """
+        global _UPLOAD_GAP_STATE_BROKEN
         try:
             conn = get_conn()
             try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _recover_upload_slot(conn)
+                except Exception:
+                    _UPLOAD_GAP_STATE_BROKEN = True
+                    raise
                 cur = conn.execute("""
                     UPDATE video_queue
                     SET status = CASE
@@ -859,15 +984,33 @@ class PipelineManager:
         do_render: bool = True,
         do_upload: bool = True,
         force_reupload: bool = False,
+        preview_token: str = "",
     ):
         item_ids = list(dict.fromkeys(item_ids))
+        options = [do_download, do_render, do_upload]
         with self._lifecycle_lock:
+            if do_upload:
+                with closing(get_conn()) as conn:
+                    approval = conn.execute("SELECT * FROM upload_approvals WHERE token = ?", (preview_token,)).fetchone()
+                    if approval and approval["state"] in ("accepted", "finished", "interrupted"):
+                        accepted_ids = {row[0] for row in conn.execute(
+                            "SELECT queue_id FROM upload_approval_items WHERE token = ?", (preview_token,)
+                        )}
+                        if approval["options_json"] == encode(options) and accepted_ids == set(item_ids):
+                            return {
+                                "ok": True, "batch_id": _log_run_id(approval["run_token"]),
+                                "replayed": True, "state": approval["state"],
+                            }
+                        return {"ok": False, "code": "PREVIEW_STALE", "message": "Lựa chọn khác bản đã xác nhận."}
             if self._is_running or self._active_threads > 0:
                 return {"ok": False, "message": "Hệ thống đang chạy hoặc đang dừng một tiến trình khác."}
 
+            batch_token = uuid.uuid4().hex
             if do_upload:
                 try:
-                    self._freeze_batch_assignments(item_ids)
+                    self._freeze_batch_assignments(item_ids, preview_token, options, batch_token)
+                except PreviewStale as exc:
+                    return {"ok": False, "code": "PREVIEW_STALE", "message": str(exc)}
                 except Exception as exc:
                     return {"ok": False, "message": f"Không thể xác nhận kênh đích cho batch: {exc}"}
 
@@ -875,7 +1018,6 @@ class PipelineManager:
             self._is_running = True
             self._batch_upload_box = {"n": 0}
             self._active_threads = 1
-            batch_token = uuid.uuid4().hex
             try:
                 render_queue.configure(
                     int(get_settings().get("max_concurrent_renders", RENDER_QUEUE_DEFAULT_WORKERS) or RENDER_QUEUE_DEFAULT_WORKERS)
@@ -883,35 +1025,54 @@ class PipelineManager:
             except Exception:
                 pass
 
-        t = threading.Thread(
-            target=self._batch_worker_guarded,
-            args=(item_ids, do_download, do_render, do_upload, batch_token, force_reupload),
-            daemon=True,
-        )
-        try:
-            t.start()
-        except Exception as exc:
-            with self._lifecycle_lock:
-                self._is_running = False
-                self._active_threads = 0
-            return {"ok": False, "message": f"Không thể khởi chạy tiến trình: {exc}"}
-        return {"ok": True, "message": f"Đã bắt đầu xử lý {len(item_ids)} video."}
+            try:
+                t = threading.Thread(
+                    target=self._batch_worker_guarded,
+                    args=(item_ids, do_download, do_render, do_upload, batch_token, force_reupload),
+                    daemon=True,
+                )
+                t.start()
+            except Exception as exc:
+                try:
+                    if do_upload:
+                        with closing(get_conn()) as conn, conn:
+                            conn.execute("UPDATE video_queue SET claim_token = '' WHERE claim_token = ?", (batch_token,))
+                            conn.execute(
+                                "UPDATE upload_approvals SET state = 'launch_failed', run_token = NULL WHERE run_token = ?",
+                                (batch_token,),
+                            )
+                finally:
+                    self._is_running = False
+                    self._active_threads = 0
+                return {"ok": False, "message": f"Không thể khởi chạy tiến trình: {exc}"}
+        return {"ok": True, "batch_id": _log_run_id(batch_token), "message": f"Đã bắt đầu xử lý {len(item_ids)} video."}
 
     @staticmethod
-    def _freeze_batch_assignments(item_ids: List[int]) -> Dict[int, int]:
+    def _freeze_batch_assignments(item_ids: List[int], preview_token: str, options: list, batch_token: str):
         """Validate destinations and persist channel assignments before worker threads start."""
         conn = get_conn()
-        frozen: Dict[int, int] = {}
         try:
+            conn.execute("PRAGMA synchronous=FULL")
             conn.execute("BEGIN IMMEDIATE")
+            approval = conn.execute("SELECT * FROM upload_approvals WHERE token = ?", (preview_token,)).fetchone()
+            snapshots = dict(conn.execute(
+                "SELECT queue_id, snapshot_json FROM upload_approval_items WHERE token = ?", (preview_token,)
+            ).fetchall())
+            if (
+                not approval or approval["state"] not in ("preview", "launch_failed")
+                or not 0 <= time.time() - approval["created_at"] < 900
+                or approval["options_json"] != encode(options) or set(snapshots) != set(item_ids)
+            ):
+                raise PreviewStale("Bản xem trước hết hạn hoặc khác lựa chọn. Hãy xem trước lại.")
             for item_id in item_ids:
                 row = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
                 if not row:
-                    raise ValueError(f"Video #{item_id} không còn trong hàng đợi.")
+                    raise PreviewStale(f"Video #{item_id} không còn trong hàng đợi.")
                 item = dict(row)
                 status = str(item.get("status") or "").strip()
-                if item.get("claim_token") or status.startswith(("Uploading", "Downloading", "Rendering", "Đang đăng")):
-                    raise ValueError(f"Video #{item_id} đang được worker xử lý; hãy đợi lượt đó kết thúc.")
+                if (item.get("claim_token") or item.get("published_url") or status in ("Completed", "NeedsReview")
+                        or status.startswith(("Uploading", "Downloading", "Rendering", "Đang đăng"))):
+                    raise PreviewStale(f"Video #{item_id} đã đổi trạng thái. Hãy xem trước lại.")
 
                 validate_queue_fields(item)
                 validate_metadata_fields(item, require_title=True)
@@ -920,6 +1081,8 @@ class PipelineManager:
                 if source_type not in {"file", "localfile"} and platform not in {"localfile", "localupload"}:
                     item["source_url"] = validate_source_url(item.get("source_url"))
                 channel, frozen_groups = choose_target_channel(conn, item, validate_existing_assignment=True)
+                if snapshots[item_id] != encode(approval_item(conn, item, channel, frozen_groups)):
+                    raise PreviewStale(f"Video #{item_id} đã đổi đích hoặc cấu hình. Hãy xem trước lại.")
                 channel_id = int(channel["id"])
                 groups = frozen_groups
 
@@ -930,13 +1093,14 @@ class PipelineManager:
                     )
                 legacy_group = groups[0] if groups else str(item.get("target_group_name") or "")
                 conn.execute(
-                    "UPDATE video_queue SET assigned_channel_id = ?, assigned_group_names_json = ?, "
+                    "UPDATE video_queue SET assigned_channel_id = ?, assigned_group_names_json = ?, claim_token = ?, "
                     "target_group_names_json = CASE WHEN ? = 'GROUP' THEN ? ELSE target_group_names_json END, "
                     "target_group_name = CASE WHEN ? = 'GROUP' THEN ? ELSE target_group_name END, "
                     "group_schema_version = 1 WHERE id = ?",
                     (
                         channel_id,
                         serialize_group_names(frozen_groups),
+                        batch_token,
                         str(item.get("target_type") or "GROUP").upper(),
                         serialize_group_names(groups),
                         str(item.get("target_type") or "GROUP").upper(),
@@ -944,9 +1108,11 @@ class PipelineManager:
                         item_id,
                     ),
                 )
-                frozen[item_id] = channel_id
+            conn.execute("UPDATE upload_approvals SET state = 'accepted', run_token = ? WHERE token = ?", (batch_token, preview_token))
             conn.commit()
-            return frozen
+        except ValueError as exc:
+            conn.rollback()
+            raise PreviewStale(str(exc)) from exc
         except Exception:
             conn.rollback()
             raise
@@ -954,10 +1120,13 @@ class PipelineManager:
             conn.close()
 
     @staticmethod
-    def preview_distribution(item_ids: List[int]) -> List[Dict[str, Any]]:
+    def preview_distribution(item_ids: List[int], options=None):
         conn = get_conn()
         previews: List[Dict[str, Any]] = []
+        snapshots = {}
+        token = ""
         try:
+            conn.execute("BEGIN IMMEDIATE")
             for item_id in item_ids:
                 row = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
                 if not row:
@@ -989,6 +1158,10 @@ class PipelineManager:
                     entry["groups"] = groups
                     entry["channel_id"] = int(channel["id"])
                     entry["channel_name"] = str(channel.get("name") or "")
+                    snapshot = approval_item(conn, item, channel, groups)
+                    snapshots[item_id] = encode(snapshot)
+                    for key in ("youtube_channel_id", "profile_name", "antidetect_profile_id"):
+                        entry[key] = snapshot[key]
                     if not str(channel.get("channel_id") or "").strip():
                         entry["reasons"].append("kênh đích thiếu Channel ID")
                     try:
@@ -1001,15 +1174,30 @@ class PipelineManager:
                     if str(item.get("status") or "").strip() == "NeedsReview":
                         entry["reasons"].append("cần đối soát lượt đăng trước")
                     status = str(item.get("status") or "")
+                    if status.strip() == "Completed" or item.get("published_url"):
+                        entry["reasons"].append("video đã đăng trước đó")
                     if item.get("claim_token") or status.startswith(("Uploading", "Downloading", "Rendering", "Đang đăng")):
                         entry["reasons"].append("đang được worker khác giữ")
                 except Exception as exc:
                     entry["reasons"].append(str(exc))
                 entry["blocked"] = bool(entry["reasons"])
                 previews.append(entry)
+            if previews and not any(item["blocked"] for item in previews):
+                token = uuid.uuid4().hex
+                now = time.time()
+                conn.execute("DELETE FROM upload_approvals WHERE state IN ('preview','launch_failed') AND created_at < ?", (now - 900,))
+                conn.execute("DELETE FROM upload_approval_items WHERE token NOT IN (SELECT token FROM upload_approvals)")
+                conn.execute(
+                    "INSERT INTO upload_approvals (token, created_at, state, options_json) VALUES (?, ?, 'preview', ?)",
+                    (token, now, encode(options if options is not None else [True, True, True])),
+                )
+                conn.executemany("INSERT INTO upload_approval_items VALUES (?, ?, ?)", (
+                    (token, item_id, snapshot) for item_id, snapshot in snapshots.items()
+                ))
+                conn.commit()
         finally:
             conn.close()
-        return previews
+        return {"items": previews, "preview_token": token}
 
     def _batch_worker_guarded(
         self,
@@ -1033,13 +1221,14 @@ class PipelineManager:
                 self._is_running = False
                 self._active_threads = 0
             try:
-                conn = get_conn()
-                conn.execute(
-                    "UPDATE video_queue SET claim_token = '' WHERE claim_token = ?",
-                    (batch_token,),
-                )
-                conn.commit()
-                conn.close()
+                with closing(get_conn()) as conn:
+                    conn.execute("UPDATE video_queue SET claim_token = '' WHERE claim_token = ?", (batch_token,))
+                    if do_upload:
+                        conn.execute(
+                            "UPDATE upload_approvals SET state = 'finished' WHERE run_token = ? AND state = 'accepted'",
+                            (batch_token,),
+                        )
+                    conn.commit()
             except Exception:
                 pass
 
@@ -1252,8 +1441,13 @@ class PipelineManager:
             "UPDATE video_queue SET claim_token = ? WHERE id = ? AND COALESCE(claim_token, '') = ''",
             (token, item_id),
         )
+        claimed = cur.rowcount == 1 or bool(do_upload and claim_token and conn.execute(
+            "SELECT 1 FROM upload_approvals a JOIN upload_approval_items i ON i.token = a.token "
+            "JOIN video_queue q ON q.id = i.queue_id AND q.claim_token = a.run_token "
+            "WHERE a.state = 'accepted' AND a.run_token = ? AND q.id = ?",
+            (claim_token, item_id),
+        ).fetchone())
         conn.commit()
-        claimed = cur.rowcount == 1
         conn.close()
         if not claimed:
             add_log(
@@ -1295,7 +1489,12 @@ class PipelineManager:
                         stage = "Visibility"
                     elif "đang gửi đăng" in text or "xuất bản" in text or "publish" in text:
                         stage = "Publishing"
-                    elif "xác minh video" in text or "đọc lại metadata" in text or "verifying" in text:
+                    elif (
+                        "xác minh video" in text
+                        or "xác minh url video" in text
+                        or "đọc lại metadata" in text
+                        or "verifying" in text
+                    ):
                         stage = "VerifyingResult"
                     elif "đang xử lý video" in text or "processing" in text:
                         stage = "Processing"
@@ -1335,19 +1534,24 @@ class PipelineManager:
         reservation_owned = False
         reservation_keep = False
         upload_started = False
+        slot_owner = None
         upload_attempt_id = None
         channel = None
         option_group = None
 
         try:
             if do_upload:
+                item["claim_token"] = token
+                item["_upload_origin"] = owner
                 channel = self._resolve_target_channel(item, row_idx)
                 if not channel:
                     raise RuntimeError(
                         "Chưa chọn Kênh YouTube đích hoặc Nhóm Kênh chưa có kênh nào. "
                         "Hãy thêm/chọn kênh trước khi chạy video."
                     )
-                if item.get("option_group_id"):
+                if channel.get("_approval_snapshot"):
+                    option_group = channel["_approval_options"]
+                elif item.get("option_group_id"):
                     c_opt = get_conn()
                     try:
                         og_row = c_opt.execute(
@@ -1521,6 +1725,22 @@ class PipelineManager:
                 f_row = conn_f.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
                 conn_f.close()
                 fresh_item = dict(f_row) if f_row else item
+                if channel.get("_approval_snapshot"):
+                    expected = dict(channel["_approval_snapshot"])
+                    expected["paths"] = [input_path, output_path, thumb_path]
+                    expected["asset_stamps"] = asset_stamps(expected["paths"])
+
+                    def verify_approval():
+                        with closing(get_conn()) as check_conn:
+                            check_conn.execute("BEGIN")
+                            current_item = check_conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
+                            current_channel = check_conn.execute("SELECT * FROM youtube_channels WHERE id = ?", (channel["id"],)).fetchone()
+                            if (not current_item or current_item["claim_token"] != token or not current_channel
+                                    or approval_item(check_conn, dict(current_item), dict(current_channel), expected["groups"]) != expected):
+                                raise PreviewStale("Đích, file hoặc cấu hình đã thay đổi. Hãy xem trước lại.")
+
+                    verify_approval()
+                    channel["_verify_approval"] = verify_approval
 
                 # Radio 18+ của Studio chưa được xác minh (HANDOVER v7). Chặn trước
                 # khi giữ reservation/gọi uploader để không tạo bản nháp rác.
@@ -1585,7 +1805,9 @@ class PipelineManager:
                         video_title=title,
                     )
 
-                if not reserve_upload_slot(se):
+                _update_row(status="Chờ lượt upload...")
+                slot_owner = reserve_upload_slot(se, item_id)
+                if not slot_owner:
                     _update_row(status="Stopped", error_message="Đã dừng khi đang chờ giãn cách đăng.")
                     return
                 if se.is_set():
@@ -1613,6 +1835,9 @@ class PipelineManager:
                     )
                     return
 
+                if channel.get("_verify_approval"):
+                    channel["_verify_approval"]()
+
                 upload_attempt_id = _start_upload_attempt(
                     item_id,
                     token,
@@ -1625,21 +1850,21 @@ class PipelineManager:
                         error_message="Worker không còn quyền sở hữu lượt đăng; chưa gửi yêu cầu lên YouTube.",
                     )
                     return
+                if channel.get("_verify_approval"):
+                    # The attempt consumed the one-time reupload permission.
+                    expected["video"] = {**expected["video"], "manual_reupload_authorized": 0, "manual_reupload_reason": ""}
                 set_log_context(attempt_id=upload_attempt_id, phase="Uploading")
                 if not _update_row(status=f"Uploading -> {channel['name']}", upload_progress=10, error_message=""):
                     _finish_upload_attempt(upload_attempt_id, "NotSent", error_message="Claim đã đổi trước khi gọi uploader.")
                     return
+                _mark_slot_entered(slot_owner, upload_attempt_id)
                 upload_started = True
-                try:
-                    pub_res = upload_video_to_youtube(
-                        video_item=fresh_item,
-                        channel=channel,
-                        option_group=option_group,
-                        progress_callback=_make_progress_cb("upload_progress"),
-                    )
-                finally:
-                    # Mốc kết thúc là chuẩn giãn cách cho lượt kế tiếp, kể cả khi upload lỗi giữa chừng.
-                    _record_upload_finished_safely(title)
+                pub_res = upload_video_to_youtube(
+                    video_item=fresh_item,
+                    channel=channel,
+                    option_group=option_group,
+                    progress_callback=_make_progress_cb("upload_progress"),
+                )
 
                 if isinstance(pub_res, dict):
                     pub_url = pub_res.get("url", "")
@@ -1821,6 +2046,10 @@ class PipelineManager:
                 _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
                 add_log("Pipeline", f"Đã dừng xử lý video: {title}", "WARNING", video_title=title)
         except Exception as e:
+            if upload_started and isinstance(e, AntidetectNotReady):
+                _finish_upload_attempt(upload_attempt_id, "NotSent", error_message=str(e))
+                _update_row(status="Error", error_message=str(e))
+                return
             if upload_started:
                 reservation_keep = True
                 err_msg = str(e)
@@ -1874,15 +2103,57 @@ class PipelineManager:
                         )
                     except Exception:
                         pass
+            if slot_owner:
+                _record_upload_finished_safely(
+                    title, slot_owner, entered_uploader=upload_started,
+                    cleanup_unconfirmed=bool(channel and channel.get("_upload_cleanup_unconfirmed")),
+                )
+
 
     def _resolve_target_channel(self, item: Dict[str, Any], row_idx: int) -> Dict[str, Any]:
         conn = get_conn()
         try:
+            token = item.get("claim_token")
+            if token:
+                conn.execute("BEGIN IMMEDIATE")
             selected, group_names = choose_target_channel(
                 conn, item, validate_existing_assignment=False
             )
             if not group_names and item.get("assigned_channel_id"):
                 group_names = target_group_names(item)
+            if token:
+                approved = conn.execute(
+                    "SELECT i.snapshot_json FROM upload_approvals a JOIN upload_approval_items i ON i.token = a.token "
+                    "WHERE a.run_token = ? AND a.state = 'accepted' AND i.queue_id = ?",
+                    (token, item["id"]),
+                ).fetchone()
+                current = approval_item(conn, item, selected, group_names)
+                if approved:
+                    snapshot = json.loads(approved[0])
+                    current["groups"] = snapshot["groups"]
+                    if current != snapshot:
+                        raise PreviewStale("Đích hoặc cấu hình đã thay đổi sau khi xác nhận.")
+                elif item.get("_upload_origin") == "monitor":
+                    snapshot = current
+                    approval_token = uuid.uuid4().hex
+                    conn.execute(
+                        "INSERT INTO upload_approvals VALUES (?, ?, 'accepted', ?, ?, 'monitor')",
+                        (approval_token, time.time(), encode([True, True, True]), token),
+                    )
+                    conn.execute("INSERT INTO upload_approval_items VALUES (?, ?, ?)", (approval_token, item["id"], encode(snapshot)))
+                    conn.execute("UPDATE video_queue SET assigned_channel_id = ?, assigned_group_names_json = ? "
+                                 "WHERE id = ? AND claim_token = ?",
+                                 (snapshot["channel_id"], serialize_group_names(group_names), item["id"], token))
+                else:
+                    raise PreviewStale("Lượt upload thiếu bản xác nhận. Hãy xem trước lại.")
+                selected["_approval_snapshot"] = snapshot
+                option_row = conn.execute(
+                    "SELECT * FROM upload_option_groups WHERE id = ?", (item.get("option_group_id"),)
+                ).fetchone()
+                selected["_approval_options"] = dict(option_row) if option_row else None
+                selected["channel_id"] = snapshot["youtube_channel_id"]
+                selected["antidetect_profile_id"] = snapshot["antidetect_profile_id"]
+                conn.commit()
             add_log(
                 "Pipeline",
                 f"Chọn kênh video #{item.get('id')} → '{selected['name']}' (kênh #{selected['id']})"
@@ -2636,6 +2907,11 @@ class PipelineManager:
                             )
                         finally:
                             release_item_claim(queue_id, monitor_token)
+                            with closing(get_conn()) as approval_conn, approval_conn:
+                                approval_conn.execute(
+                                    "UPDATE upload_approvals SET state = 'finished' WHERE run_token = ? AND state = 'accepted'",
+                                    (monitor_token,),
+                                )
 
                         # S2: chỉ đánh dấu "đã xử lý" KHI video thực sự đăng thành công —
                         # video lỗi/dừng sẽ được quét lại ở chu kỳ sau thay vì bị bỏ vĩnh viễn.
