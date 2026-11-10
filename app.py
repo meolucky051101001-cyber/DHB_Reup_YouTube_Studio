@@ -82,6 +82,7 @@ from phase4_rules import (
 from queue_import import preview_csv_import
 from app_instance_lock import AppInstanceAlreadyRunning, acquire_app_instance_lock
 from render_engine import normalize_render_speed
+from runtime_identity import capture_runtime, runtime_status
 from storage_manager import (
     DEFAULT_RETENTION_DAYS,
     cleanup_managed_artifacts,
@@ -307,6 +308,7 @@ if not BACKGROUND_TASKS_DISABLED:
     pipeline_manager.start_monitor_supervisor()
 
 APP_BUILD_VERSION = "2026.11.04-p7-fix2"
+RUNTIME_IDENTITY = capture_runtime(APP_ROOT)
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
 API_TOKEN = generate_api_token()
@@ -471,6 +473,14 @@ def index():
     return FileResponse(str(STATIC_DIR / "index.html"), headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
 
+@app.get("/health/dhb", include_in_schema=False)
+def dhb_health():
+    return JSONResponse(
+        {key: RUNTIME_IDENTITY[key] for key in ("application", "source_root")},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/api/overview")
 def get_overview():
     conn = get_conn()
@@ -489,6 +499,7 @@ def get_overview():
         "completed_videos": completed_videos,
         "monitors_running": monitors_running,
         "pipeline_running": pipeline_manager.is_running,
+        "batch_state": pipeline_manager.batch_state,
         "dhb_connected": DHB_ROOT.exists(),
         "ffmpeg_path": FFMPEG_EXE,
         "ytdl_path": YTDL_EXE,
@@ -573,6 +584,9 @@ def api_diagnostics():
 
     return {
         "version": APP_BUILD_VERSION,
+        "runtime": runtime_status(APP_ROOT, RUNTIME_IDENTITY),
+        "batch_state": pipeline_manager.batch_state,
+        "upload_slot": upload_slot_recovery_status(),
         "database": {"available": APP_DB_PATH.exists(), "bytes": db_bytes, "user_version": user_version,
                      "schemas": schema_rows},
         "workers": workers,
@@ -3419,8 +3433,7 @@ def api_acknowledge_upload_slot(data: Dict[str, Any] = Body(...)):
 
 @app.post("/api/pipeline/stop")
 def api_stop_pipeline():
-    pipeline_manager.stop_all()
-    return {"ok": True}
+    return {"ok": True, "batch_state": pipeline_manager.stop_all()}
 
 
 # ==========================================================

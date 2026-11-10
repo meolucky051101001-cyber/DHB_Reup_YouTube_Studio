@@ -465,6 +465,7 @@
         <!-- Cột Phải: Bảng Hàng Đợi Video & Điều Khiển Pipeline -->
         <div>
           <div class="card">
+            <p id="queue-stopping-status" role="status" hidden>Đang dừng lô. Video đang upload sẽ hoàn tất trước khi dừng hẳn.</p>
             <div id="queue-pending-banner" style="display:none; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin:14px 14px 0; padding:12px 16px; border-radius:10px; border:1px solid rgba(34,197,94,0.55); background:linear-gradient(135deg, rgba(22,101,52,0.35), rgba(15,23,42,0.65));">
               <div style="font-size:13px; line-height:1.5;">
                 ⏳ <strong style="color:#4ade80;"><span id="queue-pending-count">0</span> video đang chờ</strong> trong dự án này.
@@ -1858,6 +1859,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20261109-upload"></script>
+  <script src="/static/app.js?v=g1-operations"></script>
 </body>
 </html>

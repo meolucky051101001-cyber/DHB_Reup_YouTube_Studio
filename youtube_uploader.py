@@ -14,6 +14,8 @@ import requests
 
 from config import APP_PROFILES_DIR
 from database import add_log, get_settings
+from scanner_downloader import probe_video_info
+from upload_approval import upload_source_path
 from antidetect_client import (
     AntidetectNotReady,
     AntidetectBrowserLease,
@@ -2506,8 +2508,9 @@ def _studio_row_video_id(row) -> str:
 _STUDIO_EMPTY_HEADER = "ytcp-video-section-content#video-list .no-content > .no-content-header"
 _STUDIO_TABLE_FOOTER = "ytcp-video-section-content#video-list ytcp-table-footer"
 _STUDIO_FOOTER_RANGE = re.compile(
-    r"(?m)^\s*(\d+)\s*[-–—]\s*(\d+)\s*/\s*(?:khoảng\s*)?(\d+)\s*$"
+    r"(?mi)^[ \t]*(\d+)[ \t]*[-–—][ \t]*(\d+)[ \t]*(?:/|of)[ \t]*(\d+)[ \t]*$"
 )
+_STUDIO_PAGE_ROW_LIMIT = 100
 _STUDIO_EMPTY_MESSAGE = re.compile(
     r"(?:(?:[^.!?]*\b(?:videos?|shorts?|live streams?|phát trực tiếp)\b[^.!?]*"
     r"(?:will (?:appear|show up) here|sẽ xuất hiện ở đây))"
@@ -2542,6 +2545,7 @@ def _studio_content_tab_is_complete(
     return (
         start == expected_start
         and end >= start
+        and row_count <= _STUDIO_PAGE_ROW_LIMIT
         and end - start + 1 == row_count
         and total >= end
     )
@@ -2584,7 +2588,7 @@ def _collect_studio_title_candidates(
                     elif page_total != reported_total:
                         unreadable.append(section)
                         break
-            for index in range(min(raw_count, 100)):
+            for index in range(min(raw_count, _STUDIO_PAGE_ROW_LIMIT)):
                 row = rows.nth(index)
                 if not _studio_row_matches_title(row, title, require_readable=require_readable):
                     continue
@@ -2624,6 +2628,9 @@ def _collect_studio_title_candidates(
                 break
             next_start = end + 1
             previous_first_id = _studio_row_video_id(rows.first)
+            if not previous_first_id:
+                unreadable.append(section)
+                break
             page_index += 1
             if page_index >= 100:
                 unreadable.append(section)
@@ -3212,8 +3219,8 @@ def upload_via_playwright_studio(
                 if known_video_ids is None:
                     add_log(
                         "Upload",
-                        "Không đọc được danh sách video hiện có để đối chiếu — chỉ chấp nhận bằng chứng "
-                        "từ hộp thoại chia sẻ, không dùng fallback danh sách nội dung.",
+                        "Không đọc được danh sách video trước khi đăng. Nếu tiếp tục gửi video, "
+                        "lượt này sẽ cần đối soát trực tiếp trong Studio.",
                         "WARNING",
                         channel_name=channel.get("name", ""),
                         video_title=metadata.get("title", ""),
@@ -3662,16 +3669,18 @@ def upload_via_playwright_studio(
                 if progress_callback:
                     progress_callback(96, "Đã gửi yêu cầu; đang xác minh URL video từ Studio...")
 
-                verified_url = _wait_for_publish_completion(
+                confirmation_url = _wait_for_publish_completion(
                     page, studio_url_before_publish, PUBLISH_CONFIRM_TIMEOUT_SECONDS
                 ) or video_url
-                if not verified_url:
-                    verified_url = _verify_published_video_on_fresh_tab(
-                        context,
-                        active_channel.get("channel_id", ""),
-                        metadata,
-                        known_video_ids,
-                    )
+                verified_url = _verify_published_video_on_fresh_tab(
+                    context,
+                    active_channel.get("channel_id", ""),
+                    metadata,
+                    known_video_ids,
+                )
+                if confirmation_url and verified_url and confirmation_url != verified_url:
+                    add_log("Upload", "ID trong xác nhận lưu khác ID đọc lại từ Studio.", "WARNING", phase="VerifyingResult")
+                    verified_url = ""
 
                 # Đóng hộp thoại xác nhận hoàn tất của Studio để Cookie phiên kịp đồng bộ
                 try:
@@ -3687,7 +3696,7 @@ def upload_via_playwright_studio(
 
                 if not verified_url:
                     uncertain_msg = (
-                        "Đã bấm Xuất bản/Lên lịch nhưng KHÔNG đọc được URL video thật từ hộp thoại hoặc "
+                        "Đã bấm Xuất bản/Lên lịch nhưng chưa xác minh được video và chế độ hiển thị qua "
                         "danh sách Nội dung (Video/Shorts) của YouTube Studio. "
                         "Không thể xác minh video đã đăng thành công — hãy mở Studio kiểm tra trực tiếp "
                         "trước khi chạy lại để tránh đăng trùng."
@@ -3796,9 +3805,10 @@ def upload_video_to_youtube(
     """
     metadata = validate_upload_preflight(video_item, channel, option_group)
     mode = (channel.get("upload_mode") or "playwright").strip().lower()
-    video_path = video_item.get("output_video_path") or video_item.get("input_video_path") or ""
-    if not video_path or not os.path.exists(video_path):
+    video_path = upload_source_path(video_item)
+    if not video_path or not os.path.isfile(video_path):
         raise FileNotFoundError(f"Không tìm thấy file video để upload: {video_path}")
+    probe_video_info(video_path)
 
     if mode == "youtube_api":
         return upload_via_youtube_api(

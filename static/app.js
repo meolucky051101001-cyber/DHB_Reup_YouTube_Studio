@@ -617,6 +617,7 @@ async function loadOverview() {
   try {
     const data = await apiFetch('/api/overview');
     gPipelineRunning = !!data.pipeline_running;
+    document.getElementById('queue-stopping-status').hidden = data.batch_state !== 'stopping';
     document.getElementById('st-dhb').textContent = data.dhb_connected ? 'Đã kết nối ổ C' : 'Chưa kết nối';
     document.getElementById('st-channels').textContent = data.channels_count;
     document.getElementById('st-videos').textContent = data.total_videos;
@@ -2677,7 +2678,8 @@ function formatDistributionPreview(preview) {
     const schedule = item.visibility === 'schedule' ? ` · ⏰ ${item.schedule_time || 'thiếu lịch'}` : ` · ${item.visibility}`;
     const prefix = item.blocked ? '⛔' : '•';
     const suffix = [...(item.reasons || []), ...(item.warnings || []).map(w => `cảnh báo: ${w}`)];
-    return `${prefix} #${item.id} ${item.title || ''} → ${target} · ${profile}${groups}${schedule}${suffix.length ? `\n    ${suffix.join('; ')}` : ''}`;
+    const file = item.file_kind ? ` · ${item.file_kind}${item.file_name ? ` (${item.file_name})` : ''}` : '';
+    return `${prefix} #${item.id} ${item.title || ''} → ${target} · ${profile}${groups}${schedule}${file}${suffix.length ? `\n    ${suffix.join('; ')}` : ''}`;
   });
   const totals = entries => Array.from(entries, ([name, count]) => `${name}: ${count}`).join('\n');
   return `Theo profile\n${totals(profiles)}\n\nTheo kênh\n${totals(channels)}\n\n${lines.join('\n')}`;
@@ -2726,9 +2728,10 @@ async function previewSelectedDistribution() {
 
 async function stopPipeline() {
   try {
-    showToast('⏳ Đang phát lệnh dừng khẩn cấp...', 'warning');
     const res = await apiFetch('/api/pipeline/stop', { method: 'POST' });
-    showToast('🛑 Đã dừng toàn bộ tiến trình render và upload!', 'warning');
+    const stopping = res.batch_state === 'stopping';
+    document.getElementById('queue-stopping-status').hidden = !stopping;
+    showToast(stopping ? 'Đã yêu cầu dừng. Video đang upload sẽ hoàn tất trước khi dừng hẳn.' : 'Lô hiện đã dừng.', 'warning');
     await loadQueue(true);
     await loadLogs();
   } catch (e) {
@@ -2739,6 +2742,10 @@ async function stopPipeline() {
 async function reviewUploadSlot() {
   try {
     const slot = await apiFetch('/api/pipeline/upload-slot');
+    if (slot.available === false) {
+      alert('Tool chưa xác nhận được trạng thái upload. Kiểm tra Nhật ký và đối soát lượt cũ trước khi chạy lại.');
+      return;
+    }
     if (slot.state === 'recovery_required') {
       const confirmed = confirm(
         `Lượt upload của video #${slot.queue_id} cần phục hồi.\n\n` +
@@ -2756,7 +2763,10 @@ async function reviewUploadSlot() {
     if (slot.state === 'active') {
       alert(`Video #${slot.queue_id} đang giữ lượt upload.`);
     } else if (slot.state === 'cooldown') {
-      alert('Đang kiểm tra khoảng nghỉ 30 phút trước lượt tiếp theo.');
+      const seconds = slot.remaining_seconds;
+      alert(seconds > 0
+        ? `Còn ${Math.floor(seconds / 60)} phút ${seconds % 60} giây trước lượt upload tiếp theo. Khoảng nghỉ dùng chung cho mọi profile. Sau khi khởi động lại, tool có thể áp dụng lại 30 phút để xác nhận an toàn.`
+        : 'Lượt upload đã đủ khoảng nghỉ.');
     } else {
       alert('Lượt upload đang trống.');
     }
@@ -3280,15 +3290,21 @@ async function loadDiagnostics() {
     const workers = data.workers || {};
     const storage = data.storage || {};
     const heartbeat = data.heartbeat || {};
+    const runtime = data.runtime || {};
+    const slot = data.upload_slot || {};
     const schemaText = (db.schemas || []).map(item => `${item.key}: v${item.version}`).join(', ') || 'chưa có bản ghi schema';
     const toolsText = (data.tools || []).map(tool =>
       `${tool.name}: ${tool.available ? 'OK' : 'LỖI'}${tool.version ? ` — ${tool.version}` : ''}${tool.error ? ` (${tool.error})` : ''}`
     ).join('\n');
     panel.textContent = [
       `Bản dựng: ${data.version || 'không rõ'}`,
+      `Revision khi mở: ${runtime.revision || 'không rõ'} · mã nguồn ${runtime.startup_fingerprint?.slice(0, 12) || 'không rõ'}`,
+      `Khởi động: ${runtime.started_at ? new Date(runtime.started_at).toLocaleString() : 'không rõ'} · thư mục ${runtime.source_root || 'không rõ'}`,
+      runtime.restart_required ? 'Mã trên đĩa đã đổi. Khởi động lại DHB để áp dụng.' : '',
       `Database: ${db.available ? 'OK' : 'không tìm thấy'} · ${storageFormatBytes(db.bytes || 0)} · user_version ${db.user_version ?? 0}`,
       `Schema: ${schemaText}`,
-      `Worker batch: ${workers.pipeline_running ? 'đang chạy' : 'dừng'} · active ${workers.active_batch_threads || 0}`,
+      `Worker batch: ${data.batch_state === 'stopping' ? 'đang dừng' : workers.pipeline_running ? 'đang chạy' : 'dừng'} · active ${workers.active_batch_threads || 0}`,
+      `Slot upload: ${slot.state || 'không rõ'}${slot.remaining_seconds != null ? ` · còn ${slot.remaining_seconds} giây` : ''}`,
       `Monitor: ${workers.monitor_workers || 0} worker · ${workers.monitor_heartbeats || 0} heartbeat · supervisor ${workers.monitor_supervisor_alive ? 'sống' : 'dừng'}`,
       `NeedsReview: ${data.needs_review_count || 0} · heartbeat mới nhất: ${heartbeat.latest || 'chưa có'} (${heartbeat.running_monitors || 0} monitor bật)`,
       `Ổ đĩa trống: ${storageFormatBytes(storage.free_bytes || 0)} · temp ${storageFormatBytes(storage.temp_bytes || 0)} · output ${storageFormatBytes(storage.output_bytes || 0)} · artifact ${storage.artifact_count || 0}`,

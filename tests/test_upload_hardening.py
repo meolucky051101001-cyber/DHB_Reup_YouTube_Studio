@@ -61,6 +61,31 @@ class UploadHardeningTests(unittest.TestCase):
         with closing(database.get_conn()) as conn, self.assertRaisesRegex(sqlite3.IntegrityError, "UPLOAD_BINDING_BUSY"):
             conn.execute("UPDATE youtube_channels SET channel_id = 'replacement' WHERE id = 901")
 
+    def test_preview_reports_render_output_and_rejects_missing_file(self):
+        with closing(database.get_conn()) as conn, conn:
+            conn.execute("UPDATE video_queue SET output_video_path = ? WHERE id = 901", (str(self.video),))
+        manager = pm.PipelineManager()
+        options = [False, False, True]
+        preview = manager.preview_distribution([901], options)
+        self.assertEqual(preview["items"][0]["file_kind"], "bản render có sẵn")
+        self.assertEqual(preview["items"][0]["file_name"], self.video.name)
+        self.video.unlink()
+        self.assertFalse(manager.start_batch([901], *options, preview_token=preview["preview_token"])["ok"])
+        self.assertTrue(manager.preview_distribution([901], options)["items"][0]["blocked"])
+
+    def test_preview_binds_upload_format_and_rechecks_recovery_state(self):
+        manager = pm.PipelineManager()
+        options = [False, False, True]
+        preview = manager.preview_distribution([901], options)
+        with closing(database.get_conn()) as conn, conn:
+            conn.execute("UPDATE video_queue SET upload_to = 'Video' WHERE id = 901")
+        self.assertEqual(manager.start_batch([901], *options, preview_token=preview["preview_token"])["code"], "PREVIEW_STALE")
+        preview = manager.preview_distribution([901], options)
+        with closing(database.get_conn()) as conn, conn:
+            conn.execute("UPDATE upload_slot SET state = 'recovery_required' WHERE id = 1")
+        self.assertEqual(manager.start_batch([901], *options, preview_token=preview["preview_token"])["code"], "PREVIEW_STALE")
+        self.assertTrue(manager.preview_distribution([901], options)["items"][0]["blocked"])
+
     def test_failed_thread_launch_rolls_back_claim_and_can_retry(self):
         manager = pm.PipelineManager()
         token = manager.preview_distribution([901])["preview_token"]

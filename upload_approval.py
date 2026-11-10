@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 import time
 
 
@@ -12,7 +13,7 @@ class PreviewStale(ValueError):
 _QUEUE_FIELDS = (
     "project_name", "source_type", "platform", "source_url", "post_id",
     "target_type", "target_channel_id", "target_profile_name",
-    "title", "description", "tags", "visibility", "schedule_time", "option_group_id",
+    "title", "description", "tags", "upload_to", "visibility", "schedule_time", "option_group_id",
     "made_for_kids", "altered_content", "age_restriction", "is_premiere",
     "render_mode", "render_config_json", "cut_start", "cut_end", "resolution",
     "emulate_mobile", "manual_reupload_authorized", "manual_reupload_reason",
@@ -43,10 +44,16 @@ def asset_stamps(paths):
     return result
 
 
+def upload_source_path(item):
+    return item.get("output_video_path") or item.get("input_video_path") or ""
+
+
 def approval_item(conn, item, channel, groups):
     channel_id = str(channel.get("channel_id") or "").strip()
     if not channel_id:
         raise PreviewStale("Kênh đích chưa có YouTube Channel ID.")
+    if not re.fullmatch(r"UC[A-Za-z0-9_-]{22}", channel_id):
+        raise PreviewStale("YouTube Channel ID không đúng định dạng. Hãy xác minh lại kênh.")
     duplicate = conn.execute(
         "SELECT 1 FROM youtube_channels WHERE TRIM(channel_id) = ? AND id <> ? LIMIT 1",
         (channel_id, channel["id"]),
@@ -58,6 +65,8 @@ def approval_item(conn, item, channel, groups):
         "SELECT path, source, antidetect_profile_id, proxy FROM chrome_profiles WHERE name = ?",
         (name,),
     ).fetchone()
+    if name and not binding:
+        raise PreviewStale("Profile của kênh đích không còn trong danh sách đã lưu.")
     profile = dict(binding) if binding else {}
     profile_id = str(profile.get("antidetect_profile_id") or "").strip()
     path = str(channel.get("profile_path") or "").strip()

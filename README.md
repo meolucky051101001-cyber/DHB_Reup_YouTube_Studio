@@ -55,7 +55,7 @@ python -m playwright install chromium
 START_DHB_YOUTUBE.bat
 ```
 
-Script sẽ khởi động server (`app.py`, uvicorn bind `127.0.0.1:8686`, log ghi ra `logs\server.out.log` / `logs\server.error.log`) rồi mở dashboard. Nếu dashboard đang chạy sẵn, script chỉ mở trình duyệt.
+Script khởi động server (`app.py`, cổng `127.0.0.1:8686`) và ghi log vào `logs\server.out.log` / `logs\server.error.log`. Nếu DHB đã chạy từ đúng thư mục, script mở dashboard hiện tại. Nếu cổng thuộc bản DHB khác hoặc chương trình khác, script báo xung đột. Kiểm tra revision khi mở và cảnh báo mã trên đĩa đã đổi trong **Tổng quan → Chẩn đoán**.
 
 Hoặc chạy trực tiếp:
 
@@ -64,6 +64,8 @@ python app.py
 ```
 
 Tool **không** tự chạy hàng đợi khi khởi động — mọi lượt đăng phải bấm Start trong dashboard.
+
+Với video đã dựng sẵn, chọn **Chỉ Đăng YT** và kiểm tra kênh, profile, chế độ hiển thị và file trong Preview. Nếu dòng còn bản render có sẵn, Preview sẽ ghi rõ bản đó. **Dừng** ngừng nhận video mới của lô và chờ lượt upload đã bắt đầu hoàn tất. Chờ trạng thái đang dừng biến mất trước khi tắt dịch vụ. Dòng **NeedsReview** cần đối chiếu trong Studio trước khi quyết định đăng lại.
 
 Kiểm tra nhanh trạng thái hàng đợi và log mà không cần dashboard:
 
@@ -81,7 +83,7 @@ Cấu hình (biến môi trường, hoặc setting trong DB):
 
 | Biến | Ý nghĩa |
 |---|---|
-| `ANTIDETECT_HOME` | Thư mục cài Antidetect; mặc định `C:\Users\admin\Documents\antigravity\blissful-maxwell\antidetect_python`. |
+| `ANTIDETECT_HOME` | Thư mục cài Antidetect. Mặc định là `C:\Projects\Tools\Antidetect Python`. |
 | `ANTIDETECT_DATA_DIR` | Thư mục dữ liệu chứa `server.pid` và `runtime.dpapi`. |
 | `ANTIDETECT_BASE_URL` | Ép địa chỉ API, ví dụ `http://127.0.0.1:8000`. Để trống thì tool tự dò từ `server.pid` rồi cổng 8000. |
 | `ANTIDETECT_ACCESS_KEY` / `ANTIDETECT_API_TOKEN` | Khóa Bearer; nếu không đặt, tool giải mã `runtime.dpapi` bằng DPAPI của user hiện tại. |

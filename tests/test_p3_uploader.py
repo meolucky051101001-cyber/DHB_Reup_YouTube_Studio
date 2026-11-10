@@ -81,6 +81,10 @@ class _StudioList:
     def nth(self, index):
         return self.items[index]
 
+    @property
+    def first(self):
+        return self.items[0] if self.items else self
+
 
 class _StudioText:
     def __init__(self, text):
@@ -148,6 +152,51 @@ class _StudioPage:
 
 
 class UrlAndChecksTests(unittest.TestCase):
+    def test_paginated_result_waits_for_new_rows_and_checks_all_matches(self):
+        class PaginatedPage(_StudioPage):
+            def __init__(self, first_title):
+                super().__init__({"short": [_StudioRow(first_title, VIDEO_ID)], "upload": []})
+                self.second_page = False
+                self.refresh_ticks = 0
+
+            def click(self):
+                self.second_page = True
+
+            def evaluate(self, _script):
+                return False
+
+            def count(self):
+                return 1
+
+            def wait_for_timeout(self, _ms):
+                self.refresh_ticks += 1
+                if self.refresh_ticks == 2:
+                    self.rows_by_section["short"] = [_StudioRow("New short", "13t572zFqlw", "Riêng tư")]
+
+            def locator(self, selector):
+                if self.section == "short" and selector == yu._STUDIO_TABLE_FOOTER:
+                    start = 2 if self.second_page else 1
+                    return _StudioText(f"Rows per page:\n30\n{start} – {start} of 2")
+                if self.section == "short" and selector.endswith("#navigate-after"):
+                    return _StudioList([self])
+                return super().locator(selector)
+
+        page = PaginatedPage("Other title")
+        self.assertEqual(yu._find_published_video_in_studio_content(
+            page, CHANNEL_ID, "New short", "Shorts", "private", set()
+        ), "https://youtu.be/13t572zFqlw")
+        self.assertEqual(page.refresh_ticks, 2)
+        self.assertEqual(yu._find_published_video_in_studio_content(
+            PaginatedPage("New short"), CHANNEL_ID, "New short", "Shorts", "private", set()
+        ), "")
+
+    def test_approximate_total_or_truncated_page_cannot_confirm_result(self):
+        page = _StudioPage({"short": [_StudioRow("New short", VIDEO_ID)], "upload": []})
+        page.footer_override["short"] = "Số hàng mỗi trang:\n30\n1 – 1/khoảng 1"
+        self.assertIsNone(yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "New short", "Shorts"))
+        page = _StudioPage({"short": [_StudioRow("Other title", VIDEO_ID)] * 101, "upload": []})
+        self.assertIsNone(yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "New short", "Shorts"))
+
     def test_fresh_tab_retries_unreadable_and_pending_private_result(self):
         context = mock.Mock()
         observations = [

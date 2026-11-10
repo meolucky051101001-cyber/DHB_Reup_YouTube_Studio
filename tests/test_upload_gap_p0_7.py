@@ -39,8 +39,10 @@ class UploadGapTests(unittest.TestCase):
         pm._record_upload_finished_safely("A", owner, entered_uploader=True)
         self.wall += 5000
         self.monotonic += 1799
+        self.assertEqual(pm.upload_slot_recovery_status()["remaining_seconds"], 1)
         self.assertFalse(pm.reserve_upload_slot(self.stop_after_wait(), 102))
         self.monotonic += 1
+        self.assertEqual(pm.upload_slot_recovery_status()["remaining_seconds"], 0)
         newer = pm.reserve_upload_slot(threading.Event(), 102)
         self.assertNotEqual(newer, owner)
         pm._record_upload_finished_safely("old callback", owner, entered_uploader=True)
