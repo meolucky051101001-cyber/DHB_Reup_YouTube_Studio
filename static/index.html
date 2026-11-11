@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DHB Reup YouTube Studio — Hệ Thống Tự Động Hóa Reup & Đăng YouTube</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20261103-p6" />
+  <link rel="stylesheet" href="/static/styles.css?v=queue-quick-edit" />
 </head>
 <body>
   <!-- TOP HEADER -->
@@ -44,41 +44,6 @@
          ========================================== -->
     <section id="tab-workspace" class="tab-pane active">
       
-      <!-- 1. WORKFLOW STEPPER BAR (Hướng Dẫn Quy Trình Thao Tác Nhanh) -->
-      <div class="workflow-stepper">
-        <div class="step-item" onclick="switchSubTab('scan')" style="cursor:pointer;" title="Bước 1: Quét hoặc dán link video">
-          <div class="step-num">1</div>
-          <div class="step-info">
-            <b>1. Nạp Nguồn Video</b>
-            <span>Dán link MXH hoặc Thư mục máy</span>
-          </div>
-        </div>
-        <div class="step-arrow">➔</div>
-        <div class="step-item" onclick="applyShortsBooster()" style="cursor:pointer;" title="Bước 2: Tối ưu 1-Click chuẩn Shorts <= 58.5s">
-          <div class="step-num" style="background:#ec4899;">2</div>
-          <div class="step-info">
-            <b>2. Tối Ưu Shorts 1-Click</b>
-            <span>Ép &le; 58.5s • Lách âm • OLED Pop</span>
-          </div>
-        </div>
-        <div class="step-arrow">➔</div>
-        <div class="step-item" onclick="promptAutoSchedule()" style="cursor:pointer;" title="Bước 3: Lên lịch giãn cách an toàn chống spam">
-          <div class="step-num" style="background:#f59e0b;">3</div>
-          <div class="step-info">
-            <b>3. Lên Lịch Giãn Cách</b>
-            <span>Cách nhau 60 - 120 phút / video</span>
-          </div>
-        </div>
-        <div class="step-arrow">➔</div>
-        <div class="step-item step-run" onclick="startPipeline(true, true, true)" style="cursor:pointer;" title="Bước 4: Chạy toàn bộ quy trình tự động">
-          <div class="step-num">▶</div>
-          <div class="step-info">
-            <b>4. BẮT ĐẦU CHẠY</b>
-            <span>Tải ➔ Render FFmpeg ➔ Đăng Studio</span>
-          </div>
-        </div>
-      </div>
-
       <div class="workspace-grid">
         <!-- Cột Trái: Dự án, Quét Nguồn & Gán Nhanh Dạng Tab -->
         <div>
@@ -480,14 +445,13 @@
               <!-- Dòng 1: Cụm Nút Bắt Đầu Chính & Điều Khiển -->
               <div class="toolbar-row">
                 <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                  <button class="btn btn-run-big" onclick="startPipeline(true, true, true)" title="Chạy tự động: Tải nguồn ➔ Render FFmpeg ➔ Đăng YouTube Studio">
-                    ▶️ CHẠY TOÀN TRÌNH TỰ ĐỘNG
-                  </button>
+                  <button type="button" class="btn btn-outline btn-sm" id="queue-quick-edit" onclick="openQuickQueueEdit()" disabled>Sửa nhanh video đã chọn</button>
+                  <button type="button" class="btn btn-success btn-sm" onclick="startPipeline(false, false, true)" title="Chỉ Đăng YT: xem trước lô video đã dựng">📤 Xem trước &amp; đăng</button>
+                  <button class="btn btn-outline btn-sm" onclick="startPipeline(true, true, true)" title="Tải nguồn, render và đăng YouTube Studio">▶️ Chạy toàn trình tự động</button>
                   <button class="btn btn-outline btn-sm" onclick="previewSelectedDistribution()" title="Xem kênh, chế độ đăng, lịch và cảnh báo trước khi chạy">🔎 Preview Phân Phối</button>
                   <button class="btn btn-outline btn-sm" onclick="reviewUploadSlot()">Kiểm tra lượt upload</button>
                   <button class="btn btn-accent btn-sm" onclick="startPipeline(true, false, false)" title="Chỉ tải video về máy">⬇️ Chỉ Tải</button>
                   <button class="btn btn-purple btn-sm" onclick="startPipeline(false, true, false)" title="Chỉ render lách bản quyền FFmpeg">🎬 Chỉ Render</button>
-                  <button class="btn btn-success btn-sm" onclick="startPipeline(false, false, true)" title="Chỉ đăng lên YouTube">📤 Chỉ Đăng YT</button>
                   <button class="btn btn-warning btn-sm" onclick="stopPipeline()" title="Dừng toàn bộ luồng xử lý">⏹️ Dừng</button>
                 </div>
                 <div>
@@ -1437,6 +1401,29 @@
 
   </main>
 
+  <dialog id="quick-queue-dialog" aria-labelledby="quick-queue-title">
+    <form>
+      <div class="quick-queue-header">
+        <h3 id="quick-queue-title">Sửa nhanh video đã chọn</h3>
+        <p id="quick-queue-summary"></p>
+      </div>
+      <div class="quick-queue-table">
+        <table>
+          <thead>
+            <tr><th scope="col">ID</th><th scope="col">Tiêu đề</th><th scope="col">Kênh và profile</th><th scope="col">Hiển thị</th></tr>
+          </thead>
+          <tbody id="quick-queue-rows"></tbody>
+        </table>
+      </div>
+      <p id="quick-queue-error" role="alert"></p>
+      <div class="quick-queue-actions">
+        <button type="button" class="btn btn-outline btn-sm" onclick="setQuickQueuePrivate()">Đặt tất cả Riêng tư</button>
+        <button type="button" class="btn btn-outline btn-sm" onclick="this.closest('dialog').close()">Đóng</button>
+        <button type="submit" class="btn btn-primary btn-sm">Lưu thay đổi</button>
+      </div>
+    </form>
+  </dialog>
+
   <div id="modal-bulk-description" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="bulk-desc-title">
     <div class="modal-content" style="max-width:960px;">
       <div class="modal-header">
@@ -1859,6 +1846,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=g1-operations"></script>
+  <script src="/static/app.js?v=queue-quick-edit"></script>
 </body>
 </html>

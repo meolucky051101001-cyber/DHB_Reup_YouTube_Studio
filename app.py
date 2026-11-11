@@ -667,7 +667,8 @@ def api_get_queue(project: str = ""):
         p_row = conn.execute("SELECT name FROM projects ORDER BY id ASC LIMIT 1").fetchone()
         project = p_row["name"] if p_row else "Dự án YouTube #1"
     rows = conn.execute(
-        "SELECT * FROM video_queue WHERE project_name = ? ORDER BY id DESC",
+        "SELECT *, COALESCE(claim_token, '') <> '' AS is_claimed "
+        "FROM video_queue WHERE project_name = ? ORDER BY id DESC",
         (project,),
     ).fetchall()
     conn.close()
@@ -897,6 +898,7 @@ def api_upload_video_files(
     added_count = 0
     skipped_count = 0
     added_titles = []
+    added_ids = []
     invalid_files = []
     seen_content_keys = set()
     conn.commit()
@@ -1013,6 +1015,7 @@ def api_upload_video_files(
             continue
         added_count += 1
         added_titles.append(title)
+        added_ids.append(queue_id)
         try:
             register_managed_artifact(str(target_path), "upload", "queue", queue_id)
         except Exception as exc:
@@ -1026,7 +1029,7 @@ def api_upload_video_files(
     add_log("Upload", log_msg, "SUCCESS")
     return {
         "ok": True, "added": added_count, "skipped": skipped_count,
-        "titles": added_titles, "invalid_files": invalid_files,
+        "titles": added_titles, "added_ids": added_ids, "invalid_files": invalid_files,
     }
 
 
@@ -1214,6 +1217,7 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
 
     added_count = 0
     added_titles = []
+    added_ids = []
     conn = get_conn()
     try:
         with _import_insert_lock:
@@ -1230,7 +1234,7 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
                 item_schedule = (start_dt + timedelta(minutes=added_count * schedule_interval_minutes)).strftime("%Y-%m-%d %H:%M:%S") if start_dt else ""
                 item_premiere = final_settings["is_premiere"] if start_dt else 0
 
-                conn.execute(
+                cursor = conn.execute(
                     """
                     INSERT INTO video_queue (
                         project_name, source_type, platform, post_id, source_url, input_video_path,
@@ -1265,6 +1269,7 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
                 )
                 added_count += 1
                 added_titles.append(title)
+                added_ids.append(int(cursor.lastrowid))
 
             conn.commit()
     finally:
@@ -1273,7 +1278,64 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
     if skipped_count:
         log_msg += f" Bỏ qua {skipped_count} video đã có trong dự án."
     add_log("Scanner", log_msg, "SUCCESS")
-    return {"ok": True, "added": added_count, "skipped": skipped_count, "titles": added_titles}
+    return {"ok": True, "added": added_count, "skipped": skipped_count,
+            "titles": added_titles, "added_ids": added_ids}
+
+
+@app.post("/api/queue/quick-edit")
+def api_quick_edit_queue(data: Dict[str, Any] = Body(...)):
+    edits = data.get("items")
+    project = data.get("project")
+    if not isinstance(edits, list) or not edits or not isinstance(project, str) or not project:
+        raise HTTPException(400, "Chọn dự án và video cần lưu.")
+
+    changes = {}
+    for edit in edits:
+        if not isinstance(edit, dict) or type(edit.get("id")) is not int or edit["id"] <= 0:
+            raise HTTPException(400, "ID video không hợp lệ.")
+        item_id = edit["id"]
+        if item_id in changes or not edit.keys() <= {"id", "title", "target_channel_id", "visibility"}:
+            raise HTTPException(400, f"Video #{item_id} có thay đổi không hợp lệ.")
+        changes[item_id] = {key: value for key, value in edit.items() if key != "id"}
+
+    conn = get_conn()
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _ensure_queue_items_idle(conn, changes, "sửa nhanh video")
+            for item_id, updates in changes.items():
+                row = conn.execute(
+                    "SELECT * FROM video_queue WHERE id = ? AND project_name = ?", (item_id, project),
+                ).fetchone()
+                if not row:
+                    raise HTTPException(404, f"Video #{item_id} không còn trong dự án.")
+                current = dict(row)
+                if current["status"] == "Completed" or current["published_url"]:
+                    raise HTTPException(409, f"Video #{item_id} đã đăng.")
+                if "title" in updates:
+                    if not isinstance(updates["title"], str):
+                        raise HTTPException(400, f"Tiêu đề video #{item_id} không hợp lệ.")
+                    try:
+                        updates["title"] = validate_metadata_fields(
+                            {"title": updates["title"]}, require_title=True,
+                        )["title"]
+                    except ValueError as exc:
+                        raise HTTPException(400, f"Video #{item_id}: {exc}") from exc
+                if "visibility" in updates:
+                    if updates["visibility"] not in ("private", "unlisted", "public"):
+                        raise HTTPException(400, f"Chế độ hiển thị video #{item_id} không hợp lệ.")
+                    updates.update(schedule_time="", is_premiere=0)
+                if "target_channel_id" in updates:
+                    channel_id = updates["target_channel_id"]
+                    if type(channel_id) is not int or channel_id <= 0:
+                        raise HTTPException(400, f"Kênh đích video #{item_id} không hợp lệ.")
+                    updates = _queue_target_updates(conn, updates, current)
+                if updates:
+                    columns = ", ".join(f"{key} = ?" for key in updates)
+                    conn.execute(f"UPDATE video_queue SET {columns} WHERE id = ?", [*updates.values(), item_id])
+    finally:
+        conn.close()
+    return {"ok": True}
 
 
 @app.post("/api/queue/bulk-update")

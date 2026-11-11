@@ -264,7 +264,7 @@ async function uploadVideoFiles(files) {
       }, 2500);
       const fileInput = document.getElementById('file-upload-input');
       if (fileInput) fileInput.value = '';
-      await loadQueue();
+      await selectImportedVideos(proj, resp);
     } else {
       alert('Lỗi tải file lên: ' + xhr.responseText);
       if (statusBox) statusBox.style.display = 'none';
@@ -314,15 +314,23 @@ async function browseNativeFiles() {
       }),
     });
 
-    if (!addRes.added && addRes.skipped) {
-      alert(`ℹ️ ${addRes.skipped} video đã có trong dự án [${proj}] — không thêm trùng.`);
-    } else {
-      const skipNote = addRes.skipped ? ` (bỏ qua ${addRes.skipped} video đã có)` : '';
-      alert(`✅ Đã thêm trực tiếp ${addRes.added} video từ máy tính vào dự án [${proj}]!${skipNote}`);
-    }
-    await loadQueue();
+    const skipNote = addRes.skipped ? ` · Bỏ qua ${addRes.skipped} video đã có` : '';
+    showToast(`Đã nạp ${addRes.added} video vào [${proj}]${skipNote}`, addRes.added ? 'info' : 'warning');
+    await selectImportedVideos(proj, addRes);
   } catch (e) {
     alert('Lỗi chọn file: ' + e.message);
+  }
+}
+
+async function selectImportedVideos(project, result) {
+  if (!result.added_ids?.length || (document.getElementById('sel-project').value || 'Default') !== project) return;
+  const search = document.getElementById('queue-search');
+  search.value = '';
+  gSelectedIds = new Set(result.added_ids);
+  try {
+    await loadQueue(true);
+  } catch (e) {
+    showToast('Video đã được nạp. Tải lại bảng để xem video mới.', 'warning');
   }
 }
 
@@ -1526,6 +1534,7 @@ async function loadQueue(preserveSelection = false) {
     gPendingBannerDismissed = false;
   }
   const items = await apiFetch(`/api/queue?project=${encodeURIComponent(proj)}`);
+  if ((document.getElementById('sel-project').value || 'Default') !== proj) return;
   gQueueItems = items || [];
   updatePendingQueueBanner(gQueueItems);
   if (!preserveSelection) {
@@ -1698,6 +1707,8 @@ function updateQueueSelectionSummary() {
   const selected = Array.from(gSelectedIds).filter(id => currentIds.has(Number(id)));
   const visible = getVisibleQueueIds();
   const hiddenCount = selected.filter(id => !visible.includes(Number(id))).length;
+  const quickEdit = document.getElementById('queue-quick-edit');
+  if (quickEdit) quickEdit.disabled = selected.length === 0;
   if (summary) {
     summary.textContent = selected.length
       ? `Đã chọn ${selected.length} video${hiddenCount ? ` (${hiddenCount} dòng đang ẩn)` : ''}; thao tác dùng đủ số đã chọn.`
@@ -1709,6 +1720,104 @@ function updateQueueSelectionSummary() {
     selectAll.checked = visible.length > 0 && selectedVisible === visible.length;
     selectAll.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
   }
+}
+
+function openQuickQueueEdit() {
+  const dialog = document.getElementById('quick-queue-dialog');
+  const selected = gQueueItems.filter(item => gSelectedIds.has(item.id));
+  const busy = /^(Uploading|Đang đăng|Rendering|Đang Render|Downloading|Đang tải|Chờ giãn cách)/;
+  const items = selected.filter(item => !item.is_claimed && !item.published_url &&
+    !['Completed', 'NeedsReview'].includes(item.status) && !busy.test(item.status || ''));
+  if (!items.length) {
+    showToast('Chọn video chưa đăng, không đang xử lý hoặc cần đối soát.', 'warning');
+    return;
+  }
+
+  const form = dialog.querySelector('form');
+  const rows = document.getElementById('quick-queue-rows');
+  const byProfile = new Map();
+  gChannels.filter(channel => channel.channel_id && channel.profile_name).forEach(channel => {
+    if (!byProfile.has(channel.profile_name)) byProfile.set(channel.profile_name, []);
+    byProfile.get(channel.profile_name).push(channel);
+  });
+  const channels = Array.from(byProfile, ([profile, list]) =>
+    `<optgroup label="${escapeHtml(profile)}">${list.map(channel =>
+      `<option value="${channel.id}">${escapeHtml([channel.name, channel.handle, profile].filter(Boolean).join(' · '))}</option>`
+    ).join('')}</optgroup>`).join('');
+  const modes = { private: 'Riêng tư', unlisted: 'Không công khai', public: 'Công khai', schedule: 'Đã đặt lịch' };
+  rows.innerHTML = items.map(item => {
+    const channel = gChannels.find(ch => ch.id === (item.assigned_channel_id || item.target_channel_id));
+    const destination = channel ? [channel.name, channel.profile_name].filter(Boolean).join(' · ')
+      : item.target_profile_name || groupNamesFromItem(item).join(' + ') || 'Chưa chọn kênh cụ thể';
+    const mode = modes[item.visibility] || item.visibility || 'Chưa đặt';
+    return `<tr data-id="${item.id}">
+      <td>#${item.id}</td>
+      <td><input aria-label="Tiêu đề #${item.id}" name="title" value="${escapeHtml(item.title || '')}"></td>
+      <td><select aria-label="Kênh và profile #${item.id}" name="channel">
+        <option value="">Giữ: ${escapeHtml(destination)}</option>${channels}
+      </select></td>
+      <td><select aria-label="Hiển thị #${item.id}" name="visibility">
+        <option value="">Giữ: ${escapeHtml(mode)}</option>
+        <option value="private">Riêng tư</option>
+        <option value="unlisted">Không công khai</option>
+        <option value="public">Công khai</option>
+      </select></td>
+    </tr>`;
+  }).join('');
+  const project = document.getElementById('sel-project').value;
+  document.getElementById('quick-queue-summary').textContent = `${project} · ${items.length} video` +
+    (selected.length > items.length ? ` · Bỏ qua ${selected.length - items.length} video đã đăng, đang xử lý hoặc cần đối soát` : '');
+  const error = document.getElementById('quick-queue-error');
+  error.textContent = '';
+  const buttons = Array.from(form.querySelectorAll('button'));
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const edits = items.map((item, index) => {
+      const row = rows.rows[index];
+      const title = row.querySelector('[name="title"]').value.trim();
+      const channel = row.querySelector('[name="channel"]').value;
+      const visibility = row.querySelector('[name="visibility"]').value;
+      const edit = { id: item.id };
+      if (title !== (item.title || '').trim()) edit.title = title;
+      if (channel) edit.target_channel_id = Number(channel);
+      if (visibility && visibility !== item.visibility) edit.visibility = visibility;
+      return edit;
+    }).filter(edit => Object.keys(edit).length > 1);
+    if (!edits.length) {
+      dialog.close();
+      return;
+    }
+    buttons.forEach(button => { button.disabled = true; });
+    error.textContent = '';
+    try {
+      await apiFetch('/api/queue/quick-edit', {
+        method: 'POST',
+        body: JSON.stringify({ project, items: edits }),
+      });
+    } catch (e) {
+      error.textContent = e.message;
+      return;
+    } finally {
+      buttons.forEach(button => { button.disabled = false; });
+    }
+    dialog.close();
+    showToast(`Đã lưu ${edits.length} video. Chọn “Xem trước & đăng” để kiểm tra lô.`);
+    try {
+      await loadQueue(true);
+    } catch (e) {
+      showToast('Đã lưu thay đổi. Tải lại bảng để xem thông tin mới.', 'warning');
+    }
+  };
+  dialog.oncancel = event => {
+    if (buttons.some(button => button.disabled)) event.preventDefault();
+  };
+  dialog.showModal();
+}
+
+function setQuickQueuePrivate() {
+  document.querySelectorAll('#quick-queue-rows select[name="visibility"]').forEach(select => {
+    select.value = 'private';
+  });
 }
 
 function getTargetIdsOrAlert() {
@@ -2667,6 +2776,7 @@ function formatDistributionPreview(preview) {
   const rows = (preview && preview.items) || [];
   const profiles = new Map();
   const channels = new Map();
+  const visibility = { private: 'Riêng tư', unlisted: 'Không công khai', public: 'Công khai' };
   const lines = rows.map(item => {
     const target = item.channel_name ? `${item.channel_name} (${item.youtube_channel_id || '#' + item.channel_id})` : 'chưa có kênh';
     const profile = [item.profile_name, item.antidetect_profile_id].filter(Boolean).join(' / ') || 'profile mặc định';
@@ -2675,7 +2785,8 @@ function formatDistributionPreview(preview) {
       channels.set(target, (channels.get(target) || 0) + 1);
     }
     const groups = item.groups && item.groups.length ? ` · nhóm ${item.groups.join(' + ')}` : '';
-    const schedule = item.visibility === 'schedule' ? ` · ⏰ ${item.schedule_time || 'thiếu lịch'}` : ` · ${item.visibility}`;
+    const schedule = item.visibility === 'schedule' ? ` · Lên lịch: ${item.schedule_time || 'thiếu lịch'}`
+      : ` · ${visibility[item.visibility] || item.visibility || 'Chưa rõ chế độ'}`;
     const prefix = item.blocked ? '⛔' : '•';
     const suffix = [...(item.reasons || []), ...(item.warnings || []).map(w => `cảnh báo: ${w}`)];
     const file = item.file_kind ? ` · ${item.file_kind}${item.file_name ? ` (${item.file_name})` : ''}` : '';

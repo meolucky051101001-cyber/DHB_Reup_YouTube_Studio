@@ -68,8 +68,8 @@ Mở Antidetect trước nếu dùng profile Antidetect. Lô thủ công chỉ b
 ## Đăng video theo lô
 
 1. Trong **Quản Lý Kênh & Profile Chrome**, xác nhận phiên đăng nhập và kênh YouTube đích đã có Channel ID. Dùng **Đồng Bộ Antidetect** khi cần lấy profile mới.
-2. Chọn dự án, bấm **Chọn Tệp Từ Máy** hoặc kéo thả video. Mở ✏️ trên mỗi dòng để sửa tiêu đề, chọn **Profile Chrome** rồi **Kênh YouTube Đích**, và đặt chế độ hiển thị. Một profile có thể chứa nhiều kênh, nên hãy chọn kênh cụ thể nếu cần gán chính xác.
-3. Tích đúng các dòng cần chạy. Chọn **Chỉ Đăng YT** cho file đã dựng, hoặc **Chạy Toàn Trình Tự Động** nếu cần tải, render và đăng. Trong Preview của lần chạy, đọc lại file sẽ gửi, kênh, profile, chế độ và lịch rồi xác nhận một lần.
+2. Chọn dự án rồi nạp file. Tool tự chọn các video mới thêm. Dùng **Sửa nhanh video đã chọn** để đặt tiêu đề, kênh kèm profile và chế độ hiển thị cho từng video trong cùng một bảng.
+3. Kiểm tra các dòng đang chọn. Bấm **Xem trước & đăng** cho file đã dựng hoặc **Chạy toàn trình tự động** nếu cần tải, render và đăng. Đọc lại file sẽ gửi, kênh, profile, chế độ và lịch rồi xác nhận một lần.
 4. Theo dõi hàng đợi và **Kiểm tra lượt upload**. Khoảng nghỉ tối thiểu là 30 phút dùng chung cho các profile. **Đã đăng** có link đối chiếu. Với **Cần đối soát** (`NeedsReview`), kiểm tra đúng kênh trên Studio trước khi quyết định cho phép đăng lại.
 5. Bấm **Dừng** để ngừng nhận video tiếp theo. Lượt upload đã bắt đầu được chờ hoàn tất. Kiểm tra Chẩn đoán báo worker batch đã dừng và monitor liên quan cũng đã dừng trước khi tắt DHB hoặc máy.
 

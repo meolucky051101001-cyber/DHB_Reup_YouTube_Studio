@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -263,6 +264,8 @@ class UploadDedupeTests(unittest.TestCase):
             )
         self.assertEqual(res1["added"], 1)
         self.assertEqual(res1["skipped"], 1)
+        queued = app_module.api_get_queue("Dự án Upload Test")
+        self.assertEqual(res1["added_ids"], [row["id"] for row in queued])
 
         with mock.patch.object(app_module, "probe_video_info", return_value=valid_probe):
             res2 = app_module.api_upload_video_files(
@@ -275,10 +278,60 @@ class UploadDedupeTests(unittest.TestCase):
             )
         self.assertEqual(res2["added"], 0)
         self.assertEqual(res2["skipped"], 1)
+        self.assertEqual(res2["added_ids"], [])
 
         uploads_dir = app_module.APP_TEMP_DIR / "uploads"
         leftovers = list(uploads_dir.glob("clip*.mp4")) if uploads_dir.exists() else []
         self.assertEqual(len(leftovers), 1, "Chỉ đúng 1 file được giữ lại, bản trùng phải bị dọn")
+
+
+class QuickQueueEditTests(unittest.TestCase):
+    def setUp(self):
+        self.project = self.id()
+        with closing(database.get_conn()) as conn, conn:
+            self.channel = conn.execute(
+                "INSERT INTO youtube_channels (name, profile_name) VALUES ('Quick edit channel', 'Quick edit profile')"
+            ).lastrowid
+            self.items = [
+                conn.execute(
+                    "INSERT INTO video_queue (project_name, title, tags, visibility, schedule_time, is_premiere) "
+                    "VALUES (?, ?, 'original tags', 'schedule', '2099-01-01 00:00:00', 1)",
+                    (self.project, title),
+                ).lastrowid
+                for title in ("First", "Second")
+            ]
+
+    def test_saves_distinct_rows_and_keeps_fields_omitted_from_each_edit(self):
+        first, second = self.items
+        app_module.api_quick_edit_queue({
+            "project": self.project,
+            "items": [
+                {"id": first, "title": "Edited", "target_channel_id": self.channel, "visibility": "private"},
+                {"id": second, "title": "Other title"},
+            ],
+        })
+        rows = {row["id"]: row for row in app_module.api_get_queue(self.project)}
+        self.assertEqual(
+            [rows[first][key] for key in (
+                "title", "target_type", "target_channel_id", "target_profile_name",
+                "visibility", "schedule_time", "is_premiere", "tags",
+            )],
+            ["Edited", "CHANNEL", self.channel, "Quick edit profile", "private", "", 0, "original tags"],
+        )
+        self.assertEqual(rows[second]["title"], "Other title")
+        self.assertEqual(rows[second]["visibility"], "schedule")
+        self.assertEqual(rows[second]["schedule_time"], "2099-01-01 00:00:00")
+
+    def test_invalid_second_edit_rolls_back_first(self):
+        first, second = self.items
+        with self.assertRaises(HTTPException) as ctx:
+            app_module.api_quick_edit_queue({
+                "project": self.project,
+                "items": [{"id": first, "title": "Edited"}, {"id": second, "title": " "}],
+            })
+        self.assertEqual(ctx.exception.status_code, 400)
+        rows = {row["id"]: row for row in app_module.api_get_queue(self.project)}
+        self.assertEqual(rows[first]["title"], "First")
 
 
 class ManualUploadDecisionTests(unittest.TestCase):

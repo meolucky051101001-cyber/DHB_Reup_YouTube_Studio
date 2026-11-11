@@ -11,10 +11,10 @@ Dùng hướng dẫn này để chạy một lô có giám sát, đối soát k�
 
 ## Nạp, chọn đích và chạy
 
-1. Chọn dự án trong **Bảng Điều Khiển & Dự Án**. Bấm **Chọn Tệp Từ Máy** hoặc kéo thả file rồi kiểm tra các dòng vừa nạp.
-2. Bấm ✏️ trên từng dòng. Sửa tiêu đề và metadata, chọn **Profile Chrome** rồi **Kênh YouTube Đích**, đặt chế độ hiển thị và lưu. Với lượt thử, chọn **Riêng tư**. Để nhóm đích trống nếu đã gán kênh cụ thể.
-3. Tích đúng các dòng. Chọn **Chỉ Đăng YT** cho video đã dựng hoặc **Chạy Toàn Trình Tự Động** khi cần tải, render và đăng. Nếu chưa tích dòng nào, giao diện có thể đề nghị chạy tất cả dòng đang hiển thị. Hủy hộp thoại và chọn từng dòng nếu phạm vi đó rộng hơn dự kiến. Khi cần giữ thứ tự lô như Preview, đặt **Số Luồng Chạy Song Song Tối Đa** thành 1 trong Cài đặt trước khi chạy.
-4. Đọc Preview của nút chạy vừa chọn. So khớp ID hàng đợi, kênh, profile, chế độ hiển thị, lịch và file. Với **Chỉ Đăng YT**, một bản render có sẵn có thể được ưu tiên hơn file nguồn. Nếu thay đổi đích, file hoặc cấu hình, lưu rồi xem Preview mới. Xác nhận một lần khi các dòng đều đúng.
+1. Chọn dự án trong **Bảng Điều Khiển & Dự Án**. Bấm **Chọn Tệp Từ Máy**, kéo thả video hoặc dùng **Duyệt File Windows**. Tool tự tích những dòng mới thêm trong dự án hiện tại.
+2. Mở **Sửa nhanh video đã chọn**. Sửa tiêu đề, chọn kênh cùng profile và đặt chế độ hiển thị cho mỗi dòng rồi lưu một lần. Với lượt thử, có thể bấm **Đặt tất cả Riêng tư**. Dùng ✏️ trên từng dòng để chỉnh mô tả, lịch và các tùy chọn chi tiết.
+3. Kiểm tra các dòng đang tích. Chọn **Xem trước & đăng** cho video đã dựng hoặc **Chạy toàn trình tự động** khi cần tải, render và đăng. Nếu chưa tích dòng nào, giao diện có thể đề nghị chạy tất cả dòng đang hiển thị. Hủy hộp thoại và chọn từng dòng nếu phạm vi đó rộng hơn dự kiến. Khi cần giữ thứ tự lô như Preview, đặt **Số Luồng Chạy Song Song Tối Đa** thành 1 trong Cài đặt trước khi chạy.
+4. Đọc Preview của nút chạy vừa chọn. So khớp ID hàng đợi, kênh, profile, chế độ hiển thị, lịch và file. Với **Xem trước & đăng**, một bản render có sẵn có thể được ưu tiên hơn file nguồn. Nếu thay đổi đích, file hoặc cấu hình, lưu rồi xem Preview mới. Xác nhận một lần khi các dòng đều đúng.
 5. Theo dõi lô. Mỗi lần chỉ một video giữ lượt upload. Cooldown tối thiểu 30 phút dùng chung giữa các profile, tính từ khi lượt trước kết thúc. Lịch phát hành trên YouTube là thiết lập riêng. Với **Đã đăng** (`Completed`), mở link và kiểm tra ID, kênh, chế độ hiển thị trong Studio bằng phiên có quyền xem.
 6. Để kết thúc sớm, bấm **Dừng**. Tool ngừng nhận video mới và chờ lượt upload đã bắt đầu hoàn tất. Đợi thông báo **Đang dừng lô** biến mất và Chẩn đoán báo worker batch đã dừng, active bằng 0. Nếu có monitor, dừng riêng trong tab monitor rồi kiểm tra worker và heartbeat trước khi tắt máy hoặc dịch vụ.
 
