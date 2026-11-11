@@ -25,6 +25,11 @@ from antidetect_client import (
 
 CHUNK_SIZE = 8 * 1024 * 1024  # 8MB giống SliceBytes của DHB jFbxQL
 
+
+class UploadNotSent(RuntimeError):
+    """A guard rejected this operation before any file was sent to Studio."""
+
+
 _PROFILE_LOCKS_GUARD = threading.Lock()
 _PROFILE_LOCKS: Dict[str, threading.Lock] = {}
 
@@ -2683,7 +2688,8 @@ def _collect_studio_title_candidates(
 
 
 def _snapshot_studio_exact_title_ids(
-    page, channel_id: str, title: str, upload_to: str = ""
+    page, channel_id: str, title: str, upload_to: str = "", *,
+    attempts: int = 1, on_observation: Optional[Callable[[str], None]] = None,
 ) -> Optional[set]:
     """Chụp ID các video trùng tiêu đề TRƯỚC khi upload để loại trừ video cũ khi xác minh."""
     channel_id = str(channel_id or "").strip()
@@ -2691,11 +2697,26 @@ def _snapshot_studio_exact_title_ids(
         return None
     original_url = str(page.url or "https://studio.youtube.com")
     try:
-        candidates = _collect_studio_title_candidates(
-            page, channel_id, title, upload_to, require_readable=True
-        )
-        return {candidate["id"] for candidate in candidates if candidate["id"]}
-    except Exception:
+        for index in range(attempts):
+            try:
+                if index:
+                    page.wait_for_timeout(2000)
+                candidates = _collect_studio_title_candidates(
+                    page, channel_id, title, upload_to, require_readable=True
+                )
+            except AntidetectNotReady:
+                raise
+            except Exception as exc:
+                detail = (
+                    str(exc) if str(exc).startswith("Không đọc đầy đủ danh sách nội dung tab ")
+                    else type(exc).__name__
+                )
+                if on_observation:
+                    on_observation(f"snapshot {index + 1}/{attempts}: unreadable ({detail})")
+            else:
+                if on_observation:
+                    on_observation(f"snapshot {index + 1}/{attempts}: confirmed")
+                return {candidate["id"] for candidate in candidates if candidate["id"]}
         return None
     finally:
         try:
@@ -3231,20 +3252,26 @@ def upload_via_playwright_studio(
                     video_title=metadata.get("title", ""),
                 )
 
-                known_video_ids = _snapshot_studio_exact_title_ids(
-                    page,
-                    active_channel.get("channel_id", ""),
-                    metadata.get("title", ""),
-                    metadata.get("upload_to", ""),
-                )
+                try:
+                    known_video_ids = _snapshot_studio_exact_title_ids(
+                        page,
+                        active_channel.get("channel_id", ""),
+                        metadata.get("title", ""),
+                        metadata.get("upload_to", ""),
+                        attempts=3,
+                        on_observation=lambda message: add_log(
+                            "Upload", message, "INFO", phase="PreUploadSnapshot",
+                            channel_name=channel.get("name", ""), video_title=metadata.get("title", ""),
+                        ),
+                    )
+                except AntidetectNotReady:
+                    raise
+                except Exception as exc:
+                    raise UploadNotSent("Đã dừng trước khi gửi file vì kiểm tra danh sách Studio gặp lỗi.") from exc
                 if known_video_ids is None:
-                    add_log(
-                        "Upload",
-                        "Không đọc được danh sách video trước khi đăng. Nếu tiếp tục gửi video, "
-                        "lượt này sẽ cần đối soát trực tiếp trong Studio.",
-                        "WARNING",
-                        channel_name=channel.get("name", ""),
-                        video_title=metadata.get("title", ""),
+                    raise UploadNotSent(
+                        "Đã dừng trước khi gửi file vì chưa đọc được đầy đủ danh sách video trong Studio "
+                        "sau 3 lần kiểm tra. Kiểm tra đăng nhập, kênh và kết nối rồi Preview lại."
                     )
 
                 if progress_callback:

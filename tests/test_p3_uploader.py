@@ -152,6 +152,38 @@ class _StudioPage:
 
 
 class UrlAndChecksTests(unittest.TestCase):
+    def test_snapshot_retries_transient_read_and_accepts_verified_empty_tabs(self):
+        page = mock.Mock(url="https://studio.youtube.com/")
+        with mock.patch.object(yu, "_collect_studio_title_candidates", side_effect=[RuntimeError("loading"), []]) as read:
+            result = yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "Pilot", attempts=3)
+        self.assertEqual(result, set())
+        self.assertEqual(read.call_count, 2)
+        page.wait_for_timeout.assert_called_once_with(2000)
+        page.goto.assert_called_once_with(page.url, wait_until="domcontentloaded", timeout=30000)
+
+    def test_unreadable_snapshot_blocks_normal_uploader_before_file_dispatch(self):
+        page = mock.Mock(url="https://studio.youtube.com/")
+        page.locator.return_value.first.count.return_value = 0
+        session = mock.Mock(page=page)
+        metadata = {"title": "Pilot", "upload_to": "Video"}
+        with mock.patch.object(yu, "get_settings", return_value={}), \
+                mock.patch.object(yu, "_channel_antidetect_id", return_value="test-profile"), \
+                mock.patch.object(yu, "_StudioBrowserSession") as browser, \
+                mock.patch.object(yu, "select_studio_channel", return_value=(page, {"channel_id": CHANNEL_ID})), \
+                mock.patch.object(yu, "_collect_studio_title_candidates", side_effect=RuntimeError("loading")) as read, \
+                mock.patch.object(yu, "attach_upload_file") as attach, \
+                mock.patch.object(yu, "human_move_and_click") as click, \
+                mock.patch.object(yu, "discard_and_cancel_upload") as discard, \
+                mock.patch.object(yu, "add_log") as log:
+            browser.return_value.__enter__.return_value = session
+            with self.assertRaises(yu.UploadNotSent):
+                yu.upload_via_playwright_studio("fixture.mp4", metadata, {"id": 1, "name": "Test"})
+        self.assertEqual(read.call_count, 3)
+        attach.assert_not_called()
+        click.assert_not_called()
+        discard.assert_not_called()
+        self.assertEqual(sum(c.kwargs.get("phase") == "PreUploadSnapshot" for c in log.call_args_list), 3)
+
     def test_paginated_result_waits_for_new_rows_and_checks_all_matches(self):
         class PaginatedPage(_StudioPage):
             def __init__(self, first_title, approximate=False):

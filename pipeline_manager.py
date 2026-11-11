@@ -20,7 +20,9 @@ from config import APP_OUTPUT_DIR, APP_TEMP_DIR
 from scanner_downloader import download_video, scan_social_urls
 from render_engine import render_video, generate_thumbnail_from_video
 from ai_engine import ai_optimize_youtube_metadata
-from youtube_uploader import upload_video_to_youtube, validate_upload_preflight, normalize_published_video_url
+from youtube_uploader import (
+    UploadNotSent, upload_video_to_youtube, validate_upload_preflight, normalize_published_video_url,
+)
 from content_identity import normalize_source_url, sha256_file, source_dedupe_key
 from group_distribution import choose_target_channel, target_group_names
 from upload_approval import PreviewStale, approval_item, asset_stamps, encode, upload_source_path
@@ -2083,6 +2085,13 @@ class PipelineManager:
                 _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
                 add_log("Pipeline", f"Đã dừng xử lý video: {title}", "WARNING", video_title=title)
         except Exception as e:
+            if upload_started and isinstance(e, UploadNotSent):
+                if owner == "batch":
+                    self._stop_event.set()
+                _finish_upload_attempt(upload_attempt_id, "NotSent", error_message=str(e))
+                _update_row(status="Error", error_message=str(e))
+                add_log("Upload", str(e), "ERROR", video_title=title, error_code="ERR_STUDIO_BASELINE")
+                return
             if upload_started and isinstance(e, AntidetectNotReady):
                 _finish_upload_attempt(upload_attempt_id, "NotSent", error_message=str(e))
                 _update_row(status="Error", error_message=str(e))

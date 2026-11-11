@@ -116,6 +116,32 @@ class UploadHardeningTests(unittest.TestCase):
             self.assertEqual(tuple(row), ("Completed", ""))
         self.assertEqual(pm.upload_slot_recovery_status()["state"], "cooldown")
 
+    def test_missing_baseline_is_not_sent_and_stops_the_batch(self):
+        manager = pm.PipelineManager()
+        options = [False, False, True]
+        token = manager.preview_distribution([901], options)["preview_token"]
+        manager._freeze_batch_assignments([901], token, options, "baseline-blocked")
+        with mock.patch.object(pm, "upload_video_to_youtube", side_effect=pm.UploadNotSent("baseline unavailable")):
+            manager._process_single_item_safe(901, 0, *options, threading.Semaphore(0), "baseline-blocked")
+        with closing(database.get_conn()) as conn:
+            self.assertEqual(tuple(conn.execute("SELECT status, claim_token FROM video_queue WHERE id=901").fetchone()), ("Error", ""))
+            self.assertEqual(conn.execute("SELECT outcome FROM upload_attempts WHERE queue_id=901").fetchone()[0], "NotSent")
+            self.assertEqual(conn.execute("SELECT count(*) FROM content_reservations WHERE queue_id=901").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM published_history").fetchone()[0], 0)
+        self.assertTrue(manager._stop_event.is_set())
+        self.assertEqual(pm.upload_slot_recovery_status()["state"], "cooldown")
+
+    def test_unknown_uploader_error_still_requires_review(self):
+        manager = pm.PipelineManager()
+        options = [False, False, True]
+        token = manager.preview_distribution([901], options)["preview_token"]
+        manager._freeze_batch_assignments([901], token, options, "unknown-dispatch")
+        with mock.patch.object(pm, "upload_video_to_youtube", side_effect=RuntimeError("connection lost")):
+            manager._process_single_item_safe(901, 0, *options, threading.Semaphore(0), "unknown-dispatch")
+        with closing(database.get_conn()) as conn:
+            self.assertEqual(conn.execute("SELECT status FROM video_queue WHERE id=901").fetchone()[0], "NeedsReview")
+            self.assertEqual(conn.execute("SELECT state FROM content_reservations WHERE queue_id=901").fetchone()[0], "NeedsReview")
+
     def test_health_rechecks_launch_identity_before_tab_creation(self):
         client = antidetect_client.AntidetectClient()
         state = {"port": 12345, "status": "running", "cdp_health": {"state": "healthy", "launch_id": "new"}}
