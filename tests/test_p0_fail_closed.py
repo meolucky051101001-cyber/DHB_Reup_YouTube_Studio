@@ -173,39 +173,20 @@ class FailClosedSourceTests(unittest.TestCase):
 
 
 class StopSemanticsTests(unittest.TestCase):
-    class _FakeConn:
-        def __init__(self):
-            self.statements = []
-
-        def execute(self, sql, params=()):
-            self.statements.append((sql, params))
-            return self
-
-        def commit(self):
-            pass
-
-        def close(self):
-            pass
-
-    def test_stop_keeps_uploading_rows_and_running_flag(self):
-        manager = pm.PipelineManager.__new__(pm.PipelineManager)
-        manager._stop_event = __import__("threading").Event()
+    def test_stop_waits_for_active_workers_without_updating_other_rows(self):
+        manager = pm.PipelineManager()
         manager._is_running = True
-        fake_conn = self._FakeConn()
 
-        with mock.patch.object(pm, "get_conn", return_value=fake_conn), \
+        with mock.patch.object(pm, "get_conn") as connect, \
                 mock.patch.object(pm, "add_log"), \
                 mock.patch("render_engine.kill_all_render_processes") as kill_mock:
-            manager.stop_all()
+            self.assertEqual(manager.stop_all(), "stopping")
+            self.assertEqual(manager.stop_all(), "stopping")
 
         kill_mock.assert_called_once_with(owner="batch")
-
+        connect.assert_not_called()
         self.assertTrue(manager._is_running)
         self.assertTrue(manager._stop_event.is_set())
-        self.assertEqual(len(fake_conn.statements), 1)
-        sql = fake_conn.statements[0][0]
-        self.assertNotIn("Uploading", sql)
-        self.assertIn("Pending", sql)
 
 
 if __name__ == "__main__":

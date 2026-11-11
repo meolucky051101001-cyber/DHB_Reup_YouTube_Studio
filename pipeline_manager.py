@@ -20,10 +20,12 @@ from config import APP_OUTPUT_DIR, APP_TEMP_DIR
 from scanner_downloader import download_video, scan_social_urls
 from render_engine import render_video, generate_thumbnail_from_video
 from ai_engine import ai_optimize_youtube_metadata
-from youtube_uploader import upload_video_to_youtube, validate_upload_preflight, normalize_published_video_url
+from youtube_uploader import (
+    UploadNotSent, upload_video_to_youtube, validate_upload_preflight, normalize_published_video_url,
+)
 from content_identity import normalize_source_url, sha256_file, source_dedupe_key
 from group_distribution import choose_target_channel, target_group_names
-from upload_approval import PreviewStale, approval_item, asset_stamps, encode
+from upload_approval import PreviewStale, approval_item, asset_stamps, encode, upload_source_path
 from antidetect_client import AntidetectNotReady
 from phase4_rules import (
     GROUP_SCHEMA_VERSION, serialize_group_names, validate_metadata_fields,
@@ -547,21 +549,23 @@ def read_last_upload_epoch() -> float:
 
 def read_upload_gap_remaining(now: Optional[float] = None) -> float:
     """Số giây còn phải chờ trước lượt upload kế tiếp (âm = đã đủ giãn cách)."""
-    global _COOLDOWN_ANCHOR
-    current = time.time() if now is None else float(now)
-    with closing(get_conn()) as conn:
+    with _UPLOAD_GAP_LOCK, closing(get_conn()) as conn:
         row = conn.execute("SELECT cooldown_until FROM upload_slot WHERE id = 1").fetchone()
+        current = time.time() if now is None else float(now)
         if row and row["cooldown_until"] is not None:
-            until = row["cooldown_until"]
-            remaining = until - current
-            with _UPLOAD_GAP_LOCK:
-                if _COOLDOWN_ANCHOR is None:
-                    _COOLDOWN_ANCHOR = (until, time.monotonic() + UPLOAD_MIN_GAP_SECONDS)
-                anchor_until, deadline = _COOLDOWN_ANCHOR
-                if anchor_until == until:
-                    remaining = max(remaining, deadline - time.monotonic())
-            return remaining
+            return _cooldown_remaining_locked(row["cooldown_until"], current)
     return read_last_upload_epoch() + UPLOAD_MIN_GAP_SECONDS - current
+
+
+def _cooldown_remaining_locked(until, now):
+    global _COOLDOWN_ANCHOR
+    if until is None:
+        return 0
+    monotonic_now = time.monotonic()
+    if _COOLDOWN_ANCHOR is None or _COOLDOWN_ANCHOR[0] != until:
+        # After a restart, wait a full interval on the monotonic clock.
+        _COOLDOWN_ANCHOR = (until, monotonic_now + UPLOAD_MIN_GAP_SECONDS)
+    return max(until - now, _COOLDOWN_ANCHOR[1] - monotonic_now)
 
 
 def _slot_connection():
@@ -658,11 +662,14 @@ def _recover_upload_slot(conn):
 
 
 def upload_slot_recovery_status():
-    with closing(get_conn()) as conn:
+    with _UPLOAD_GAP_LOCK, closing(get_conn()) as conn:
         row = conn.execute("SELECT state, owner, queue_id, attempt_id, cooldown_until FROM upload_slot WHERE id = 1").fetchone()
         return {
             "state": row["state"], "queue_id": row["queue_id"], "attempt_id": row["attempt_id"],
             "cooldown_until": row["cooldown_until"],
+            "remaining_seconds": max(0, math.ceil(_cooldown_remaining_locked(row["cooldown_until"], time.time())))
+            if row["state"] == "cooldown" else None,
+            "available": not _UPLOAD_GAP_STATE_BROKEN,
             "recovery_id": _log_run_id(row["owner"]) if row["state"] == "recovery_required" else None,
         }
 
@@ -703,7 +710,6 @@ def release_item_claim(item_id: int, token: str):
 
 def reserve_upload_slot(stop_event: threading.Event, queue_id=None):
     """Return a durable ownership token. Elapsed time cannot expire an active owner."""
-    global _COOLDOWN_ANCHOR
     while not stop_event.is_set():
         try:
             with _UPLOAD_GAP_LOCK, closing(_slot_connection()) as conn, conn:
@@ -715,15 +721,7 @@ def reserve_upload_slot(stop_event: threading.Event, queue_id=None):
                     raise UploadGapStateError("Cần đối soát và xác nhận phiên upload cũ đã dừng.")
                 if row["state"] != "active":
                     now = time.time()
-                    until = row["cooldown_until"]
-                    remaining = (until - now) if until is not None else 0
-                    if until is not None:
-                        if _COOLDOWN_ANCHOR is None:
-                            # A restart has no monotonic proof for the persisted cooldown.
-                            _COOLDOWN_ANCHOR = (until, time.monotonic() + UPLOAD_MIN_GAP_SECONDS)
-                        anchor_until, deadline = _COOLDOWN_ANCHOR
-                        if anchor_until == until:
-                            remaining = max(remaining, deadline - time.monotonic())
+                    remaining = _cooldown_remaining_locked(row["cooldown_until"], now)
                     if remaining <= 0 and not stop_event.is_set():
                         owner = uuid.uuid4().hex
                         conn.execute(
@@ -738,6 +736,38 @@ def reserve_upload_slot(stop_event: threading.Event, queue_id=None):
             raise UploadGapStateError(f"Không xác minh được lượt upload: {exc}") from exc
         stop_event.wait(0.5)
     return False
+
+
+def _check_upload_slot_preflight(conn):
+    row = conn.execute("SELECT state FROM upload_slot WHERE id = 1").fetchone()
+    if _UPLOAD_GAP_STATE_BROKEN or not row:
+        raise PreviewStale("Chưa xác nhận được trạng thái lượt upload. Kiểm tra Nhật ký và slot.")
+    if row["state"] == "recovery_required":
+        raise PreviewStale("Lượt upload cũ cần đối soát. Mở Kiểm tra lượt upload trước khi chạy.")
+
+
+def _preview_upload_file(item, options):
+    do_download, do_render, _ = options
+    local = str(item.get("source_type") or "").lower() in {"file", "localfile"} or (
+        str(item.get("platform") or "").lower() in {"localfile", "localupload"}
+    )
+    output = item.get("output_video_path") or ""
+    source = item.get("input_video_path") or ""
+    if do_download and local and (not source or not os.path.isfile(source)):
+        raise PreviewStale("File nguồn local không còn. Chọn lại file hoặc dùng Chỉ Đăng YT nếu còn bản render.")
+    path = source if do_render else upload_source_path(item)
+    file_kind = "render mới" if do_render else "bản render có sẵn" if output else "file nguồn"
+    if do_download and not local and (do_render or not output) and (not path or not os.path.isfile(path)):
+        return {"file_kind": "tải nguồn rồi render" if do_render else "tải từ nguồn", "file_name": ""}
+    try:
+        if not path or not os.path.isfile(path):
+            raise FileNotFoundError
+        with open(path, "rb") as stream:
+            if not stream.read(1):
+                raise OSError
+    except (OSError, ValueError) as exc:
+        raise PreviewStale(f"Không tìm thấy hoặc không đọc được {file_kind}. Kiểm tra lại file đã chọn.") from exc
+    return {"file_kind": file_kind, "file_name": Path(path).name}
 
 
 class PipelineManager:
@@ -764,6 +794,12 @@ class PipelineManager:
     @property
     def is_running(self) -> bool:
         return self._is_running
+
+    @property
+    def batch_state(self) -> str:
+        if not self._is_running:
+            return "idle"
+        return "stopping" if self._stop_event.is_set() else "running"
 
     def clear_stale_claims(self):
         """Phục hồi job mồ côi sau khi app đã giữ singleton lock.
@@ -933,49 +969,24 @@ class PipelineManager:
                 pass
 
     def stop_all(self):
-        self._stop_event.set()
-
-        # 1. Chỉ hủy FFmpeg của làn batch — render của Monitor đang chạy phải sống tiếp,
-        # chỉ dừng theo stop_event riêng của từng monitor.
-        try:
-            from render_engine import kill_all_render_processes
-            kill_all_render_processes(owner="batch")
-        except Exception:
-            pass
-
-        # 2. Chỉ dừng các video CHƯA đăng. Video đang Uploading phải chạy xong
-        # (người dùng chọn "chờ upload hiện tại xong rồi dừng") — đánh dấu
-        # Stopped ngay lúc này sẽ khiến UI báo dừng trong khi Chrome vẫn đăng.
-        # _is_running giữ nguyên True cho tới khi batch worker kết thúc, nhờ đó
-        # không thể start thêm batch mới trong lúc upload cuối đang hoàn tất.
-        try:
-            conn = get_conn()
-            conn.execute("""
-                UPDATE video_queue
-                SET status = 'Stopped',
-                    error_message = 'Đã dừng theo yêu cầu của người dùng'
-                WHERE (status LIKE 'Rendering%'
-                   OR status LIKE 'Đang Render%'
-                   OR status LIKE 'Downloading%'
-                   OR status LIKE 'Đang tải%'
-                   OR status = 'Pending')
-                   AND project_name NOT LIKE 'Monitor -%'
-            """)
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            # Lỗi ở đây khiến UI hiển thị sai trạng thái (vẫn Pending dù đã yêu cầu dừng).
+        with self._lifecycle_lock:
+            if self.batch_state != "running":
+                return self.batch_state
+            self._stop_event.set()
+            # Each worker updates only its own claimed row. Work the batch has
+            # not started keeps its previous state, including other projects.
             try:
-                add_log("Pipeline", f"Không cập nhật được trạng thái Stopped khi dừng lô: {e}", "ERROR")
+                from render_engine import kill_all_render_processes
+                kill_all_render_processes(owner="batch")
             except Exception:
                 pass
 
         add_log(
             "Pipeline",
-            "Đã yêu cầu dừng. Video đang đăng (nếu có) sẽ được hoàn tất trước khi dừng hẳn; "
-            "các video còn lại chưa đăng đã chuyển Stopped.",
+            "Đã yêu cầu dừng lô. Video đang đăng (nếu có) sẽ hoàn tất trước khi dừng hẳn.",
             "WARNING",
         )
+        return "stopping"
 
     def start_batch(
         self,
@@ -1054,6 +1065,7 @@ class PipelineManager:
         try:
             conn.execute("PRAGMA synchronous=FULL")
             conn.execute("BEGIN IMMEDIATE")
+            _check_upload_slot_preflight(conn)
             approval = conn.execute("SELECT * FROM upload_approvals WHERE token = ?", (preview_token,)).fetchone()
             snapshots = dict(conn.execute(
                 "SELECT queue_id, snapshot_json FROM upload_approval_items WHERE token = ?", (preview_token,)
@@ -1083,6 +1095,7 @@ class PipelineManager:
                 channel, frozen_groups = choose_target_channel(conn, item, validate_existing_assignment=True)
                 if snapshots[item_id] != encode(approval_item(conn, item, channel, frozen_groups)):
                     raise PreviewStale(f"Video #{item_id} đã đổi đích hoặc cấu hình. Hãy xem trước lại.")
+                _preview_upload_file(item, options)
                 channel_id = int(channel["id"])
                 groups = frozen_groups
 
@@ -1121,6 +1134,7 @@ class PipelineManager:
 
     @staticmethod
     def preview_distribution(item_ids: List[int], options=None):
+        options = options if options is not None else [True, True, True]
         conn = get_conn()
         previews: List[Dict[str, Any]] = []
         snapshots = {}
@@ -1146,6 +1160,7 @@ class PipelineManager:
                     "blocked": False,
                 }
                 try:
+                    _check_upload_slot_preflight(conn)
                     normalized = validate_queue_fields(item)
                     validate_metadata_fields(item, require_title=True)
                     source_type = str(item.get("source_type") or "").lower()
@@ -1162,8 +1177,15 @@ class PipelineManager:
                     snapshots[item_id] = encode(snapshot)
                     for key in ("youtube_channel_id", "profile_name", "antidetect_profile_id"):
                         entry[key] = snapshot[key]
-                    if not str(channel.get("channel_id") or "").strip():
-                        entry["reasons"].append("kênh đích thiếu Channel ID")
+                    option_id = item.get("option_group_id")
+                    option = conn.execute("SELECT * FROM upload_option_groups WHERE id = ?", (option_id,)).fetchone() if option_id else None
+                    metadata = validate_upload_preflight(item, channel, dict(option) if option else None)
+                    entry["title"] = metadata["title"]
+                    entry["visibility"] = metadata["privacy_status"]
+                    entry["schedule_time"] = metadata["schedule_time"]
+                    entry.update(_preview_upload_file(item, options))
+                    if snapshot["antidetect_profile_id"]:
+                        entry["warnings"].append("Đăng nhập và đúng kênh sẽ được xác minh trong Studio trước khi gửi file.")
                     try:
                         if _history_contains_item(
                             conn, item, int(channel["id"]), str(item.get("content_key") or "").strip()
@@ -1189,7 +1211,7 @@ class PipelineManager:
                 conn.execute("DELETE FROM upload_approval_items WHERE token NOT IN (SELECT token FROM upload_approvals)")
                 conn.execute(
                     "INSERT INTO upload_approvals (token, created_at, state, options_json) VALUES (?, ?, 'preview', ?)",
-                    (token, now, encode(options if options is not None else [True, True, True])),
+                    (token, now, encode(options)),
                 )
                 conn.executemany("INSERT INTO upload_approval_items VALUES (?, ?, ?)", (
                     (token, item_id, snapshot) for item_id, snapshot in snapshots.items()
@@ -1217,9 +1239,6 @@ class PipelineManager:
             except Exception:
                 pass
         finally:
-            with self._lifecycle_lock:
-                self._is_running = False
-                self._active_threads = 0
             try:
                 with closing(get_conn()) as conn:
                     conn.execute("UPDATE video_queue SET claim_token = '' WHERE claim_token = ?", (batch_token,))
@@ -1231,6 +1250,10 @@ class PipelineManager:
                     conn.commit()
             except Exception:
                 pass
+            finally:
+                with self._lifecycle_lock:
+                    self._is_running = False
+                    self._active_threads = 0
 
     def _batch_worker(
         self,
@@ -1538,6 +1561,7 @@ class PipelineManager:
         upload_attempt_id = None
         channel = None
         option_group = None
+        approved_assets = None
 
         try:
             if do_upload:
@@ -1551,6 +1575,7 @@ class PipelineManager:
                     )
                 if channel.get("_approval_snapshot"):
                     option_group = channel["_approval_options"]
+                    approved_assets = list(channel["_approval_snapshot"]["asset_stamps"])
                 elif item.get("option_group_id"):
                     c_opt = get_conn()
                     try:
@@ -1583,7 +1608,12 @@ class PipelineManager:
                     owner_id=item_id,
                 )
                 input_path = dl_res["video_path"]
-                thumb_path = dl_res.get("thumbnail_path") or thumb_path
+                downloaded_thumb = dl_res.get("thumbnail_path")
+                thumb_path = downloaded_thumb or thumb_path
+                if approved_assets is not None:
+                    approved_assets[0] = asset_stamps([input_path])[0]
+                    if downloaded_thumb:
+                        approved_assets[2] = asset_stamps([thumb_path])[0]
                 _update_row(
                     input_video_path=input_path,
                     thumbnail_path=thumb_path,
@@ -1675,6 +1705,8 @@ class PipelineManager:
                     raise RuntimeError(
                         f"Render xong nhưng file đầu ra không hợp lệ hoặc rỗng: {output_path or '(không có đường dẫn)'}"
                     )
+                if approved_assets is not None:
+                    approved_assets[1] = asset_stamps([output_path])[0]
 
                 # Nguồn thumbnail: 'reup' = dùng ảnh gốc của nguồn nếu có (học ReupThumbnail của DHB),
                 # 'generate' = luôn tự chụp từ video render. Mặc định reup.
@@ -1683,6 +1715,8 @@ class PipelineManager:
                     gen_thumb = generate_thumbnail_from_video(output_path or input_path, owner_id=item_id)
                     if gen_thumb:
                         thumb_path = gen_thumb
+                        if approved_assets is not None:
+                            approved_assets[2] = asset_stamps([thumb_path])[0]
 
                 _update_row(
                     output_video_path=output_path,
@@ -1728,7 +1762,7 @@ class PipelineManager:
                 if channel.get("_approval_snapshot"):
                     expected = dict(channel["_approval_snapshot"])
                     expected["paths"] = [input_path, output_path, thumb_path]
-                    expected["asset_stamps"] = asset_stamps(expected["paths"])
+                    expected["asset_stamps"] = approved_assets
 
                     def verify_approval():
                         with closing(get_conn()) as check_conn:
@@ -1857,8 +1891,13 @@ class PipelineManager:
                 if not _update_row(status=f"Uploading -> {channel['name']}", upload_progress=10, error_message=""):
                     _finish_upload_attempt(upload_attempt_id, "NotSent", error_message="Claim đã đổi trước khi gọi uploader.")
                     return
-                _mark_slot_entered(slot_owner, upload_attempt_id)
-                upload_started = True
+                with self._lifecycle_lock:
+                    if se.is_set():
+                        _finish_upload_attempt(upload_attempt_id, "NotSent", error_message="Đã dừng trước khi gửi video.")
+                        _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
+                        return
+                    _mark_slot_entered(slot_owner, upload_attempt_id)
+                    upload_started = True
                 pub_res = upload_video_to_youtube(
                     video_item=fresh_item,
                     channel=channel,
@@ -2046,6 +2085,13 @@ class PipelineManager:
                 _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
                 add_log("Pipeline", f"Đã dừng xử lý video: {title}", "WARNING", video_title=title)
         except Exception as e:
+            if upload_started and isinstance(e, UploadNotSent):
+                if owner == "batch":
+                    self._stop_event.set()
+                _finish_upload_attempt(upload_attempt_id, "NotSent", error_message=str(e))
+                _update_row(status="Error", error_message=str(e))
+                add_log("Upload", str(e), "ERROR", video_title=title, error_code="ERR_STUDIO_BASELINE")
+                return
             if upload_started and isinstance(e, AntidetectNotReady):
                 _finish_upload_attempt(upload_attempt_id, "NotSent", error_message=str(e))
                 _update_row(status="Error", error_message=str(e))

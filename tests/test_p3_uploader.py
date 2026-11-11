@@ -81,6 +81,10 @@ class _StudioList:
     def nth(self, index):
         return self.items[index]
 
+    @property
+    def first(self):
+        return self.items[0] if self.items else self
+
 
 class _StudioText:
     def __init__(self, text):
@@ -148,6 +152,100 @@ class _StudioPage:
 
 
 class UrlAndChecksTests(unittest.TestCase):
+    def test_snapshot_retries_transient_read_and_accepts_verified_empty_tabs(self):
+        page = mock.Mock(url="https://studio.youtube.com/")
+        with mock.patch.object(yu, "_collect_studio_title_candidates", side_effect=[RuntimeError("loading"), []]) as read:
+            result = yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "Pilot", attempts=3)
+        self.assertEqual(result, set())
+        self.assertEqual(read.call_count, 2)
+        page.wait_for_timeout.assert_called_once_with(2000)
+        page.goto.assert_called_once_with(page.url, wait_until="domcontentloaded", timeout=30000)
+
+    def test_unreadable_snapshot_blocks_normal_uploader_before_file_dispatch(self):
+        page = mock.Mock(url="https://studio.youtube.com/")
+        page.locator.return_value.first.count.return_value = 0
+        session = mock.Mock(page=page)
+        metadata = {"title": "Pilot", "upload_to": "Video"}
+        with mock.patch.object(yu, "get_settings", return_value={}), \
+                mock.patch.object(yu, "_channel_antidetect_id", return_value="test-profile"), \
+                mock.patch.object(yu, "_StudioBrowserSession") as browser, \
+                mock.patch.object(yu, "select_studio_channel", return_value=(page, {"channel_id": CHANNEL_ID})), \
+                mock.patch.object(yu, "_collect_studio_title_candidates", side_effect=RuntimeError("loading")) as read, \
+                mock.patch.object(yu, "attach_upload_file") as attach, \
+                mock.patch.object(yu, "human_move_and_click") as click, \
+                mock.patch.object(yu, "discard_and_cancel_upload") as discard, \
+                mock.patch.object(yu, "add_log") as log:
+            browser.return_value.__enter__.return_value = session
+            with self.assertRaises(yu.UploadNotSent):
+                yu.upload_via_playwright_studio("fixture.mp4", metadata, {"id": 1, "name": "Test"})
+        self.assertEqual(read.call_count, 3)
+        attach.assert_not_called()
+        click.assert_not_called()
+        discard.assert_not_called()
+        self.assertEqual(sum(c.kwargs.get("phase") == "PreUploadSnapshot" for c in log.call_args_list), 3)
+
+    def test_paginated_result_waits_for_new_rows_and_checks_all_matches(self):
+        class PaginatedPage(_StudioPage):
+            def __init__(self, first_title, approximate=False):
+                super().__init__({"short": [_StudioRow(first_title, VIDEO_ID)], "upload": []})
+                self.second_page = False
+                self.refresh_ticks = 0
+                self.approximate = approximate
+
+            def click(self):
+                self.second_page = True
+
+            def evaluate(self, _script):
+                return self.second_page and self.refresh_ticks >= 2
+
+            def count(self):
+                return 1
+
+            def wait_for_timeout(self, _ms):
+                self.refresh_ticks += 1
+                if self.refresh_ticks == 2:
+                    self.rows_by_section["short"] = [_StudioRow("New short", "13t572zFqlw", "Riêng tư")]
+
+            def locator(self, selector):
+                if self.section == "short" and selector == yu._STUDIO_TABLE_FOOTER:
+                    start = 2 if self.second_page else 1
+                    total = "/khoảng 1" if self.approximate else " of 2"
+                    return _StudioText(f"Rows per page:\n30\n{start} – {start}{total}")
+                if self.section == "short" and selector.endswith("#navigate-after"):
+                    return _StudioList([self])
+                return super().locator(selector)
+
+        page = PaginatedPage("Other title")
+        self.assertEqual(yu._find_published_video_in_studio_content(
+            page, CHANNEL_ID, "New short", "Shorts", "private", set()
+        ), "https://youtu.be/13t572zFqlw")
+        self.assertEqual(page.refresh_ticks, 2)
+        estimated = PaginatedPage("Other title", approximate=True)
+        self.assertEqual(yu._find_published_video_in_studio_content(
+            estimated, CHANNEL_ID, "New short", "Shorts", "private", set()
+        ), "https://youtu.be/13t572zFqlw")
+        self.assertEqual(estimated.refresh_ticks, 2)
+        self.assertEqual(yu._find_published_video_in_studio_content(
+            PaginatedPage("New short"), CHANNEL_ID, "New short", "Shorts", "private", set()
+        ), "")
+
+    def test_approximate_total_or_truncated_page_cannot_confirm_result(self):
+        page = _StudioPage({"short": [_StudioRow("New short", VIDEO_ID)], "upload": []})
+        page.footer_override["short"] = "Số hàng mỗi trang:\n30\n1 – 1/khoảng 1"
+        self.assertIsNone(yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "New short", "Shorts"))
+        page = _StudioPage({"short": [_StudioRow("Other title", VIDEO_ID)] * 101, "upload": []})
+        self.assertIsNone(yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "New short", "Shorts"))
+
+    def test_studio_empty_content_label_observed_in_vietnamese(self):
+        class EmptyContentPage(_StudioPage):
+            def locator(self, selector):
+                if selector == yu._STUDIO_EMPTY_HEADER:
+                    return _StudioText("Không có nội dung")
+                return super().locator(selector)
+
+        page = EmptyContentPage({"short": [], "upload": []})
+        self.assertEqual(yu._snapshot_studio_exact_title_ids(page, CHANNEL_ID, "New short", "Shorts"), set())
+
     def test_fresh_tab_retries_unreadable_and_pending_private_result(self):
         context = mock.Mock()
         observations = [

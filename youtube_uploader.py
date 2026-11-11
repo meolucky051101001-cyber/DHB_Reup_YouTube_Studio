@@ -14,6 +14,8 @@ import requests
 
 from config import APP_PROFILES_DIR
 from database import add_log, get_settings
+from scanner_downloader import probe_video_info
+from upload_approval import upload_source_path
 from antidetect_client import (
     AntidetectNotReady,
     AntidetectBrowserLease,
@@ -22,6 +24,11 @@ from antidetect_client import (
 )
 
 CHUNK_SIZE = 8 * 1024 * 1024  # 8MB giống SliceBytes của DHB jFbxQL
+
+
+class UploadNotSent(RuntimeError):
+    """A guard rejected this operation before any file was sent to Studio."""
+
 
 _PROFILE_LOCKS_GUARD = threading.Lock()
 _PROFILE_LOCKS: Dict[str, threading.Lock] = {}
@@ -2506,12 +2513,14 @@ def _studio_row_video_id(row) -> str:
 _STUDIO_EMPTY_HEADER = "ytcp-video-section-content#video-list .no-content > .no-content-header"
 _STUDIO_TABLE_FOOTER = "ytcp-video-section-content#video-list ytcp-table-footer"
 _STUDIO_FOOTER_RANGE = re.compile(
-    r"(?m)^\s*(\d+)\s*[-–—]\s*(\d+)\s*/\s*(?:khoảng\s*)?(\d+)\s*$"
+    r"(?mi)^[ \t]*(\d+)[ \t]*[-–—][ \t]*(\d+)[ \t]*(?:/|of)[ \t]*"
+    r"(?P<approximate>(?:khoảng|about)[ \t]+)?(?P<total>\d+)[ \t]*$"
 )
+_STUDIO_PAGE_ROW_LIMIT = 100
 _STUDIO_EMPTY_MESSAGE = re.compile(
     r"(?:(?:[^.!?]*\b(?:videos?|shorts?|live streams?|phát trực tiếp)\b[^.!?]*"
     r"(?:will (?:appear|show up) here|sẽ xuất hiện ở đây))"
-    r"|(?:no videos(?: yet)?|chưa có video|không có video))[.!]?"
+    r"|(?:no videos(?: yet)?|no content|chưa có video|không có video|không có nội dung))[.!]?"
 )
 
 
@@ -2538,12 +2547,13 @@ def _studio_content_tab_is_complete(
     match = _STUDIO_FOOTER_RANGE.search(footer.inner_text(timeout=2500))
     if not match:
         return False
-    start, end, total = map(int, match.groups())
+    start, end, total = int(match[1]), int(match[2]), int(match["total"])
     return (
         start == expected_start
         and end >= start
+        and row_count <= _STUDIO_PAGE_ROW_LIMIT
         and end - start + 1 == row_count
-        and total >= end
+        and (match["approximate"] or total >= end)
     )
 
 
@@ -2560,12 +2570,13 @@ def _collect_studio_title_candidates(
         previous_footer = ""
         reported_total = None
         page_index = 0
+        first_ids = set()
         while True:
             try:
                 page.wait_for_selector(f"ytcp-video-row, {_STUDIO_EMPTY_HEADER}", timeout=15000)
             except Exception:
                 if require_readable:
-                    unreadable.append(section)
+                    unreadable.append((section, "rows_timeout"))
                     break
                 page.wait_for_timeout(1500)
             rows = page.locator("ytcp-video-row")
@@ -2574,59 +2585,77 @@ def _collect_studio_title_candidates(
             footer_text = footer.inner_text(timeout=2500) if footer.count() else ""
             if require_readable:
                 if not _studio_content_tab_is_complete(page, content_url, raw_count, expected_start):
-                    unreadable.append(section)
+                    unreadable.append((section, "range_or_route_invalid"))
                     break
                 if raw_count:
                     match = _STUDIO_FOOTER_RANGE.search(footer_text)
-                    page_total = int(match[3]) if match else -1
-                    if reported_total is None:
-                        reported_total = page_total
-                    elif page_total != reported_total:
-                        unreadable.append(section)
+                    if not match:
+                        unreadable.append((section, "footer_changed"))
                         break
-            for index in range(min(raw_count, 100)):
+                    if not match["approximate"]:
+                        page_total = int(match["total"])
+                        if reported_total is not None and page_total != reported_total:
+                            unreadable.append((section, "total_changed"))
+                            break
+                        reported_total = page_total
+                    elif reported_total is not None:
+                        unreadable.append((section, "total_became_approximate"))
+                        break
+                    first_id = _studio_row_video_id(rows.first)
+                    if page_index and (not first_id or first_id in first_ids):
+                        unreadable.append((section, "page_identity_invalid"))
+                        break
+                    first_ids.add(first_id)
+            for index in range(min(raw_count, _STUDIO_PAGE_ROW_LIMIT)):
                 row = rows.nth(index)
                 if not _studio_row_matches_title(row, title, require_readable=require_readable):
                     continue
                 video_id = _studio_row_video_id(row)
                 if require_readable and not video_id:
                     # A matching title without a video ID cannot be safely deduplicated.
-                    unreadable.append(section)
+                    unreadable.append((section, "matching_video_without_id"))
                     break
                 candidates.append(
                     {"id": video_id, "visibility": _studio_row_visibility_state(row, title)}
                 )
-            if unreadable and unreadable[-1] == section:
+            if unreadable and unreadable[-1][0] == section:
                 break
             if require_readable and rows.count() != raw_count:
-                unreadable.append(section)
+                unreadable.append((section, "row_count_changed"))
                 break
             if not require_readable or raw_count == 0:
                 break
 
             match = _STUDIO_FOOTER_RANGE.search(footer_text)
             if not match:
-                unreadable.append(section)
+                unreadable.append((section, "footer_unreadable"))
                 break
-            _start, end, total = map(int, match.groups())
-            if end >= total:
+            end, total = int(match[2]), int(match["total"])
+            approximate = bool(match["approximate"])
+            if not approximate and end == total:
                 break
             next_page = page.locator(f"{_STUDIO_TABLE_FOOTER} ytcp-icon-button#navigate-after").first
             if not next_page.count():
-                unreadable.append(section)
+                unreadable.append((section, "next_control_missing"))
                 break
             is_disabled = next_page.evaluate(
                 "element => element.disabled === true || element.hasAttribute('disabled') "
                 "|| element.getAttribute('aria-disabled') === 'true'"
             )
             if is_disabled:
-                unreadable.append(section)
+                # The estimate never proves the end. An explicit disabled Next
+                # control can, unless it conflicts with a much larger estimate.
+                if not approximate or total - end > _STUDIO_PAGE_ROW_LIMIT:
+                    unreadable.append((section, "next_disabled_before_end"))
                 break
             next_start = end + 1
             previous_first_id = _studio_row_video_id(rows.first)
+            if not previous_first_id:
+                unreadable.append((section, "first_video_without_id"))
+                break
             page_index += 1
             if page_index >= 100:
-                unreadable.append(section)
+                unreadable.append((section, "page_limit"))
                 break
             previous_footer = footer_text
             next_page.click()
@@ -2648,17 +2677,19 @@ def _collect_studio_title_candidates(
                     expected_start = next_start
                     break
             else:
-                unreadable.append(section)
+                unreadable.append((section, "next_page_timeout"))
                 break
     if unreadable:
         raise RuntimeError(
-            "Không đọc đầy đủ danh sách nội dung tab " + ", ".join(sorted(set(unreadable))) + "."
+            "Không đọc đầy đủ danh sách nội dung tab "
+            + ", ".join(f"{section} ({reason})" for section, reason in unreadable) + "."
         )
     return candidates
 
 
 def _snapshot_studio_exact_title_ids(
-    page, channel_id: str, title: str, upload_to: str = ""
+    page, channel_id: str, title: str, upload_to: str = "", *,
+    attempts: int = 1, on_observation: Optional[Callable[[str], None]] = None,
 ) -> Optional[set]:
     """Chụp ID các video trùng tiêu đề TRƯỚC khi upload để loại trừ video cũ khi xác minh."""
     channel_id = str(channel_id or "").strip()
@@ -2666,11 +2697,26 @@ def _snapshot_studio_exact_title_ids(
         return None
     original_url = str(page.url or "https://studio.youtube.com")
     try:
-        candidates = _collect_studio_title_candidates(
-            page, channel_id, title, upload_to, require_readable=True
-        )
-        return {candidate["id"] for candidate in candidates if candidate["id"]}
-    except Exception:
+        for index in range(attempts):
+            try:
+                if index:
+                    page.wait_for_timeout(2000)
+                candidates = _collect_studio_title_candidates(
+                    page, channel_id, title, upload_to, require_readable=True
+                )
+            except AntidetectNotReady:
+                raise
+            except Exception as exc:
+                detail = (
+                    str(exc) if str(exc).startswith("Không đọc đầy đủ danh sách nội dung tab ")
+                    else type(exc).__name__
+                )
+                if on_observation:
+                    on_observation(f"snapshot {index + 1}/{attempts}: unreadable ({detail})")
+            else:
+                if on_observation:
+                    on_observation(f"snapshot {index + 1}/{attempts}: confirmed")
+                return {candidate["id"] for candidate in candidates if candidate["id"]}
         return None
     finally:
         try:
@@ -2709,6 +2755,9 @@ def _find_published_video_in_studio_content(
             candidates = _collect_studio_title_candidates(
                 page, channel_id, title, upload_to, require_readable=True
             )
+        except RuntimeError as exc:
+            if str(exc).startswith("Không đọc đầy đủ danh sách nội dung tab "):
+                result = f"unreadable: {exc}"
         except Exception:
             pass
         else:
@@ -3203,20 +3252,26 @@ def upload_via_playwright_studio(
                     video_title=metadata.get("title", ""),
                 )
 
-                known_video_ids = _snapshot_studio_exact_title_ids(
-                    page,
-                    active_channel.get("channel_id", ""),
-                    metadata.get("title", ""),
-                    metadata.get("upload_to", ""),
-                )
+                try:
+                    known_video_ids = _snapshot_studio_exact_title_ids(
+                        page,
+                        active_channel.get("channel_id", ""),
+                        metadata.get("title", ""),
+                        metadata.get("upload_to", ""),
+                        attempts=3,
+                        on_observation=lambda message: add_log(
+                            "Upload", message, "INFO", phase="PreUploadSnapshot",
+                            channel_name=channel.get("name", ""), video_title=metadata.get("title", ""),
+                        ),
+                    )
+                except AntidetectNotReady:
+                    raise
+                except Exception as exc:
+                    raise UploadNotSent("Đã dừng trước khi gửi file vì kiểm tra danh sách Studio gặp lỗi.") from exc
                 if known_video_ids is None:
-                    add_log(
-                        "Upload",
-                        "Không đọc được danh sách video hiện có để đối chiếu — chỉ chấp nhận bằng chứng "
-                        "từ hộp thoại chia sẻ, không dùng fallback danh sách nội dung.",
-                        "WARNING",
-                        channel_name=channel.get("name", ""),
-                        video_title=metadata.get("title", ""),
+                    raise UploadNotSent(
+                        "Đã dừng trước khi gửi file vì chưa đọc được đầy đủ danh sách video trong Studio "
+                        "sau 3 lần kiểm tra. Kiểm tra đăng nhập, kênh và kết nối rồi Preview lại."
                     )
 
                 if progress_callback:
@@ -3662,16 +3717,18 @@ def upload_via_playwright_studio(
                 if progress_callback:
                     progress_callback(96, "Đã gửi yêu cầu; đang xác minh URL video từ Studio...")
 
-                verified_url = _wait_for_publish_completion(
+                confirmation_url = _wait_for_publish_completion(
                     page, studio_url_before_publish, PUBLISH_CONFIRM_TIMEOUT_SECONDS
                 ) or video_url
-                if not verified_url:
-                    verified_url = _verify_published_video_on_fresh_tab(
-                        context,
-                        active_channel.get("channel_id", ""),
-                        metadata,
-                        known_video_ids,
-                    )
+                verified_url = _verify_published_video_on_fresh_tab(
+                    context,
+                    active_channel.get("channel_id", ""),
+                    metadata,
+                    known_video_ids,
+                )
+                if confirmation_url and verified_url and confirmation_url != verified_url:
+                    add_log("Upload", "ID trong xác nhận lưu khác ID đọc lại từ Studio.", "WARNING", phase="VerifyingResult")
+                    verified_url = ""
 
                 # Đóng hộp thoại xác nhận hoàn tất của Studio để Cookie phiên kịp đồng bộ
                 try:
@@ -3687,7 +3744,7 @@ def upload_via_playwright_studio(
 
                 if not verified_url:
                     uncertain_msg = (
-                        "Đã bấm Xuất bản/Lên lịch nhưng KHÔNG đọc được URL video thật từ hộp thoại hoặc "
+                        "Đã bấm Xuất bản/Lên lịch nhưng chưa xác minh được video và chế độ hiển thị qua "
                         "danh sách Nội dung (Video/Shorts) của YouTube Studio. "
                         "Không thể xác minh video đã đăng thành công — hãy mở Studio kiểm tra trực tiếp "
                         "trước khi chạy lại để tránh đăng trùng."
@@ -3796,9 +3853,10 @@ def upload_video_to_youtube(
     """
     metadata = validate_upload_preflight(video_item, channel, option_group)
     mode = (channel.get("upload_mode") or "playwright").strip().lower()
-    video_path = video_item.get("output_video_path") or video_item.get("input_video_path") or ""
-    if not video_path or not os.path.exists(video_path):
+    video_path = upload_source_path(video_item)
+    if not video_path or not os.path.isfile(video_path):
         raise FileNotFoundError(f"Không tìm thấy file video để upload: {video_path}")
+    probe_video_info(video_path)
 
     if mode == "youtube_api":
         return upload_via_youtube_api(

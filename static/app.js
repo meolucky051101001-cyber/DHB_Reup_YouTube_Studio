@@ -264,7 +264,7 @@ async function uploadVideoFiles(files) {
       }, 2500);
       const fileInput = document.getElementById('file-upload-input');
       if (fileInput) fileInput.value = '';
-      await loadQueue();
+      await selectImportedVideos(proj, resp);
     } else {
       alert('Lỗi tải file lên: ' + xhr.responseText);
       if (statusBox) statusBox.style.display = 'none';
@@ -314,15 +314,23 @@ async function browseNativeFiles() {
       }),
     });
 
-    if (!addRes.added && addRes.skipped) {
-      alert(`ℹ️ ${addRes.skipped} video đã có trong dự án [${proj}] — không thêm trùng.`);
-    } else {
-      const skipNote = addRes.skipped ? ` (bỏ qua ${addRes.skipped} video đã có)` : '';
-      alert(`✅ Đã thêm trực tiếp ${addRes.added} video từ máy tính vào dự án [${proj}]!${skipNote}`);
-    }
-    await loadQueue();
+    const skipNote = addRes.skipped ? ` · Bỏ qua ${addRes.skipped} video đã có` : '';
+    showToast(`Đã nạp ${addRes.added} video vào [${proj}]${skipNote}`, addRes.added ? 'info' : 'warning');
+    await selectImportedVideos(proj, addRes);
   } catch (e) {
     alert('Lỗi chọn file: ' + e.message);
+  }
+}
+
+async function selectImportedVideos(project, result) {
+  if (!result.added_ids?.length || (document.getElementById('sel-project').value || 'Default') !== project) return;
+  const search = document.getElementById('queue-search');
+  search.value = '';
+  gSelectedIds = new Set(result.added_ids);
+  try {
+    await loadQueue(true);
+  } catch (e) {
+    showToast('Video đã được nạp. Tải lại bảng để xem video mới.', 'warning');
   }
 }
 
@@ -617,6 +625,7 @@ async function loadOverview() {
   try {
     const data = await apiFetch('/api/overview');
     gPipelineRunning = !!data.pipeline_running;
+    document.getElementById('queue-stopping-status').hidden = data.batch_state !== 'stopping';
     document.getElementById('st-dhb').textContent = data.dhb_connected ? 'Đã kết nối ổ C' : 'Chưa kết nối';
     document.getElementById('st-channels').textContent = data.channels_count;
     document.getElementById('st-videos').textContent = data.total_videos;
@@ -1525,6 +1534,7 @@ async function loadQueue(preserveSelection = false) {
     gPendingBannerDismissed = false;
   }
   const items = await apiFetch(`/api/queue?project=${encodeURIComponent(proj)}`);
+  if ((document.getElementById('sel-project').value || 'Default') !== proj) return;
   gQueueItems = items || [];
   updatePendingQueueBanner(gQueueItems);
   if (!preserveSelection) {
@@ -1697,6 +1707,8 @@ function updateQueueSelectionSummary() {
   const selected = Array.from(gSelectedIds).filter(id => currentIds.has(Number(id)));
   const visible = getVisibleQueueIds();
   const hiddenCount = selected.filter(id => !visible.includes(Number(id))).length;
+  const quickEdit = document.getElementById('queue-quick-edit');
+  if (quickEdit) quickEdit.disabled = selected.length === 0;
   if (summary) {
     summary.textContent = selected.length
       ? `Đã chọn ${selected.length} video${hiddenCount ? ` (${hiddenCount} dòng đang ẩn)` : ''}; thao tác dùng đủ số đã chọn.`
@@ -1708,6 +1720,104 @@ function updateQueueSelectionSummary() {
     selectAll.checked = visible.length > 0 && selectedVisible === visible.length;
     selectAll.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
   }
+}
+
+function openQuickQueueEdit() {
+  const dialog = document.getElementById('quick-queue-dialog');
+  const selected = gQueueItems.filter(item => gSelectedIds.has(item.id));
+  const busy = /^(Uploading|Đang đăng|Rendering|Đang Render|Downloading|Đang tải|Chờ giãn cách)/;
+  const items = selected.filter(item => !item.is_claimed && !item.published_url &&
+    !['Completed', 'NeedsReview'].includes(item.status) && !busy.test(item.status || ''));
+  if (!items.length) {
+    showToast('Chọn video chưa đăng, không đang xử lý hoặc cần đối soát.', 'warning');
+    return;
+  }
+
+  const form = dialog.querySelector('form');
+  const rows = document.getElementById('quick-queue-rows');
+  const byProfile = new Map();
+  gChannels.filter(channel => channel.channel_id && channel.profile_name).forEach(channel => {
+    if (!byProfile.has(channel.profile_name)) byProfile.set(channel.profile_name, []);
+    byProfile.get(channel.profile_name).push(channel);
+  });
+  const channels = Array.from(byProfile, ([profile, list]) =>
+    `<optgroup label="${escapeHtml(profile)}">${list.map(channel =>
+      `<option value="${channel.id}">${escapeHtml([channel.name, channel.handle, profile].filter(Boolean).join(' · '))}</option>`
+    ).join('')}</optgroup>`).join('');
+  const modes = { private: 'Riêng tư', unlisted: 'Không công khai', public: 'Công khai', schedule: 'Đã đặt lịch' };
+  rows.innerHTML = items.map(item => {
+    const channel = gChannels.find(ch => ch.id === (item.assigned_channel_id || item.target_channel_id));
+    const destination = channel ? [channel.name, channel.profile_name].filter(Boolean).join(' · ')
+      : item.target_profile_name || groupNamesFromItem(item).join(' + ') || 'Chưa chọn kênh cụ thể';
+    const mode = modes[item.visibility] || item.visibility || 'Chưa đặt';
+    return `<tr data-id="${item.id}">
+      <td>#${item.id}</td>
+      <td><input aria-label="Tiêu đề #${item.id}" name="title" value="${escapeHtml(item.title || '')}"></td>
+      <td><select aria-label="Kênh và profile #${item.id}" name="channel">
+        <option value="">Giữ: ${escapeHtml(destination)}</option>${channels}
+      </select></td>
+      <td><select aria-label="Hiển thị #${item.id}" name="visibility">
+        <option value="">Giữ: ${escapeHtml(mode)}</option>
+        <option value="private">Riêng tư</option>
+        <option value="unlisted">Không công khai</option>
+        <option value="public">Công khai</option>
+      </select></td>
+    </tr>`;
+  }).join('');
+  const project = document.getElementById('sel-project').value;
+  document.getElementById('quick-queue-summary').textContent = `${project} · ${items.length} video` +
+    (selected.length > items.length ? ` · Bỏ qua ${selected.length - items.length} video đã đăng, đang xử lý hoặc cần đối soát` : '');
+  const error = document.getElementById('quick-queue-error');
+  error.textContent = '';
+  const buttons = Array.from(form.querySelectorAll('button'));
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const edits = items.map((item, index) => {
+      const row = rows.rows[index];
+      const title = row.querySelector('[name="title"]').value.trim();
+      const channel = row.querySelector('[name="channel"]').value;
+      const visibility = row.querySelector('[name="visibility"]').value;
+      const edit = { id: item.id };
+      if (title !== (item.title || '').trim()) edit.title = title;
+      if (channel) edit.target_channel_id = Number(channel);
+      if (visibility && visibility !== item.visibility) edit.visibility = visibility;
+      return edit;
+    }).filter(edit => Object.keys(edit).length > 1);
+    if (!edits.length) {
+      dialog.close();
+      return;
+    }
+    buttons.forEach(button => { button.disabled = true; });
+    error.textContent = '';
+    try {
+      await apiFetch('/api/queue/quick-edit', {
+        method: 'POST',
+        body: JSON.stringify({ project, items: edits }),
+      });
+    } catch (e) {
+      error.textContent = e.message;
+      return;
+    } finally {
+      buttons.forEach(button => { button.disabled = false; });
+    }
+    dialog.close();
+    showToast(`Đã lưu ${edits.length} video. Chọn “Xem trước & đăng” để kiểm tra lô.`);
+    try {
+      await loadQueue(true);
+    } catch (e) {
+      showToast('Đã lưu thay đổi. Tải lại bảng để xem thông tin mới.', 'warning');
+    }
+  };
+  dialog.oncancel = event => {
+    if (buttons.some(button => button.disabled)) event.preventDefault();
+  };
+  dialog.showModal();
+}
+
+function setQuickQueuePrivate() {
+  document.querySelectorAll('#quick-queue-rows select[name="visibility"]').forEach(select => {
+    select.value = 'private';
+  });
 }
 
 function getTargetIdsOrAlert() {
@@ -2622,12 +2732,8 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
         method: 'POST',
         body: JSON.stringify({ ids, do_download: doDownload, do_render: doRender, do_upload: doUpload }),
       });
-      const previewText = formatDistributionPreview(preview);
-      if (preview.blocked) {
-        alert(`⛔ Có ${preview.blocked} video chưa đủ điều kiện. Sửa các dòng bị chặn rồi xem lại preview.\n\n${previewText}`);
-        return;
-      }
-      if (!preview.preview_id || !await showDistributionDialog(previewText, true)) return;
+      const operation = doRender ? 'Render và đăng' : 'Đăng file có sẵn';
+      if (!await showDistributionDialog(preview, operation, true)) return;
       previewToken = preview.preview_id;
     } catch (e) {
       alert('Không xem được preview phân phối: ' + e.message);
@@ -2662,51 +2768,80 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
   }
 }
 
-function formatDistributionPreview(preview) {
-  const rows = (preview && preview.items) || [];
-  const profiles = new Map();
-  const channels = new Map();
-  const lines = rows.map(item => {
-    const target = item.channel_name ? `${item.channel_name} (${item.youtube_channel_id || '#' + item.channel_id})` : 'chưa có kênh';
-    const profile = [item.profile_name, item.antidetect_profile_id].filter(Boolean).join(' / ') || 'profile mặc định';
-    if (!item.blocked) {
-      profiles.set(profile, (profiles.get(profile) || 0) + 1);
-      channels.set(target, (channels.get(target) || 0) + 1);
-    }
-    const groups = item.groups && item.groups.length ? ` · nhóm ${item.groups.join(' + ')}` : '';
-    const schedule = item.visibility === 'schedule' ? ` · ⏰ ${item.schedule_time || 'thiếu lịch'}` : ` · ${item.visibility}`;
-    const prefix = item.blocked ? '⛔' : '•';
-    const suffix = [...(item.reasons || []), ...(item.warnings || []).map(w => `cảnh báo: ${w}`)];
-    return `${prefix} #${item.id} ${item.title || ''} → ${target} · ${profile}${groups}${schedule}${suffix.length ? `\n    ${suffix.join('; ')}` : ''}`;
-  });
-  const totals = entries => Array.from(entries, ([name, count]) => `${name}: ${count}`).join('\n');
-  return `Theo profile\n${totals(profiles)}\n\nTheo kênh\n${totals(channels)}\n\n${lines.join('\n')}`;
-}
+function showDistributionDialog(preview, operation, allowStart = false) {
+  if (document.querySelector('.upload-preview-dialog[open]')) return Promise.resolve(false);
 
-function showDistributionDialog(text, canStart = false) {
+  const items = preview.items || [];
+  const blocked = items.filter(item => item.blocked).length;
+  const publicCount = items.filter(item => !item.blocked && item.visibility === 'public').length;
+  const canStart = allowStart && items.length > 0 && !blocked && !preview.blocked && Boolean(preview.preview_id);
+  const modes = { private: 'Riêng tư', unlisted: 'Không công khai', public: 'Công khai', schedule: 'Lên lịch' };
+  const counts = [new Map(), new Map()];
+  const list = items.map(item => {
+    if (!item.blocked) {
+      const labels = [
+        [item.channel_name, item.youtube_channel_id].filter(Boolean).join(' · ') || 'Chưa xác định',
+        [item.profile_name, item.antidetect_profile_id].filter(Boolean).join(' · ') || 'Chưa xác định',
+      ];
+      counts.forEach((map, index) => map.set(labels[index], (map.get(labels[index]) || 0) + 1));
+    }
+    const detail = (label, name, id) => `<div><dt>${label}</dt><dd>${escapeHtml(name)}${id ? `<small>${escapeHtml(id)}</small>` : ''}</dd></div>`;
+    const file = item.file_name ? `${item.file_kind || 'File'} · ${item.file_name}` : item.file_kind;
+    const notes = [
+      ...(item.reasons || []).map(text => `<li class="upload-preview-error">${escapeHtml(text)}</li>`),
+      ...(item.warnings || []).map(text => `<li>${escapeHtml(text)}</li>`),
+    ];
+    const group = item.groups?.length ? detail('Nhóm', item.groups.join(' + ')) : '';
+    const visibility = item.visibility === 'schedule'
+      ? `Lên lịch · ${item.schedule_time || 'Chưa có giờ'}`
+      : modes[item.visibility] || 'Chưa rõ';
+    return `
+      <li class="upload-preview-item">
+        <div class="upload-preview-item-title">
+          <h3>#${escapeHtml(item.id)} ${escapeHtml(item.title)}</h3>
+          <span class="upload-preview-badge ${item.visibility === 'public' || item.blocked ? 'upload-preview-warning' : ''}">${escapeHtml(item.blocked ? 'Cần xử lý' : visibility)}</span>
+        </div>
+        <dl>
+          ${detail('Kênh YouTube', item.channel_name || 'Chưa xác định', item.youtube_channel_id)}
+          ${detail('Profile', item.profile_name || 'Chưa xác định', item.antidetect_profile_id)}
+          ${file ? detail('File', file) : ''}
+          ${group}
+        </dl>
+        ${notes.length ? `<ul class="upload-preview-notes">${notes.join('')}</ul>` : ''}
+      </li>`;
+  }).join('');
+  const breakdown = items.length > 1 && counts[0].size ? `
+    <details class="upload-preview-counts">
+      <summary>Số video theo kênh và profile</summary>
+      ${counts.map((map, index) => `<h3>${index === 0 ? 'Kênh YouTube' : 'Profile'}</h3>
+        <ul>${Array.from(map, ([name, count]) => `<li>${escapeHtml(name)} · ${count} video</li>`).join('')}</ul>`
+      ).join('')}
+    </details>` : '';
+
   const dialog = document.createElement('dialog');
-  dialog.setAttribute('aria-label', 'Xem trước phân công YouTube');
-  dialog.style.cssText = 'max-width: min(1000px, 92vw); padding: 1rem;';
-  const content = document.createElement('pre');
-  content.style.cssText = 'white-space: pre-wrap; overflow: auto; max-height: 65vh;';
-  content.textContent = text;
-  const actions = document.createElement('form');
-  actions.method = 'dialog';
-  const close = document.createElement('button');
-  close.value = 'close';
-  close.textContent = 'Đóng';
-  actions.append(close);
-  if (canStart) {
-    const start = document.createElement('button');
-    start.value = 'start';
-    start.textContent = 'Xác nhận phân công và chạy';
-    actions.append(start);
-  }
-  dialog.append(content, actions);
+  dialog.className = 'workspace-dialog upload-preview-dialog';
+  dialog.setAttribute('aria-labelledby', 'upload-preview-title');
+  dialog.innerHTML = `
+    <form method="dialog">
+      <header>
+        <h2 id="upload-preview-title">Xem trước lô đăng YouTube</h2>
+        <p>${escapeHtml(operation)} · ${items.length} video</p>
+        ${blocked ? `<p class="upload-preview-error">${blocked} video cần xử lý. Sửa các dòng bên dưới rồi xem trước lại.</p>` : ''}
+        ${publicCount ? `<p class="upload-preview-warning">${publicCount} video đặt Công khai.</p>` : ''}
+      </header>
+      <div class="upload-preview-body">
+        ${breakdown}
+        <ul class="upload-preview-list" aria-label="Video trong lô">${list}</ul>
+      </div>
+      <footer class="quick-queue-actions">
+        <button type="submit" class="btn btn-outline" value="close" autofocus>Đóng</button>
+        ${canStart ? '<button type="submit" class="btn btn-success" value="start">Xác nhận và chạy</button>' : ''}
+      </footer>
+    </form>`;
   document.body.append(dialog);
   return new Promise(resolve => {
     dialog.addEventListener('close', () => {
-      resolve(dialog.returnValue === 'start');
+      resolve(canStart && dialog.returnValue === 'start');
       dialog.remove();
     }, { once: true });
     dialog.showModal();
@@ -2720,15 +2855,16 @@ async function previewSelectedDistribution() {
     const preview = await apiFetch('/api/queue/preview-distribution', {
       method: 'POST', body: JSON.stringify({ ids }),
     });
-    await showDistributionDialog(`Preview ${preview.total} video · bị chặn ${preview.blocked} · cảnh báo ${preview.warning_count}\n\n${formatDistributionPreview(preview)}`);
+    await showDistributionDialog(preview, 'Xem phân phối cho chế độ chạy toàn trình');
   } catch (e) { alert('Không xem được preview: ' + e.message); }
 }
 
 async function stopPipeline() {
   try {
-    showToast('⏳ Đang phát lệnh dừng khẩn cấp...', 'warning');
     const res = await apiFetch('/api/pipeline/stop', { method: 'POST' });
-    showToast('🛑 Đã dừng toàn bộ tiến trình render và upload!', 'warning');
+    const stopping = res.batch_state === 'stopping';
+    document.getElementById('queue-stopping-status').hidden = !stopping;
+    showToast(stopping ? 'Đã yêu cầu dừng. Video đang upload sẽ hoàn tất trước khi dừng hẳn.' : 'Lô hiện đã dừng.', 'warning');
     await loadQueue(true);
     await loadLogs();
   } catch (e) {
@@ -2739,6 +2875,10 @@ async function stopPipeline() {
 async function reviewUploadSlot() {
   try {
     const slot = await apiFetch('/api/pipeline/upload-slot');
+    if (slot.available === false) {
+      alert('Tool chưa xác nhận được trạng thái upload. Kiểm tra Nhật ký và đối soát lượt cũ trước khi chạy lại.');
+      return;
+    }
     if (slot.state === 'recovery_required') {
       const confirmed = confirm(
         `Lượt upload của video #${slot.queue_id} cần phục hồi.\n\n` +
@@ -2756,7 +2896,10 @@ async function reviewUploadSlot() {
     if (slot.state === 'active') {
       alert(`Video #${slot.queue_id} đang giữ lượt upload.`);
     } else if (slot.state === 'cooldown') {
-      alert('Đang kiểm tra khoảng nghỉ 30 phút trước lượt tiếp theo.');
+      const seconds = slot.remaining_seconds;
+      alert(seconds > 0
+        ? `Còn ${Math.floor(seconds / 60)} phút ${seconds % 60} giây trước lượt upload tiếp theo. Khoảng nghỉ dùng chung cho mọi profile. Sau khi khởi động lại, tool có thể áp dụng lại 30 phút để xác nhận an toàn.`
+        : 'Lượt upload đã đủ khoảng nghỉ.');
     } else {
       alert('Lượt upload đang trống.');
     }
@@ -3280,15 +3423,21 @@ async function loadDiagnostics() {
     const workers = data.workers || {};
     const storage = data.storage || {};
     const heartbeat = data.heartbeat || {};
+    const runtime = data.runtime || {};
+    const slot = data.upload_slot || {};
     const schemaText = (db.schemas || []).map(item => `${item.key}: v${item.version}`).join(', ') || 'chưa có bản ghi schema';
     const toolsText = (data.tools || []).map(tool =>
       `${tool.name}: ${tool.available ? 'OK' : 'LỖI'}${tool.version ? ` — ${tool.version}` : ''}${tool.error ? ` (${tool.error})` : ''}`
     ).join('\n');
     panel.textContent = [
       `Bản dựng: ${data.version || 'không rõ'}`,
+      `Revision khi mở: ${runtime.revision || 'không rõ'} · mã nguồn ${runtime.startup_fingerprint?.slice(0, 12) || 'không rõ'}`,
+      `Khởi động: ${runtime.started_at ? new Date(runtime.started_at).toLocaleString() : 'không rõ'} · thư mục ${runtime.source_root || 'không rõ'}`,
+      runtime.restart_required ? 'Mã trên đĩa đã đổi. Khởi động lại DHB để áp dụng.' : '',
       `Database: ${db.available ? 'OK' : 'không tìm thấy'} · ${storageFormatBytes(db.bytes || 0)} · user_version ${db.user_version ?? 0}`,
       `Schema: ${schemaText}`,
-      `Worker batch: ${workers.pipeline_running ? 'đang chạy' : 'dừng'} · active ${workers.active_batch_threads || 0}`,
+      `Worker batch: ${data.batch_state === 'stopping' ? 'đang dừng' : workers.pipeline_running ? 'đang chạy' : 'dừng'} · active ${workers.active_batch_threads || 0}`,
+      `Slot upload: ${slot.state || 'không rõ'}${slot.remaining_seconds != null ? ` · còn ${slot.remaining_seconds} giây` : ''}`,
       `Monitor: ${workers.monitor_workers || 0} worker · ${workers.monitor_heartbeats || 0} heartbeat · supervisor ${workers.monitor_supervisor_alive ? 'sống' : 'dừng'}`,
       `NeedsReview: ${data.needs_review_count || 0} · heartbeat mới nhất: ${heartbeat.latest || 'chưa có'} (${heartbeat.running_monitors || 0} monitor bật)`,
       `Ổ đĩa trống: ${storageFormatBytes(storage.free_bytes || 0)} · temp ${storageFormatBytes(storage.temp_bytes || 0)} · output ${storageFormatBytes(storage.output_bytes || 0)} · artifact ${storage.artifact_count || 0}`,
