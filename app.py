@@ -328,6 +328,7 @@ _JSON_SECRET_KEYS = {
     "oauthtoken", "oauthtokenjson", "apikey", "clientsecret", "secret",
     "password", "passwd", "cookie", "authorization",
 }
+_JSON_OAUTH_PRESENCE_KEYS = {"hasoauthtoken", "hasaccesstoken", "hasrefreshtoken"}
 
 
 def _redact_json_value(value: Any, secrets: List[str]) -> Any:
@@ -336,6 +337,9 @@ def _redact_json_value(value: Any, secrets: List[str]) -> Any:
         safe = {}
         for key, child in value.items():
             normalized_key = re.sub(r"[^a-z0-9]+", "", str(key).lower())
+            if isinstance(child, bool) and normalized_key in _JSON_OAUTH_PRESENCE_KEYS:
+                safe[key] = child
+                continue
             is_secret = (
                 normalized_key in _JSON_SECRET_KEYS
                 or normalized_key.endswith(("apikey", "clientsecret", "password", "passwd", "token"))

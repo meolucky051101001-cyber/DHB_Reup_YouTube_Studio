@@ -181,7 +181,12 @@ def connect(client_file, channel_row_id, activate):
                 raise RuntimeError("DHB chưa chuyển sang API. Kiểm tra bản chạy hoặc dùng lệnh không có --activate để lưu OAuth.")
             raise RuntimeError("DHB chưa lưu được OAuth. Kiểm tra kênh có đang được worker sử dụng không.")
         updated = find_channel(local, channel_row_id)
-        if not updated.get("has_oauth_token") or (activate and updated["upload_mode"] != "youtube_api"):
+        status = local.get(f"{DHB_URL}/api/channels/{channel_row_id}/oauth-status", timeout=15)
+        if (
+            not status.ok
+            or not status.json().get("configured")
+            or (activate and updated["upload_mode"] != "youtube_api")
+        ):
             raise RuntimeError("DHB chưa xác nhận trạng thái cấu hình sau khi lưu.")
         print("OAuth đã lưu cho đúng kênh. " + ("DHB đang dùng YouTube Data API." if activate else "Đã giữ chế độ đăng hiện tại."))
 

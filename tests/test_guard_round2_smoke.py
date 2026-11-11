@@ -334,6 +334,46 @@ class QuickQueueEditTests(unittest.TestCase):
         self.assertEqual(rows[first]["title"], "First")
 
 
+class OAuthChannelModeTests(unittest.TestCase):
+    def test_switch_preserves_channel_profile_and_history(self):
+        profile = "OAuth Test Browser Profile"
+        path = "antidetect://oauth-test-binding"
+        with closing(database.get_conn()) as conn, conn:
+            conn.execute(
+                "INSERT INTO chrome_profiles (name,path,source,antidetect_profile_id) VALUES (?,?,'Antidetect',?)",
+                (profile, path, "oauth-test-binding"),
+            )
+            channel = conn.execute(
+                "INSERT INTO youtube_channels (name,channel_id,profile_name,profile_path) VALUES (?,?,?,?)",
+                ("OAuth Test Channel", "UC" + "w" * 22, profile, path),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO published_history (source_post_id,channel_id,published_url) VALUES (?,?,?)",
+                ("previous-oauth-test", channel, "https://youtu.be/dQw4w9WgXcQ"),
+            )
+        origin = "http://127.0.0.1:8686"
+        headers = {"X-DHB-Token": client.get("/api/auth/token").json()["token"], "Origin": origin}
+        url = f"/api/channels/{channel}"
+        mode = {"upload_mode": "youtube_api"}
+        self.assertEqual(client.put(url, json=mode, headers=headers).status_code, 400)
+        config = json.dumps({
+            "client_id": "sample-google-client-id",
+            "client_secret": "sample-google-secret",
+            "refresh_token": "sample-google-refresh",
+        })
+        self.assertEqual(
+            client.put(url, json={**mode, "oauth_token_json": config}, headers=headers).status_code, 200,
+        )
+        row = next(row for row in client.get("/api/channels", headers=headers).json() if row["id"] == channel)
+        self.assertEqual((row["upload_mode"], row["profile_name"], row["profile_path"]), ("youtube_api", profile, path))
+        self.assertIs(row["has_oauth_token"], True)
+        self.assertNotIn("oauth_token_json", row)
+        with closing(database.get_conn()) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM published_history WHERE channel_id = ?", (channel,),
+            ).fetchone()[0], 1)
+
+
 class ManualUploadDecisionTests(unittest.TestCase):
     def test_completed_group_item_without_known_channel_cannot_be_reuploaded(self):
         conn = database.get_conn()
@@ -550,6 +590,18 @@ class SmokeTests(unittest.TestCase):
 
 
 class JsonResponseRedactionTests(unittest.TestCase):
+    def test_oauth_presence_flags_are_booleans_and_token_values_are_redacted(self):
+        value = {
+            "has_oauth_token": False,
+            "has_refresh_token": True,
+            "has_access_token": "unexpected credential value",
+            "refresh_token": "example credential",
+        }
+        self.assertEqual(
+            app_module._redact_json_value(value, []),
+            {"has_oauth_token": False, "has_refresh_token": True, "has_access_token": "***", "refresh_token": "***"},
+        )
+
     def _request(self):
         return Request({
             "type": "http", "method": "GET", "path": "/acceptance-json",
