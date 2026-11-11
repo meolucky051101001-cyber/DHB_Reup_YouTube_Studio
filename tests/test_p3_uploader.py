@@ -275,6 +275,35 @@ class UrlAndChecksTests(unittest.TestCase):
             ), "")
         self.assertEqual(read.call_count, 2)
 
+    def test_delayed_studio_listing_confirms_only_the_id_from_save(self):
+        context = mock.Mock()
+        confirmation = f"https://youtu.be/{VIDEO_ID}"
+        entries = [[], [], [], [{"id": VIDEO_ID, "visibility": "private"}]]
+        metadata = {"title": "Pilot", "privacy_status": "private"}
+        with mock.patch.object(yu, "_collect_studio_title_candidates", side_effect=entries) as read, \
+                mock.patch.object(yu, "add_log"):
+            url = yu._verify_published_video_on_fresh_tab(
+                context, CHANNEL_ID, metadata, set(), confirmation_url=confirmation
+            )
+        self.assertEqual(url, confirmation)
+        self.assertEqual(read.call_count, 4)
+
+        with mock.patch.object(yu, "_collect_studio_title_candidates", return_value=entries[-1]) as read, \
+                mock.patch.object(yu, "add_log"):
+            url = yu._verify_published_video_on_fresh_tab(
+                context, CHANNEL_ID, metadata, set(), confirmation_url="https://youtu.be/13t572zFqlw"
+            )
+        self.assertEqual(url, "")
+        self.assertEqual(read.call_count, 1)
+
+    def test_studio_title_requires_approved_text_after_description_entry(self):
+        title_box = mock.Mock()
+        title_box.inner_text.return_value = "đi sa\u0306n nấm hiếm #shorts"
+        yu._verify_studio_upload_title(title_box, "đi săn nấm hiếm #shorts")
+        title_box.inner_text.return_value = "Đi săn nấm hiếm trong rừng nhiệt đới sau mưa"
+        with self.assertRaisesRegex(RuntimeError, "chưa bấm đăng"):
+            yu._verify_studio_upload_title(title_box, "đi săn nấm hiếm #shorts")
+
     def test_empty_video_tab_can_confirm_a_new_private_video(self):
         class EmptyStudioPage(_StudioPage):
             def wait_for_selector(self, selector, **_kwargs):

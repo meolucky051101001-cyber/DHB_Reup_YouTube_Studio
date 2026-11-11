@@ -20,6 +20,8 @@ Dùng hướng dẫn này để chạy một lô có giám sát, đối soát k�
 
 Khi dòng đang đăng bằng trình duyệt, bấm **Xem Studio** trong cột **Thao tác** để xem ảnh của tab đang xử lý. Ảnh xuất hiện sau khi DHB xác minh kênh và cập nhật khi worker đi qua các bước của Studio. Đóng hộp xem để quay lại hàng đợi trong khi lượt đăng tiếp tục.
 
+DHB tự xác nhận kết quả khi tìm thấy đúng video mới, tiêu đề và chế độ hiển thị trên kênh đích. Nếu Studio chưa cập nhật danh sách, DHB đọc lại tối đa năm lần. Khi ID từ bước lưu mâu thuẫn với danh sách hoặc bằng chứng còn thiếu, dòng giữ trạng thái **Cần đối soát**.
+
 ## Xử lý nhanh
 
 | Tình huống | Kiểm tra và xử lý | Dấu hiệu xong |

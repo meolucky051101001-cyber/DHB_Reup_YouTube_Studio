@@ -6,6 +6,7 @@ import subprocess
 import shutil
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Any, Optional
@@ -2429,7 +2430,12 @@ def _wait_for_publish_completion(
 
 
 def _normalize_studio_title(value: str) -> str:
-    return " ".join(str(value or "").split()).casefold()
+    return " ".join(unicodedata.normalize("NFC", str(value or "")).split()).casefold()
+
+
+def _verify_studio_upload_title(title_box, expected_title: str):
+    if _normalize_studio_title(title_box.inner_text(timeout=5000)) != _normalize_studio_title(expected_title):
+        raise RuntimeError("Tiêu đề trên YouTube Studio khác tiêu đề trong Preview. DHB chưa bấm đăng.")
 
 
 def _studio_row_matches_title(row, expected_title: str, *, require_readable: bool = False) -> bool:
@@ -2743,6 +2749,7 @@ def _find_published_video_in_studio_content(
     attempts: int = 1,
     on_observation: Optional[Callable[[str], None]] = None,
     observe=None,
+    confirmation_url: str = "",
 ) -> str:
     """Bằng chứng dự phòng: đúng 1 ID không nằm trong snapshot đã quan sát được chấp nhận."""
     channel_id = str(channel_id or "").strip()
@@ -2776,6 +2783,8 @@ def _find_published_video_in_studio_content(
                 result = "ambiguous"
             elif not new_entries:
                 result = "not_visible"
+            elif confirmation_url and confirmation_url != f"https://youtu.be/{next(iter(observed_ids))}":
+                result = "wrong_video_id"
             elif states == {expected}:
                 result, url = "confirmed", f"https://youtu.be/{next(iter(observed_ids))}"
             elif states - {expected, ""}:
@@ -2784,14 +2793,16 @@ def _find_published_video_in_studio_content(
                 result = "pending"
         if on_observation:
             on_observation(result)
-        if url or result in ("ambiguous", "wrong_visibility"):
+        if url or result in ("ambiguous", "wrong_visibility", "wrong_video_id"):
             return url
         if index + 1 < attempts:
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(min(15000, 4000 * (index + 1)))
     return ""
 
 
-def _verify_published_video_on_fresh_tab(context, channel_id, metadata, known_video_ids, *, observe=None):
+def _verify_published_video_on_fresh_tab(
+    context, channel_id, metadata, known_video_ids, *, observe=None, confirmation_url=""
+):
     if known_video_ids is None:
         return ""
     page = None
@@ -2799,8 +2810,9 @@ def _verify_published_video_on_fresh_tab(context, channel_id, metadata, known_vi
         page = context.new_page()
         return _find_published_video_in_studio_content(
             page, channel_id, metadata.get("title", ""), metadata.get("upload_to", ""),
-            metadata.get("privacy_status", ""), known_video_ids, attempts=3,
+            metadata.get("privacy_status", ""), known_video_ids, attempts=5,
             observe=observe,
+            confirmation_url=confirmation_url,
             on_observation=lambda result: add_log(
                 "Upload", f"Kết quả đọc danh sách Studio sau lưu: {result}", "INFO", phase="VerifyingResult"
             ),
@@ -3321,11 +3333,10 @@ def upload_via_playwright_studio(
                     progress_callback(40, "Đang chuyển file lên YouTube Studio...")
 
                 if progress_callback:
-                    progress_callback(45, "Đang điền Tiêu đề, Mô tả (Mô phỏng gõ phím người thật)...")
+                    progress_callback(45, "Đang điền tiêu đề và mô tả...")
 
-                title_box = page.locator("#title-textarea #textbox, #textbox").first
-                title_box.wait_for(state="visible", timeout=120000)
-                simulate_human_type(page, title_box, metadata["title"], is_long_text=False)
+                title_box = page.locator("#title-textarea #textbox").first
+                title_box.fill(metadata["title"], timeout=120000)
 
                 desc_box = page.locator("#description-textarea #textbox").first
                 if desc_box.count() > 0 and metadata["description"]:
@@ -3429,6 +3440,7 @@ def upload_via_playwright_studio(
                     progress_callback(68, "Hoàn tất Tiêu Đề & Đối Tượng Người Xem -> Sang Thành phần video...")
 
                 page.wait_for_timeout(1500)
+                _verify_studio_upload_title(title_box, metadata["title"])
                 next_btn = page.locator("#next-button").first
                 if next_btn.count() > 0 and next_btn.is_visible():
                     human_move_and_click(page, next_btn, delay_after=1500)
@@ -3473,7 +3485,7 @@ def upload_via_playwright_studio(
                                 "processing": _CHECKS_PROCESSING_KEYWORDS,
                             },
                             timeout=wait_slice_ms,
-                            polling="mutation",
+                            polling=500,
                         )
                     except Exception as wait_err:
                         if time.monotonic() >= checks_deadline:
@@ -3708,9 +3720,6 @@ def upload_via_playwright_studio(
                         if prem_inst.count() > 0 and not prem_inst.get_attribute("checked"):
                             human_move_and_click(page, prem_inst, delay_after=500)
 
-                # Không lấy URL trước khi đăng: chỉ URL trong hộp thoại chia sẻ sau khi bấm mới là bằng chứng.
-                video_url = ""
-
                 # Bấm nút Xuất bản / Lên lịch / Lưu
                 done_btn = page.locator(
                     "#done-button, ytcp-button#done-button, ytcp-button:has-text('Publish'), "
@@ -3742,17 +3751,20 @@ def upload_via_playwright_studio(
 
                 confirmation_url = _wait_for_publish_completion(
                     page, studio_url_before_publish, PUBLISH_CONFIRM_TIMEOUT_SECONDS, observe=observe
-                ) or video_url
+                )
+                if confirmation_url:
+                    add_log(
+                        "Upload", f"URL từ bước lưu Studio, chờ đối chiếu: {confirmation_url}",
+                        "INFO", phase="VerifyingResult",
+                    )
                 verified_url = _verify_published_video_on_fresh_tab(
                     context,
                     active_channel.get("channel_id", ""),
                     metadata,
                     known_video_ids,
                     observe=observe,
+                    confirmation_url=confirmation_url,
                 )
-                if confirmation_url and verified_url and confirmation_url != verified_url:
-                    add_log("Upload", "ID trong xác nhận lưu khác ID đọc lại từ Studio.", "WARNING", phase="VerifyingResult")
-                    verified_url = ""
 
                 # Đóng hộp thoại xác nhận hoàn tất của Studio để Cookie phiên kịp đồng bộ
                 try:
