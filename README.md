@@ -55,7 +55,7 @@ python -m playwright install chromium
 START_DHB_YOUTUBE.bat
 ```
 
-Script khởi động server (`app.py`, cổng `127.0.0.1:8686`) và ghi log vào `logs\server.out.log` / `logs\server.error.log`. Nếu DHB đã chạy từ đúng thư mục, script mở dashboard hiện tại. Nếu cổng thuộc bản DHB khác hoặc chương trình khác, script báo xung đột. Kiểm tra revision khi mở và cảnh báo mã trên đĩa đã đổi trong **Tổng quan → Chẩn đoán**.
+Script khởi động server (`app.py`, cổng `127.0.0.1:8686`) và ghi log vào `logs\server.out.log` / `logs\server.error.log`. Nếu DHB đã chạy từ đúng thư mục, script mở dashboard hiện tại. Nếu cổng thuộc bản DHB khác hoặc chương trình khác, script báo xung đột. Xem **Revision khi mở**, thư mục nguồn và cảnh báo đổi mã ở **Cài Đặt & Nhật Ký Hệ Thống → Chẩn Đoán Cài Đặt & Worker**.
 
 Hoặc chạy trực tiếp:
 
@@ -63,9 +63,17 @@ Hoặc chạy trực tiếp:
 python app.py
 ```
 
-Tool **không** tự chạy hàng đợi khi khởi động — mọi lượt đăng phải bấm Start trong dashboard.
+Mở Antidetect trước nếu dùng profile Antidetect. Lô thủ công chỉ bắt đầu khi người vận hành bấm chạy trong dashboard.
 
-Với video đã dựng sẵn, chọn **Chỉ Đăng YT** và kiểm tra kênh, profile, chế độ hiển thị và file trong Preview. Nếu dòng còn bản render có sẵn, Preview sẽ ghi rõ bản đó. **Dừng** ngừng nhận video mới của lô và chờ lượt upload đã bắt đầu hoàn tất. Chờ trạng thái đang dừng biến mất trước khi tắt dịch vụ. Dòng **NeedsReview** cần đối chiếu trong Studio trước khi quyết định đăng lại.
+## Đăng video theo lô
+
+1. Trong **Quản Lý Kênh & Profile Chrome**, xác nhận phiên đăng nhập và kênh YouTube đích đã có Channel ID. Dùng **Đồng Bộ Antidetect** khi cần lấy profile mới.
+2. Chọn dự án, bấm **Chọn Tệp Từ Máy** hoặc kéo thả video. Mở ✏️ trên mỗi dòng để sửa tiêu đề, chọn **Profile Chrome** rồi **Kênh YouTube Đích**, và đặt chế độ hiển thị. Một profile có thể chứa nhiều kênh, nên hãy chọn kênh cụ thể nếu cần gán chính xác.
+3. Tích đúng các dòng cần chạy. Chọn **Chỉ Đăng YT** cho file đã dựng, hoặc **Chạy Toàn Trình Tự Động** nếu cần tải, render và đăng. Trong Preview của lần chạy, đọc lại file sẽ gửi, kênh, profile, chế độ và lịch rồi xác nhận một lần.
+4. Theo dõi hàng đợi và **Kiểm tra lượt upload**. Khoảng nghỉ tối thiểu là 30 phút dùng chung cho các profile. **Đã đăng** có link đối chiếu. Với **Cần đối soát** (`NeedsReview`), kiểm tra đúng kênh trên Studio trước khi quyết định cho phép đăng lại.
+5. Bấm **Dừng** để ngừng nhận video tiếp theo. Lượt upload đã bắt đầu được chờ hoàn tất. Kiểm tra Chẩn đoán báo worker batch đã dừng và monitor liên quan cũng đã dừng trước khi tắt DHB hoặc máy.
+
+Xem [hướng dẫn vận hành](docs/van-hanh-local.md) để xử lý sự cố, sao lưu, khôi phục và quyết định khi nào nên tăng số video hoặc profile.
 
 Kiểm tra nhanh trạng thái hàng đợi và log mà không cần dashboard:
 
@@ -121,7 +129,7 @@ Bảng dữ liệu chính trong `data/dhb_youtube.sqlite`: `channel_groups`, `ch
 python -m unittest discover -s tests -v
 ```
 
-Toàn bộ test dùng dữ liệu tạm (temp DB, HTTP server giả, FFmpeg/Playwright giả) và không chạm dữ liệu thật. CI ([.github/workflows/tests.yml](.github/workflows/tests.yml)) chạy `python -m py_compile` các module chính rồi `python -m unittest discover -s tests -v` trên Windows + Python 3.10 cho mỗi push/PR. Khi sửa frontend, hãy chạy thêm `node --check static/app.js` tại máy của bạn.
+Toàn bộ test dùng dữ liệu tạm (temp DB, HTTP server giả, FFmpeg/Playwright giả) và không chạm dữ liệu thật. CI ([.github/workflows/tests.yml](.github/workflows/tests.yml)) kiểm tra cú pháp Python và JavaScript rồi chạy `unittest` trên Windows với Python 3.10 cho mỗi push và PR.
 
 Khi sửa frontend, nhớ tăng tham số `app.js?v=N` để trình duyệt đang mở không dùng bản cache.
 
@@ -129,7 +137,7 @@ Khi sửa frontend, nhớ tăng tham số `app.js?v=N` để trình duyệt đan
 
 ## Tài liệu thêm
 
-- [HUONG_DAN_SU_DUNG.txt](HUONG_DAN_SU_DUNG.txt) — hướng dẫn thao tác từng tab cho người vận hành.
+- [Hướng dẫn vận hành local](docs/van-hanh-local.md) — quy trình đăng, đối soát, phục hồi và tăng quy mô.
 - [CHANGELOG.md](CHANGELOG.md) — các thay đổi theo phiên, gồm lỗi đã sửa và số lượng test.
 - [Tài liệu handover lưu trữ](docs/archive/handovers/) — các snapshot lịch sử; README và mã nguồn hiện tại mới là nguồn tham chiếu chính.
 
@@ -137,4 +145,4 @@ Khi sửa frontend, nhớ tăng tham số `app.js?v=N` để trình duyệt đan
 
 Mặc định tool tìm bộ DHB tại `C:\DHB Reup Facebook`; có thể đổi thư mục gốc bằng `DHB_ROOT`. Có thể chỉ định riêng executable khi cài đặt khác chuẩn: `DHB_FFMPEG`, `DHB_FFPROBE`, `DHB_FFPLAY`, `DHB_YTDL`, `DHB_BROWSER_HOST`, `DHB_MAGICK` và `DHB_STHP`. Nếu không đặt override, tool dùng file nằm trong thư mục DHB mặc định hoặc executable tương ứng trong `PATH` khi được hỗ trợ.
 
-Tab Tổng quan có phần Chẩn đoán; API `GET /api/diagnostics` trả phiên bản/schema, trạng thái worker, số item cần đối soát, tổng quan dung lượng/heartbeat và tình trạng các công cụ media.
+Khung **Chẩn Đoán Cài Đặt & Worker** và API `GET /api/diagnostics` hiển thị revision, schema, trạng thái worker và slot, số video cần đối soát, dung lượng, heartbeat và tình trạng các công cụ media.
