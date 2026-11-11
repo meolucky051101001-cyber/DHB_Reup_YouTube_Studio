@@ -493,7 +493,7 @@ async function ensureApiToken(force = false) {
   return gApiTokenPromise;
 }
 
-async function apiFetch(url, options = {}) {
+async function apiRequest(url, options = {}) {
   const doFetch = async () => {
     const token = await ensureApiToken();
     const headers = new Headers(options.headers || {});
@@ -527,6 +527,11 @@ async function apiFetch(url, options = {}) {
     error.status = res.status;
     throw error;
   }
+  return res;
+}
+
+async function apiFetch(url, options = {}) {
+  const res = await apiRequest(url, options);
   return res.json();
 }
 
@@ -1658,9 +1663,10 @@ async function loadQueue(preserveSelection = false) {
           ${item.error_message ? `<div style="font-size:10.5px; color:#fb7185; margin-top:2px;">${escapeHtml(item.error_message.slice(0, 65))}</div>` : ''}
         </td>
         <td>
-          <div style="display:flex; gap:4px; align-items:center;">
+          <div style="display:flex; gap:4px; align-items:center; flex-wrap:wrap;">
             <button class="btn btn-accent btn-sm" onclick="openPreviewModal(${item.id})" title="Xem thử video trực tiếp">▶️</button>
             <button class="btn btn-outline btn-sm" onclick="openEditModal(${item.id})" title="Chỉnh sửa chi tiết tiêu đề, mô tả, chất lượng...">✏️</button>
+            ${item.studio_view_available ? `<button type="button" class="btn btn-outline btn-sm" onclick="openStudioView(${item.id}, ${item.last_attempt_id})" title="Xem giao diện Studio của lượt đăng đang chạy">Xem Studio</button>` : ''}
             ${item.status === 'Completed' ? `<button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'reupload')" title="Ghi lý do và cho phép đăng lại riêng video này">🔁</button>` : ''}
             ${item.status === 'NeedsReview' ? `<button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'reupload')" title="Xác nhận chưa đăng rồi cho phép chạy lại video này">🔁</button><button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'confirmed_published')" title="Xác nhận đã đăng và lưu URL vào lịch sử">✅</button>` : ''}
           </div>
@@ -2176,6 +2182,72 @@ function closePreviewModal() {
     player.src = '';
   }
   document.getElementById('modal-preview-video').style.display = 'none';
+}
+
+function openStudioView(itemId, attemptId) {
+  const dialog = document.getElementById('studio-view-dialog');
+  if (dialog.open) return;
+
+  const image = document.getElementById('studio-view-frame');
+  const status = document.getElementById('studio-view-status');
+  const updated = document.getElementById('studio-view-updated');
+  document.getElementById('studio-view-title').textContent = `YouTube Studio · Video #${itemId}`;
+  const controller = new AbortController();
+  let frameUrl = '';
+  let after = 0;
+  let timer;
+
+  const showStatus = text => {
+    if (status.textContent !== text) status.textContent = text;
+  };
+  const clearImage = () => {
+    image.hidden = true;
+    image.removeAttribute('src');
+    if (frameUrl) URL.revokeObjectURL(frameUrl);
+    frameUrl = '';
+    updated.textContent = '';
+  };
+  const poll = async () => {
+    try {
+      const res = await apiRequest(
+        `/api/queue/${itemId}/studio-view?attempt_id=${attemptId}&after=${after}`,
+        { signal: controller.signal, cache: 'no-store' },
+      );
+      if (res.status === 200) {
+        const frame = await res.blob();
+        if (controller.signal.aborted) return;
+        clearImage();
+        frameUrl = URL.createObjectURL(frame);
+        after = Number(res.headers.get('X-DHB-Frame'));
+        image.src = frameUrl;
+        image.hidden = false;
+        updated.textContent = `Ảnh nhận lúc ${new Date().toLocaleTimeString('vi-VN')}`;
+      }
+      if (controller.signal.aborted) return;
+      const item = gQueueItems.find(row => row.id === itemId);
+      const stage = item ? `${item.status} · ${item.upload_progress || 0}%` : 'Studio đang chạy';
+      showStatus(frameUrl ? stage : `${stage}. Đang chờ ảnh Studio.`);
+    } catch (e) {
+      if (controller.signal.aborted) return;
+      if (e.status === 410) {
+        clearImage();
+        showStatus('Phiên Studio đã đóng. Xem kết quả trong hàng đợi.');
+        return;
+      }
+      showStatus('Mất kết nối với ảnh Studio. Đang thử lại.');
+    }
+    timer = setTimeout(poll, 2000);
+  };
+
+  clearImage();
+  showStatus('Đang chờ ảnh Studio.');
+  dialog.addEventListener('close', () => {
+    controller.abort();
+    clearTimeout(timer);
+    clearImage();
+  }, { once: true });
+  dialog.showModal();
+  poll();
 }
 
 // ===== LÊN LỊCH GIÃN CÁCH SỐ LƯỢNG LỚN (50+ VIDEO) =====

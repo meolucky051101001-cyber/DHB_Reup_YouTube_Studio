@@ -31,6 +31,7 @@ os.environ["DHB_DISABLE_BACKGROUND_TASKS"] = "1"
 
 import database
 import pipeline_manager as pm
+from studio_view import StudioView
 from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
 from starlette.requests import Request
@@ -480,6 +481,46 @@ class CsvImportSafetyTests(unittest.TestCase):
                 "do_upload": True, "force_reupload": True,
             })
         self.assertIn("đối soát", str(raised.exception.detail))
+
+
+class StudioViewTests(unittest.TestCase):
+    def test_frame_requires_authentication_and_the_active_attempt(self):
+        token = client.get("/api/auth/token").json()["token"]
+        headers = {"X-DHB-Token": token}
+        endpoint = "/api/queue/9020/studio-view"
+        page = mock.Mock(url="https://studio.youtube.com/channel/test", **{"screenshot.return_value": b"jpeg frame"})
+
+        with StudioView(9020, 18) as view:
+            self.assertEqual(client.get(endpoint, params={"attempt_id": 18}).status_code, 401)
+            self.assertEqual(client.get(endpoint, params={"attempt_id": 17}, headers=headers).status_code, 410)
+            view.capture(page)
+            page.screenshot.assert_not_called()
+            self.assertEqual(client.get(endpoint, params={"attempt_id": 18}, headers=headers).status_code, 204)
+
+            view.capture(page)
+            image = client.get(endpoint, params={"attempt_id": 18}, headers=headers)
+            self.assertEqual(image.content, b"jpeg frame")
+            self.assertEqual(image.headers["content-type"], "image/jpeg")
+            self.assertEqual(image.headers["cache-control"], "no-store")
+            params = {"attempt_id": 18, "after": image.headers["X-DHB-Frame"]}
+            self.assertEqual(client.get(endpoint, params=params, headers=headers).status_code, 204)
+
+        self.assertEqual(client.get(endpoint, params={"attempt_id": 18}, headers=headers).status_code, 410)
+
+    def test_view_skips_sign_in_pages_and_tolerates_capture_failures(self):
+        token = client.get("/api/auth/token").json()["token"]
+        endpoint = "/api/queue/9021/studio-view?attempt_id=19"
+        with StudioView(9021, 19) as view:
+            client.get(endpoint, headers={"X-DHB-Token": token})
+            signin = mock.Mock(url="https://accounts.google.com/")
+            view.capture(signin)
+            signin.screenshot.assert_not_called()
+
+            view.next_capture = 0
+            studio = mock.Mock(url="https://studio.youtube.com/", **{"screenshot.side_effect": TimeoutError})
+            view.capture(studio)
+            studio.screenshot.assert_called_once()
+            self.assertEqual(client.get(endpoint, headers={"X-DHB-Token": token}).status_code, 204)
 
 
 class SmokeTests(unittest.TestCase):

@@ -83,6 +83,7 @@ from queue_import import preview_csv_import
 from app_instance_lock import AppInstanceAlreadyRunning, acquire_app_instance_lock
 from render_engine import normalize_render_speed
 from runtime_identity import capture_runtime, runtime_status
+from studio_view import active_studio_views, request_studio_frame
 from storage_manager import (
     DEFAULT_RETENTION_DAYS,
     cleanup_managed_artifacts,
@@ -672,7 +673,24 @@ def api_get_queue(project: str = ""):
         (project,),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    views = active_studio_views()
+    return [
+        {**dict(row), "studio_view_available": (row["id"], row["last_attempt_id"]) in views}
+        for row in rows
+    ]
+
+
+@app.get("/api/queue/{item_id}/studio-view")
+def api_studio_view(item_id: int, attempt_id: int, after: int = 0):
+    frame = request_studio_frame(item_id, attempt_id, after)
+    if frame is None:
+        raise HTTPException(410, "Phiên Studio của lượt đăng này đã đóng.")
+    sequence, image = frame
+    headers = {"Cache-Control": "no-store"}
+    if image is None:
+        return Response(status_code=204, headers=headers)
+    headers["X-DHB-Frame"] = str(sequence)
+    return Response(image, media_type="image/jpeg", headers=headers)
 
 
 @app.get("/api/queue/content-identity-report")

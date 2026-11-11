@@ -18,6 +18,8 @@ Dùng hướng dẫn này để chạy một lô có giám sát, đối soát k�
 5. Theo dõi lô. Mỗi lần chỉ một video giữ lượt upload. Cooldown tối thiểu 30 phút dùng chung giữa các profile, tính từ khi lượt trước kết thúc. Lịch phát hành trên YouTube là thiết lập riêng. Với **Đã đăng** (`Completed`), mở link và kiểm tra ID, kênh, chế độ hiển thị trong Studio bằng phiên có quyền xem.
 6. Để kết thúc sớm, bấm **Dừng**. Tool ngừng nhận video mới và chờ lượt upload đã bắt đầu hoàn tất. Đợi thông báo **Đang dừng lô** biến mất và Chẩn đoán báo worker batch đã dừng, active bằng 0. Nếu có monitor, dừng riêng trong tab monitor rồi kiểm tra worker và heartbeat trước khi tắt máy hoặc dịch vụ.
 
+Khi dòng đang đăng bằng trình duyệt, bấm **Xem Studio** trong cột **Thao tác** để xem ảnh của tab đang xử lý. Ảnh xuất hiện sau khi DHB xác minh kênh và cập nhật khi worker đi qua các bước của Studio. Đóng hộp xem để quay lại hàng đợi trong khi lượt đăng tiếp tục.
+
 ## Xử lý nhanh
 
 | Tình huống | Kiểm tra và xử lý | Dấu hiệu xong |

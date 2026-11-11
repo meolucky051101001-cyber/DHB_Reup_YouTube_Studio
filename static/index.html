@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DHB Reup YouTube Studio — Hệ Thống Tự Động Hóa Reup & Đăng YouTube</title>
-  <link rel="stylesheet" href="/static/styles.css?v=upload-preview" />
+  <link rel="stylesheet" href="/static/styles.css?v=studio-view" />
 </head>
 <body>
   <!-- TOP HEADER -->
@@ -1846,6 +1846,17 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=upload-preview"></script>
+  <dialog id="studio-view-dialog" class="workspace-dialog" aria-labelledby="studio-view-title">
+    <h2 id="studio-view-title">YouTube Studio</h2>
+    <p id="studio-view-status" role="status"></p>
+    <p class="studio-view-note">Ảnh chỉ xem, cập nhật theo các bước trong Studio. Đóng cửa sổ này để quay về hàng đợi.</p>
+    <img id="studio-view-frame" alt="Ảnh tab YouTube Studio của lượt đăng" hidden />
+    <div class="quick-queue-actions">
+      <span id="studio-view-updated" class="studio-view-note"></span>
+      <form method="dialog"><button type="submit" class="btn btn-outline" autofocus>Đóng</button></form>
+    </div>
+  </dialog>
+
+  <script src="/static/app.js?v=studio-view"></script>
 </body>
 </html>

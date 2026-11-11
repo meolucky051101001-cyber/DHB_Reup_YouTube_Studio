@@ -16,6 +16,7 @@ from config import APP_PROFILES_DIR
 from database import add_log, get_settings
 from scanner_downloader import probe_video_info
 from upload_approval import upload_source_path
+from studio_view import StudioView
 from antidetect_client import (
     AntidetectNotReady,
     AntidetectBrowserLease,
@@ -2396,11 +2397,15 @@ def extract_published_video_url(page, previous_url: str = "") -> str:
     return ""
 
 
-def _wait_for_publish_completion(page, previous_url: str, timeout: int = PUBLISH_CONFIRM_TIMEOUT_SECONDS) -> str:
+def _wait_for_publish_completion(
+    page, previous_url: str, timeout: int = PUBLISH_CONFIRM_TIMEOUT_SECONDS, *, observe=None
+) -> str:
     """Chờ Studio hoàn tất đăng và trả URL thật; video còn xử lý có thể trả kết quả muộn."""
     deadline = time.monotonic() + max(30, int(timeout))
     processing_logged = False
     while time.monotonic() < deadline:
+        if observe:
+            observe(page)
         url = extract_published_video_url(page, previous_url)
         if url:
             return url
@@ -2558,7 +2563,7 @@ def _studio_content_tab_is_complete(
 
 
 def _collect_studio_title_candidates(
-    page, channel_id: str, title: str, upload_to: str = "list", require_readable: bool = False
+    page, channel_id: str, title: str, upload_to: str = "list", require_readable: bool = False, *, observe=None
 ) -> list:
     """Đọc ID + trạng thái của các hàng trùng chính xác tiêu đề trên tab Video/Shorts."""
     candidates = []
@@ -2579,6 +2584,8 @@ def _collect_studio_title_candidates(
                     unreadable.append((section, "rows_timeout"))
                     break
                 page.wait_for_timeout(1500)
+            if observe:
+                observe(page)
             rows = page.locator("ytcp-video-row")
             raw_count = rows.count()
             footer = page.locator(_STUDIO_TABLE_FOOTER).first
@@ -2689,7 +2696,7 @@ def _collect_studio_title_candidates(
 
 def _snapshot_studio_exact_title_ids(
     page, channel_id: str, title: str, upload_to: str = "", *,
-    attempts: int = 1, on_observation: Optional[Callable[[str], None]] = None,
+    attempts: int = 1, on_observation: Optional[Callable[[str], None]] = None, observe=None,
 ) -> Optional[set]:
     """Chụp ID các video trùng tiêu đề TRƯỚC khi upload để loại trừ video cũ khi xác minh."""
     channel_id = str(channel_id or "").strip()
@@ -2702,7 +2709,7 @@ def _snapshot_studio_exact_title_ids(
                 if index:
                     page.wait_for_timeout(2000)
                 candidates = _collect_studio_title_candidates(
-                    page, channel_id, title, upload_to, require_readable=True
+                    page, channel_id, title, upload_to, require_readable=True, observe=observe
                 )
             except AntidetectNotReady:
                 raise
@@ -2735,6 +2742,7 @@ def _find_published_video_in_studio_content(
     *,
     attempts: int = 1,
     on_observation: Optional[Callable[[str], None]] = None,
+    observe=None,
 ) -> str:
     """Bằng chứng dự phòng: đúng 1 ID không nằm trong snapshot đã quan sát được chấp nhận."""
     channel_id = str(channel_id or "").strip()
@@ -2753,7 +2761,7 @@ def _find_published_video_in_studio_content(
         result, url = "unreadable", ""
         try:
             candidates = _collect_studio_title_candidates(
-                page, channel_id, title, upload_to, require_readable=True
+                page, channel_id, title, upload_to, require_readable=True, observe=observe
             )
         except RuntimeError as exc:
             if str(exc).startswith("Không đọc đầy đủ danh sách nội dung tab "):
@@ -2783,7 +2791,7 @@ def _find_published_video_in_studio_content(
     return ""
 
 
-def _verify_published_video_on_fresh_tab(context, channel_id, metadata, known_video_ids):
+def _verify_published_video_on_fresh_tab(context, channel_id, metadata, known_video_ids, *, observe=None):
     if known_video_ids is None:
         return ""
     page = None
@@ -2792,6 +2800,7 @@ def _verify_published_video_on_fresh_tab(context, channel_id, metadata, known_vi
         return _find_published_video_in_studio_content(
             page, channel_id, metadata.get("title", ""), metadata.get("upload_to", ""),
             metadata.get("privacy_status", ""), known_video_ids, attempts=3,
+            observe=observe,
             on_observation=lambda result: add_log(
                 "Upload", f"Kết quả đọc danh sách Studio sau lưu: {result}", "INFO", phase="VerifyingResult"
             ),
@@ -3153,6 +3162,8 @@ def upload_via_playwright_studio(
     channel: Dict[str, Any],
     thumbnail_path: str = "",
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    *,
+    studio_view: Optional[StudioView] = None,
 ) -> Dict[str, Any]:
     """
     Tự động điều khiển trình duyệt (Playwright) đăng bài lên YouTube Studio (https://studio.youtube.com).
@@ -3211,6 +3222,7 @@ def upload_via_playwright_studio(
             publish_clicked = False
             draft_preserve_for_review = False
             checks_safe_seen = False
+            observe = studio_view.capture if studio_view else None
             try:
                 if progress_callback:
                     progress_callback(20, f"Đang mở YouTube Studio ({'📱 Giả lập Điện thoại' if is_mobile_mode else '💻 Máy tính'})...")
@@ -3242,6 +3254,16 @@ def upload_via_playwright_studio(
                     init_scripts=init_scripts,
                     progress_callback=progress_callback,
                 )
+                if observe:
+                    observe(page)
+                    report_progress = progress_callback
+
+                    def progress_callback(pct, message):
+                        if report_progress:
+                            report_progress(pct, message)
+                        if pct != 92:  # Keep the final approval check next to Publish.
+                            observe(page)
+
                 add_log(
                     "Upload",
                     f"Đã xác minh kênh đích trên Studio: {active_channel.get('name') or channel.get('name')}"
@@ -3259,6 +3281,7 @@ def upload_via_playwright_studio(
                         metadata.get("title", ""),
                         metadata.get("upload_to", ""),
                         attempts=3,
+                        observe=observe,
                         on_observation=lambda message: add_log(
                             "Upload", message, "INFO", phase="PreUploadSnapshot",
                             channel_name=channel.get("name", ""), video_title=metadata.get("title", ""),
@@ -3718,13 +3741,14 @@ def upload_via_playwright_studio(
                     progress_callback(96, "Đã gửi yêu cầu; đang xác minh URL video từ Studio...")
 
                 confirmation_url = _wait_for_publish_completion(
-                    page, studio_url_before_publish, PUBLISH_CONFIRM_TIMEOUT_SECONDS
+                    page, studio_url_before_publish, PUBLISH_CONFIRM_TIMEOUT_SECONDS, observe=observe
                 ) or video_url
                 verified_url = _verify_published_video_on_fresh_tab(
                     context,
                     active_channel.get("channel_id", ""),
                     metadata,
                     known_video_ids,
+                    observe=observe,
                 )
                 if confirmation_url and verified_url and confirmation_url != verified_url:
                     add_log("Upload", "ID trong xác nhận lưu khác ID đọc lại từ Studio.", "WARNING", phase="VerifyingResult")
@@ -3866,13 +3890,14 @@ def upload_video_to_youtube(
             thumbnail_path=video_item.get("thumbnail_path") or "",
             progress_callback=progress_callback,
         )
-    else:
+    with StudioView(video_item.get("id"), video_item.get("last_attempt_id")) as studio_view:
         return upload_via_playwright_studio(
             video_path=video_path,
             metadata=metadata,
             channel=channel,
             thumbnail_path=video_item.get("thumbnail_path") or "",
             progress_callback=progress_callback,
+            studio_view=studio_view,
         )
 
 

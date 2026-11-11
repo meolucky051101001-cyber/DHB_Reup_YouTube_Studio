@@ -466,6 +466,20 @@ textarea:focus {
   background: rgba(0, 0, 0, 0.65);
 }
 
+.studio-view-note {
+  color: var(--text-muted);
+}
+
+#studio-view-frame:not([hidden]) {
+  display: block;
+  width: 100%;
+  max-height: 65vh;
+  object-fit: contain;
+  margin-top: 12px;
+  background: var(--bg-dark);
+  border-radius: 6px;
+}
+
 .upload-preview-dialog {
   width: min(820px, calc(100vw - 32px));
   background: var(--bg-panel);

@@ -1899,7 +1899,7 @@ class PipelineManager:
                     _mark_slot_entered(slot_owner, upload_attempt_id)
                     upload_started = True
                 pub_res = upload_video_to_youtube(
-                    video_item=fresh_item,
+                    video_item={**fresh_item, "last_attempt_id": upload_attempt_id},
                     channel=channel,
                     option_group=option_group,
                     progress_callback=_make_progress_cb("upload_progress"),
