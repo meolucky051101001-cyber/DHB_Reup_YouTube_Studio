@@ -451,9 +451,10 @@ textarea:focus {
   margin-bottom: 12px;
 }
 
-#quick-queue-dialog {
+.workspace-dialog {
   width: min(1050px, calc(100vw - 32px));
   max-height: calc(100vh - 32px);
+  margin: auto;
   padding: 16px;
   background: var(--bg-card);
   color: var(--text-main);
@@ -461,8 +462,98 @@ textarea:focus {
   border-radius: 12px;
 }
 
-#quick-queue-dialog::backdrop {
+.workspace-dialog::backdrop {
   background: rgba(0, 0, 0, 0.65);
+}
+
+.upload-preview-dialog {
+  width: min(820px, calc(100vw - 32px));
+  background: var(--bg-panel);
+}
+
+.upload-preview-dialog form {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  max-height: calc(100dvh - 66px);
+}
+
+.upload-preview-dialog header p {
+  margin-top: 4px;
+  color: var(--text-muted);
+}
+
+.upload-preview-body {
+  overflow: auto;
+  margin-top: 12px;
+  scrollbar-gutter: stable;
+}
+
+.upload-preview-counts {
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  overflow-wrap: anywhere;
+}
+
+.upload-preview-counts ul {
+  margin: 2px 0 6px 18px;
+}
+
+.upload-preview-list {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+}
+
+.upload-preview-item {
+  padding: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+
+.upload-preview-item-title {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+  margin-bottom: 6px;
+}
+
+.upload-preview-badge {
+  padding: 2px 8px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  color: #7dd3fc;
+}
+
+.upload-preview-item dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 270px), 1fr));
+  gap: 6px 12px;
+}
+
+.upload-preview-item dt,
+.upload-preview-item small,
+.upload-preview-notes {
+  color: var(--text-muted);
+}
+
+.upload-preview-item small {
+  display: block;
+}
+
+.upload-preview-notes {
+  margin: 6px 0 0 18px;
+}
+
+.upload-preview-dialog .upload-preview-warning {
+  color: #fcd34d;
+}
+
+.upload-preview-dialog .upload-preview-error {
+  color: #fda4af;
 }
 
 .quick-queue-header p {
