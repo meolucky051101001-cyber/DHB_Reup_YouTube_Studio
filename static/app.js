@@ -1009,13 +1009,7 @@ async function onModalProfileChange() {
 
 function _applyChannelProfileMode(found) {
   const isAd = !!(found && (found.source === 'Antidetect' || found.antidetect_profile_id));
-  const modeEl = document.getElementById('ch-mode');
   const proxyEl = document.getElementById('ch-proxy');
-  if (modeEl) {
-    modeEl.disabled = isAd;
-    if (isAd) modeEl.value = 'playwright';
-    modeEl.title = isAd ? 'Profile Antidetect chỉ hỗ trợ đăng qua trình duyệt Playwright' : '';
-  }
   if (proxyEl) {
     proxyEl.disabled = isAd;
     if (isAd) {
@@ -2803,6 +2797,7 @@ function showDistributionDialog(preview, operation, allowStart = false) {
         </div>
         <dl>
           ${detail('Kênh YouTube', item.channel_name || 'Chưa xác định', item.youtube_channel_id)}
+          ${item.upload_mode ? detail('Phương thức đăng', item.upload_mode === 'youtube_api' ? 'YouTube Data API · OAuth 2.0' : 'YouTube Studio') : ''}
           ${detail('Profile', item.profile_name || 'Chưa xác định', item.antidetect_profile_id)}
           ${file ? detail('File', file) : ''}
           ${group}

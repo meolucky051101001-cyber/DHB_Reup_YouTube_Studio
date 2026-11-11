@@ -3956,17 +3956,13 @@ def api_create_channel(data: Dict[str, Any] = Body(...)):
         )
     )
     upload_mode = (data.get("upload_mode") or "playwright").strip()
+    if upload_mode not in ("playwright", "youtube_api"):
+        raise HTTPException(400, "Phương thức đăng không hợp lệ.")
     if is_antidetect:
         if not str(binding.get("antidetect_profile_id") or "").strip():
             raise HTTPException(
                 400,
                 "Profile Antidetect này thiếu ID liên kết. Hãy bấm 'Đồng Bộ Antidetect' rồi thử lại.",
-            )
-        if upload_mode == "youtube_api":
-            raise HTTPException(
-                400,
-                "Kênh dùng Profile Antidetect chỉ hỗ trợ đăng qua trình duyệt Playwright "
-                "(YouTube Data API sẽ đi sai proxy/fingerprint của Antidetect).",
             )
         prof_path = binding.get("path") or f"antidetect://{binding['antidetect_profile_id']}"
 
@@ -3992,7 +3988,7 @@ def api_create_channel(data: Dict[str, Any] = Body(...)):
             data.get("channel_id") or "",
             data.get("handle") or "",
             group_names[0],
-            "playwright" if is_antidetect else upload_mode,
+            upload_mode,
             prof_name,
             prof_path,
             0 if is_antidetect else (1 if data.get("emulate_mobile", False) else 0),
@@ -4053,6 +4049,12 @@ def api_update_channel(channel_id: int, data: Dict[str, Any] = Body(...)):
         conn.close()
         raise HTTPException(404, "Không tìm thấy kênh YouTube này.")
 
+    if updates.get("upload_mode") == "youtube_api":
+        oauth = get_oauth_token_local_status({**dict(row), **updates})
+        if not oauth["configured"] or oauth["error"]:
+            conn.close()
+            raise HTTPException(400, oauth["error"] or "Kênh chưa có OAuth hợp lệ.")
+
     group_names = None
     if "group_names" in data or "group_name" in data:
         group_names = _validated_group_names(
@@ -4088,13 +4090,6 @@ def api_update_channel(channel_id: int, data: Dict[str, Any] = Body(...)):
             raise HTTPException(
                 400,
                 "Profile Antidetect này thiếu ID liên kết. Hãy bấm 'Đồng Bộ Antidetect' rồi thử lại.",
-            )
-        if updates.get("upload_mode") == "youtube_api":
-            conn.close()
-            raise HTTPException(
-                400,
-                "Kênh dùng Profile Antidetect chỉ hỗ trợ đăng qua trình duyệt Playwright "
-                "(YouTube Data API sẽ đi sai proxy/fingerprint của Antidetect).",
             )
         updates["profile_path"] = prof_binding["path"] or f"antidetect://{ad_binding_id}"
         updates["proxy"] = ""

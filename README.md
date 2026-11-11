@@ -15,7 +15,7 @@ Tool được thiết kế theo hướng **fail-closed**: khi một bước khô
 | Nhóm | Nội dung |
 |---|---|
 | Kênh & Profile | Quản lý Profile Chrome và kênh YouTube theo nhóm; đồng bộ Profile từ bộ DHB Reup Facebook; mở trình duyệt để đăng nhập, quét và lưu `channel_id` của từng kênh con. |
-| Antidetect | Đồng bộ profile từ Antidetect Browser Manager, mượn trình duyệt đang chạy qua CDP lease; kênh Antidetect chỉ đăng bằng Playwright, không dùng YouTube Data API. |
+| Antidetect | Đồng bộ profile từ Antidetect Browser Manager và dùng Chrome của profile khi đăng qua Studio. Chế độ YouTube Data API dùng quyền OAuth riêng của kênh. |
 | Nạp nguồn | Dán link (YouTube, TikTok, Douyin, Facebook) hoặc quét thư mục video có sẵn; import/export CSV và Excel; sửa metadata hàng loạt. |
 | AI metadata | Viết lại tiêu đề/mô tả/tags, tìm-thay hàng loạt (Gemini), dùng key gửi qua header chứ không gắn vào URL. |
 | Render | Dựng video dọc 1080x1920 bằng FFmpeg: intro/outro, filter, logo, âm thanh; preset Shorts (ép thời lượng, hashtag). |
@@ -74,6 +74,8 @@ Mở Antidetect trước nếu dùng profile Antidetect. Lô thủ công chỉ b
 5. Bấm **Dừng** để ngừng nhận video tiếp theo. Lượt upload đã bắt đầu được chờ hoàn tất. Kiểm tra Chẩn đoán báo worker batch đã dừng và monitor liên quan cũng đã dừng trước khi tắt DHB hoặc máy.
 
 Xem [hướng dẫn vận hành](docs/van-hanh-local.md) để xử lý sự cố, sao lưu, khôi phục và quyết định khi nào nên tăng số video hoặc profile.
+
+Để kết nối YouTube Data API qua OAuth 2.0, xem [hướng dẫn OAuth cho DHB](docs/youtube-oauth.md).
 
 Kiểm tra nhanh trạng thái hàng đợi và log mà không cần dashboard:
 

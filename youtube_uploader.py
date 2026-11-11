@@ -3889,13 +3889,7 @@ def validate_upload_preflight(
         )
     metadata = build_final_metadata(video_item, channel, option_group)
     mode = (channel.get("upload_mode") or "playwright").strip().lower()
-    ad_id = _channel_antidetect_id(channel)
     if mode == "youtube_api":
-        if ad_id:
-            raise RuntimeError(
-                f"Kênh '{channel.get('name') or channel.get('handle') or '?'}' dùng Profile Antidetect nên "
-                "không thể đăng bằng YouTube Data API. Hãy dùng YouTube Studio với đúng Profile Antidetect."
-            )
         unsupported = []
         if metadata.get("age_restriction"):
             unsupported.append("giới hạn độ tuổi 18+")
@@ -3906,6 +3900,10 @@ def validate_upload_preflight(
                 "YouTube Data API hiện không thể xác minh/thiết lập " + ", ".join(unsupported)
                 + "; hãy chuyển sang YouTube Studio trước khi tải hoặc render video."
             )
-    if not ad_id:
+        oauth = get_oauth_token_local_status(channel)
+        if not oauth["configured"] or oauth["error"]:
+            raise RuntimeError(oauth["error"] or "Kênh chưa có OAuth hợp lệ.")
+        _parse_channel_proxy(channel)
+    elif not _channel_antidetect_id(channel):
         _parse_channel_proxy(channel)
     return metadata

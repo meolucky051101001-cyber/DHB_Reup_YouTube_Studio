@@ -1177,6 +1177,7 @@ class PipelineManager:
                     snapshots[item_id] = encode(snapshot)
                     for key in ("youtube_channel_id", "profile_name", "antidetect_profile_id"):
                         entry[key] = snapshot[key]
+                    entry["upload_mode"] = channel.get("upload_mode") or "playwright"
                     option_id = item.get("option_group_id")
                     option = conn.execute("SELECT * FROM upload_option_groups WHERE id = ?", (option_id,)).fetchone() if option_id else None
                     metadata = validate_upload_preflight(item, channel, dict(option) if option else None)
@@ -1184,7 +1185,9 @@ class PipelineManager:
                     entry["visibility"] = metadata["privacy_status"]
                     entry["schedule_time"] = metadata["schedule_time"]
                     entry.update(_preview_upload_file(item, options))
-                    if snapshot["antidetect_profile_id"]:
+                    if entry["upload_mode"] == "youtube_api":
+                        entry["warnings"].append("DHB sẽ kiểm tra Channel ID của OAuth trước khi gửi file qua YouTube Data API.")
+                    elif snapshot["antidetect_profile_id"]:
                         entry["warnings"].append("Đăng nhập và đúng kênh sẽ được xác minh trong Studio trước khi gửi file.")
                     try:
                         if _history_contains_item(
