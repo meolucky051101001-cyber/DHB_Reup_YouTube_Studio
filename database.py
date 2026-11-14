@@ -449,6 +449,8 @@ def init_db():
     _add_col_if_missing("monitors", "metadata_policy_json", "TEXT DEFAULT ''")
     _add_col_if_missing("monitors", "metadata_revision", "TEXT DEFAULT ''")
     _add_col_if_missing("video_queue", "monitor_metadata_policy_json", "TEXT DEFAULT ''")
+    _add_col_if_missing("video_queue", "post_upload_warnings_json", "TEXT DEFAULT '[]'")
+    _add_col_if_missing("upload_attempts", "post_upload_warnings_json", "TEXT DEFAULT '[]'")
     conn.execute("UPDATE monitors SET is_running=0, status='Cần xác nhận metadata' "
                  "WHERE COALESCE(metadata_policy_json,'')='' OR COALESCE(metadata_revision,'')=''")
     _add_col_if_missing("system_logs", "run_id", "TEXT DEFAULT ''")

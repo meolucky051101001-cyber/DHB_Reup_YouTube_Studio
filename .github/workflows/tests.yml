@@ -31,3 +31,26 @@ jobs:
         env:
           DHB_BROWSER_TESTS: '1'
         run: python -m unittest discover -s tests -p test_review_browser.py -v
+
+  media:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Install FFmpeg
+        run: choco install ffmpeg --no-progress -y
+      - name: Run actual media matrix
+        env:
+          DHB_MEDIA_TESTS: '1'
+          DHB_MEDIA_REPORT: media-results.json
+        run: python -m unittest discover -s tests -p test_review_media.py -v
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: media-results
+          path: media-results.json

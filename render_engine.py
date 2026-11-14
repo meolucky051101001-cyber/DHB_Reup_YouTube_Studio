@@ -672,7 +672,7 @@ def render_video(
             fit_mode = cfg.get("shorts_fit_mode", "speedup")
             desired_speed = effective_dur / max_shorts_dur
             if fit_mode == "speedup" and desired_speed <= 2.0:
-                speed = normalize_render_speed(round(desired_speed, 2))
+                speed = normalize_render_speed(math.ceil(desired_speed * 100) / 100)
             else:
                 effective_dur = max_shorts_dur * speed
 
@@ -712,7 +712,8 @@ def render_video(
             _clamp_int(probe.get("height"), 0, 100000, 0),
             fps,
         )
-    src_prefix = f"[0:v]{pre_edit_chain}," if pre_edit_chain else "[0:v]"
+    timeline = f"setpts=(PTS-STARTPTS)/{speed:.2f}"
+    src_prefix = f"[0:v]{pre_edit_chain},{timeline}," if pre_edit_chain else f"[0:v]{timeline},"
 
     # Kích thước khung xuất cuối (dùng để chuẩn hóa Intro/Outro) — cập nhật theo từng chế độ
     out_w, out_h = w_16_9, h_16_9
@@ -756,8 +757,6 @@ def render_video(
     if render_mode == "shorts_9_16" and cfg.get("shorts_visual_pop", cfg.get("shorts_vibrant_colors", True)):
         v_mods.append("eq=contrast=1.04:saturation=1.12")
         v_mods.append("unsharp=3:3:0.35:3:3:0.0")
-    if abs(speed - 1.0) > 0.01:
-        v_mods.append(f"setpts=PTS/{speed:.2f}")
     v_mod_chain = ("," + ",".join(v_mods)) if v_mods else ""
 
     a_mods = []
@@ -786,7 +785,9 @@ def render_video(
     sync_audio_filter = f"{a_filter},apad,atrim=duration={effective_dur / speed:.6f}"
 
     # Chế độ 2: Render Dọc 9:16 Chuẩn YouTube Shorts có nền Blur mờ (Hỗ trợ 1080p đến 4K)
-    if render_mode == "shorts_9_16":
+    if render_mode in ("shorts_9_16", "square_1_1"):
+        if render_mode == "square_1_1":
+            w_shorts, h_shorts = 1080, 1080
         blur_rad = 40 if res_mode == "4k" else (30 if res_mode == "2k" else 20)
         base_fc = (
             f"{src_prefix}scale={w_shorts}:{h_shorts}:force_original_aspect_ratio=increase,crop={w_shorts}:{h_shorts},boxblur={blur_rad}:10[bg];"
@@ -857,6 +858,7 @@ def render_video(
                 + _clear_metadata_args()
                 + [output_path]
             )
+        cmd[-1:-1] = ["-t", f"{effective_dur / speed:.6f}"]
         _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
         out_w, out_h = w_shorts, h_shorts
         rendered = True
@@ -901,46 +903,10 @@ def render_video(
                 + _clear_metadata_args()
                 + [output_path]
             )
+            cmd[-1:-1] = ["-t", f"{effective_dur / speed:.6f}"]
             _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
             out_w, out_h = 1280, 720
             rendered = True
-
-    # Chế độ 4: Render Vuông 1:1 (1080x1080)
-    if not rendered and render_mode == "square_1_1":
-        base_fc = (
-            f"{src_prefix}scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080,boxblur=20:10[bg];"
-            f"{src_prefix}scale=1080:1080:force_original_aspect_ratio=decrease{v_mod_chain}[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[vpre]"
-        )
-        extra_inputs = []
-        brand_segments, draw_chain, brand_label, _input_count = _build_branding(
-            cfg, "vpre", 1 + (0 if has_audio else 1), extra_inputs, 1080
-        )
-        tail_filters = ",".join(draw_chain + ["format=yuv420p"])
-        filter_complex = base_fc + (";" + ";".join(brand_segments) if brand_segments else "") + ";" + f"[{brand_label}]{tail_filters}[outv]"
-
-        if has_audio:
-            audio_map_args = ["-map", "[outv]", "-map", "0:a?", "-shortest"]
-            audio_fx_args = ["-af", sync_audio_filter]
-        else:
-            audio_map_args = ["-map", "[outv]", "-map", "1:a", "-shortest"]
-            audio_fx_args = []
-        cmd = (
-            [FFMPEG_EXE, "-y"]
-            + trim_args
-            + ["-i", input_path]
-            + silent_audio_input
-            + extra_inputs
-            + ["-filter_complex", filter_complex]
-            + audio_map_args + audio_fx_args
-            + ["-c:v", "libx264", "-r", str(fps), "-b:v", bitrate, "-preset", preset]
-            + ["-c:a", "aac", "-b:a", "192k"]
-            + _clear_metadata_args()
-            + [output_path]
-        )
-        _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
-        out_w, out_h = 1080, 1080
-        rendered = True
 
     # Mặc định / Chế độ 5 & 6: Lách Full Màn 16:9 (Hỗ trợ Full HD 1080p đến 4K 3840x2160)
     # Guard: chỉ chạy khi chưa có chế độ nào phía trên render (shorts/pip/square) — tránh render đè
@@ -1021,6 +987,7 @@ def render_video(
                 + [output_path]
             )
 
+        cmd[-1:-1] = ["-t", f"{effective_dur / speed:.6f}"]
         _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
         out_w, out_h = w_res, h_res
         rendered = True

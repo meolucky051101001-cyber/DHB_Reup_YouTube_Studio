@@ -1179,7 +1179,7 @@ function renderOptionsTable() {
       <td>#${o.id}</td>
       <td><b>${escapeHtml(o.name)}</b>${o.category_id ? `<div style="font-size:10.5px; color:var(--text-muted)">Danh mục ${escapeHtml(String(o.category_id))}</div>` : ''}</td>
       <td>${o.affiliate_enabled ? `<span class="badge badge-ok" style="font-size:10px;">✅ Bật</span><div style="font-size:10.5px; color:#38bdf8; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(o.affiliate_url || '')}</div>` : '<span style="color:var(--text-muted)">—</span>'}</td>
-      <td>${o.pin_comment_enabled ? '<span class="badge badge-ok" style="font-size:10px;">✅ Ghim</span>' : '<span style="color:var(--text-muted)">—</span>'}</td>
+      <td>${o.pin_comment_enabled ? '<span class="badge badge-wait" style="font-size:10px;">⚠️ Yêu cầu ghim chưa hỗ trợ — sẽ chặn đăng</span>' : '<span style="color:var(--text-muted)">—</span>'}</td>
       <td style="font-size:11px; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(o.append_hashtags || '')}">${escapeHtml(o.append_hashtags || '')}</td>
       <td>
         <button class="btn btn-outline btn-sm" onclick="editOptionGroup(${o.id})" title="Sửa bộ tùy chọn">✏️</button>
@@ -1570,6 +1570,11 @@ async function loadQueue(preserveSelection = false) {
     }
 
     const res = (item.resolution || '1080p').toLowerCase();
+    let postWarnings = [];
+    try { postWarnings = JSON.parse(item.post_upload_warnings_json || '[]'); } catch (_) {}
+    if (Array.isArray(postWarnings) && postWarnings.length) {
+      statusBadge += `<details style="color:#f59e0b"><summary>⚠️ ${postWarnings.length} cảnh báo bước phụ</summary>${postWarnings.map(w => `<div>${escapeHtml(w.message || w.code || '')}</div>`).join('')}<small>Kiểm tra video hiện có trước khi thử lại bước phụ; không cần đăng lại video.</small></details>`;
+    }
     const resBadge = res === '4k' ? 'badge-ok' : (res === '2k' ? 'badge-purple' : 'badge-video');
     const mobileBadge = item.emulate_mobile !== 0
       ? '<span title="Đăng giả lập điện thoại di động (Mobile User-Agent & Touch)" style="font-size:11px; color:#38bdf8; font-weight:600;">📱 Mobile</span>'

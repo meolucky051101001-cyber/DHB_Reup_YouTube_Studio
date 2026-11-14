@@ -96,7 +96,8 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                 render_config_json TEXT, resolution TEXT, render_mode TEXT,
                 cut_start TEXT, cut_end TEXT, project_name TEXT DEFAULT 'Default',
                 content_key TEXT DEFAULT '', manual_reupload_authorized INTEGER DEFAULT 0,
-                manual_reupload_reason TEXT DEFAULT '', last_attempt_id INTEGER DEFAULT NULL
+                manual_reupload_reason TEXT DEFAULT '', last_attempt_id INTEGER DEFAULT NULL,
+                post_upload_warnings_json TEXT DEFAULT '[]'
             );
             CREATE TABLE youtube_channels (
                 id INTEGER PRIMARY KEY, name TEXT, channel_id TEXT, handle TEXT,
@@ -126,6 +127,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                 source_post_id TEXT DEFAULT '', content_key TEXT DEFAULT '', channel_id INTEGER,
                 phase TEXT DEFAULT 'Queued', outcome TEXT DEFAULT 'InProgress', reason TEXT DEFAULT '',
                 published_url TEXT DEFAULT '', error_message TEXT DEFAULT '',
+                post_upload_warnings_json TEXT DEFAULT '[]',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(queue_id, attempt_no)
             );

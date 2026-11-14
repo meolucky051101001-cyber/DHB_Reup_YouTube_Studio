@@ -4504,6 +4504,12 @@ def api_list_monitors():
     return pipeline_manager.get_monitor_snapshots()
 
 
+@app.get('/api/upload-capabilities')
+def api_upload_capabilities():
+    from youtube_uploader import upload_capabilities
+    return upload_capabilities()
+
+
 @app.post("/api/monitors")
 def api_create_monitor(data: Dict[str, Any] = Body(...)):
     name = (data.get("name") or "").strip()

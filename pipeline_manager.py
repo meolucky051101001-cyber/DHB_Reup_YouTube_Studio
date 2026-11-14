@@ -307,7 +307,7 @@ def _start_upload_attempt(queue_id, claim_token, item, channel_id):
         conn.close()
 
 
-def _finish_upload_attempt(attempt_id, outcome, published_url="", error_message=""):
+def _finish_upload_attempt(attempt_id, outcome, published_url="", error_message="", warnings=None):
     if not attempt_id:
         return
     conn = get_conn()
@@ -317,6 +317,9 @@ def _finish_upload_attempt(attempt_id, outcome, published_url="", error_message=
             "error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (outcome, published_url or "", error_message or "", attempt_id),
         )
+        if warnings is not None:
+            conn.execute('UPDATE upload_attempts SET post_upload_warnings_json=? WHERE id=?',
+                         (encode(warnings), attempt_id))
         conn.commit()
     finally:
         conn.close()
@@ -1936,6 +1939,7 @@ class PipelineManager:
                 )
 
                 if isinstance(pub_res, dict):
+                    post_warnings = pub_res.get('warnings') or []
                     pub_url = pub_res.get("url", "")
                     is_cancelled = bool(pub_res.get("cancelled", False))
                     is_flagged = bool(pub_res.get("flagged_copyright", False))
@@ -1943,6 +1947,7 @@ class PipelineManager:
                     warning_msg = pub_res.get("warning_message", "")
                     discard_status = str(pub_res.get("discard_status") or "").strip().lower()
                 else:
+                    post_warnings = []
                     pub_url = str(pub_res)
                     is_cancelled = False
                     is_flagged = False
@@ -2038,6 +2043,7 @@ class PipelineManager:
                         status="Completed",
                         published_url=pub_url,
                         error_message="",
+                        post_upload_warnings_json=encode(post_warnings),
                     )
                     if not completed_saved:
                         reservation_keep = True
@@ -2046,7 +2052,10 @@ class PipelineManager:
                     if not self._record_published_history_for_item(item_id, channel):
                         reservation_keep = True
                         raise RuntimeError("Không ghi được published_history sau khi YouTube trả URL.")
-                    _finish_upload_attempt(upload_attempt_id, "Completed", pub_url)
+                    _finish_upload_attempt(upload_attempt_id, "Completed", pub_url, warnings=post_warnings)
+                    for warning in post_warnings:
+                        add_log('Upload', warning.get('message') or 'Bước phụ sau đăng cần kiểm tra.', 'WARNING',
+                                video_title=title, channel_name=channel['name'])
                     add_log(
                         "Upload",
                         f"✅ Đăng thành công lên kênh [{channel['name']}]: {pub_url}",

@@ -961,7 +961,8 @@ class ResumableUploadTests(unittest.TestCase):
             path.write_bytes(b"0123456789")
             result = self._run(session, path)
 
-        self.assertEqual(result, f"https://youtu.be/{VIDEO_ID}")
+        self.assertEqual(result["url"], f"https://youtu.be/{VIDEO_ID}")
+        self.assertEqual(result["warnings"], [])
         media_ranges = [
             kwargs["headers"].get("Content-Range")
             for _url, kwargs in session.put_calls
@@ -980,7 +981,8 @@ class ResumableUploadTests(unittest.TestCase):
             path.write_bytes(b"data")
             result = self._run(session, path)
 
-        self.assertEqual(result, f"https://youtu.be/{VIDEO_ID}")
+        self.assertEqual(result["url"], f"https://youtu.be/{VIDEO_ID}")
+        self.assertEqual(result["warnings"], [])
         self.assertEqual(len(session.put_calls), 2)
         self.assertEqual(session.put_calls[0][1]["headers"]["Content-Range"], "bytes 0-3/4")
         self.assertEqual(session.put_calls[1][1]["headers"]["Content-Range"], "bytes */4")

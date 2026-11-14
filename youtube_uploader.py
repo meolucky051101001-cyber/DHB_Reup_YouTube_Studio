@@ -1668,11 +1668,13 @@ def _upload_via_youtube_api_with_session(
     thumbnail_path: str = "",
     progress_callback: Optional[Callable[[int, str], None]] = None,
     session: Optional[requests.Session] = None,
-) -> str:
+) -> Dict[str, Any]:
     """
     Đăng video lên YouTube qua YouTube Data API v3 Resumable Upload (cắt mảnh 8MB).
-    Trả về link YouTube sau khi đăng thành công.
+    Trả về URL đã xác minh và cảnh báo độc lập của các bước phụ.
     """
+    if metadata.get('pin_comment'):
+        raise RuntimeError('Ghim bình luận chưa được hỗ trợ; hãy tắt yêu cầu ghim trước khi đăng.')
     if metadata.get("age_restriction"):
         raise RuntimeError(
             "Chế độ YouTube API không xác nhận được giới hạn độ tuổi 18+ trên YouTube Studio. "
@@ -1872,39 +1874,34 @@ def _upload_via_youtube_api_with_session(
         progress_callback(96, "Đã chuyển file xong; đang chờ YouTube xử lý và đọc lại metadata...")
     _verify_api_video(http, video_id, access_token, metadata, progress_callback=progress_callback)
 
+    warnings = []
+    if thumbnail_path and not os.path.exists(thumbnail_path):
+        warnings.append({'step':'thumbnail','code':'FILE_MISSING','message':'Video đã đăng; file thumbnail không còn tồn tại.'})
     if thumbnail_path and os.path.exists(thumbnail_path):
         try:
             with open(thumbnail_path, "rb") as tf:
-                http.post(
+                response = http.post(
                     f"https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId={video_id}",
                     headers={"Authorization": f"Bearer {access_token}", "Content-Type": "image/jpeg"},
                     data=tf.read(),
                     timeout=30,
                 )
+            if not 200 <= response.status_code < 300:
+                warnings.append({'step':'thumbnail','code':f'HTTP_{response.status_code}',
+                                 'message':f'Video đã đăng; đặt thumbnail thất bại (HTTP {response.status_code}).'})
+            else:
+                payload = response.json()
+                if not isinstance(payload, dict) or not payload.get('items'):
+                    warnings.append({'step':'thumbnail','code':'RESULT_UNKNOWN',
+                                     'message':'Video đã đăng; chưa xác minh được thumbnail từ phản hồi API.'})
         except Exception as thumb_err:
-            _log_optional_step_failure("tải thumbnail qua YouTube API", thumb_err, channel, metadata)
-
-    if metadata.get("pin_comment"):
-        try:
-            http.post(
-                "https://www.googleapis.com/youtube/v3/commentThreads?part=snippet",
-                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                json={
-                    "snippet": {
-                        "videoId": video_id,
-                        "topLevelComment": {
-                            "snippet": {"textOriginal": metadata["pin_comment"]}
-                        },
-                    }
-                },
-                timeout=20,
-            )
-        except Exception as pin_err:
-            _log_optional_step_failure("ghim bình luận qua YouTube API", pin_err, channel, metadata)
+            warnings.append({'step':'thumbnail','code':'RESULT_UNKNOWN',
+                             'message':'Video đã đăng; kết quả đặt thumbnail chưa rõ. Kiểm tra Studio trước khi thử lại.'})
+            _log_optional_step_failure("tải thumbnail qua YouTube API", type(thumb_err).__name__, channel, metadata)
 
     if progress_callback:
         progress_callback(100, "Đăng thành công qua YouTube API")
-    return verified_url
+    return {'url':verified_url, 'warnings':warnings}
 
 
 def upload_via_youtube_api(
@@ -1913,7 +1910,7 @@ def upload_via_youtube_api(
     channel: Dict[str, Any],
     thumbnail_path: str = "",
     progress_callback: Optional[Callable[[int, str], None]] = None,
-) -> str:
+) -> Dict[str, Any]:
     with _http_session_for_channel(channel) as session:
         return _upload_via_youtube_api_with_session(
             video_path=video_path,
@@ -3159,6 +3156,9 @@ def upload_via_playwright_studio(
     Tích hợp khóa đồng bộ Profile Chrome, Anti-Checkpoint Stealth Shield & Copyright Check Guardian.
     Với Profile Antidetect: dùng chung trình duyệt qua CDP, không tự mở Chrome/user_data_dir.
     """
+    warnings = []
+    if metadata.get('pin_comment'):
+        raise RuntimeError('Ghim bình luận chưa được hỗ trợ; hãy tắt yêu cầu ghim trước khi đăng.')
     # Radio 18+ trên Studio chưa từng được xác minh trong DOM thật (xem HANDOVER v7).
     # Chặn trước khi mở trình duyệt/nạp file để không tạo bản nháp rác rồi phải dọn.
     if metadata.get("age_restriction"):
@@ -3377,7 +3377,10 @@ def upload_via_playwright_studio(
                         if thumb_input.count() > 0:
                             thumb_input.set_input_files(thumbnail_path, timeout=5000)
                             page.wait_for_timeout(1500)
+                        else:
+                            warnings.append({'step':'thumbnail','code':'CONTROL_MISSING','message':'Video đã đăng; Studio không có nút đặt thumbnail cho video này.'})
                     except Exception as thumb_err:
+                        warnings.append({'step':'thumbnail','code':'RESULT_UNKNOWN','message':'Video đã đăng; cần kiểm tra thumbnail trong Studio.'})
                         _log_optional_step_failure("tải thumbnail", thumb_err, channel, metadata)
 
                 human_scroll(page, delta_y=220)
@@ -3779,6 +3782,7 @@ def upload_via_playwright_studio(
                 return {
                     "cancelled": False,
                     "url": verified_url,
+                    "warnings": warnings,
                     "flagged_copyright": False,
                     "warning_message": "",
                     "published_uncertain": False,
@@ -3888,6 +3892,8 @@ def validate_upload_preflight(
             "Hãy đồng bộ hoặc nhập Channel ID trước khi chạy video."
         )
     metadata = build_final_metadata(video_item, channel, option_group)
+    if option_group and option_group.get('pin_comment_enabled'):
+        raise RuntimeError('Ghim bình luận chưa được hỗ trợ trên YouTube API hoặc Studio. Tắt yêu cầu ghim trong bộ tùy chọn trước khi đăng; nội dung bình luận vẫn được giữ.')
     mode = (channel.get("upload_mode") or "playwright").strip().lower()
     if mode == "youtube_api":
         unsupported = []
@@ -3907,3 +3913,9 @@ def validate_upload_preflight(
     elif not _channel_antidetect_id(channel):
         _parse_channel_proxy(channel)
     return metadata
+
+
+def upload_capabilities():
+    return {mode: {'pin_comment': False, 'thumbnail': True,
+                   'pin_comment_reason': 'Chưa có quy trình ghim và xác minh được hỗ trợ. Yêu cầu ghim sẽ chặn trước khi gửi video.'}
+            for mode in ('youtube_api', 'playwright')}

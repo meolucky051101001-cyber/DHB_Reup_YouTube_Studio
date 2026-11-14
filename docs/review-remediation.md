@@ -27,4 +27,12 @@ G3: group editing and workbook round trip. G4: render timelines, optional upload
 
 Bulk destination edits now retain canonical group JSON, remove request aliases before SQL and reject conflicting destinations/aliases or missing queue IDs atomically. Excel export converts SQLite rows at the boundary and preserves formula-like text. Tests cover Unicode multi-group and schedule round trips, preview destinations, project filtering and rollback. Chromium exercises actual form submission, workbook download and preview/apply import against the isolated API/DB. Full suite: 330 tests / 139 subtests including both browser tests; Ruff critical checks and diff validation passed.
 
+## G4: media and upload results
+
+Foreground/background timestamps now use the same speed and start point. Shorts and square share the compositing/audio path, including selected background music; encoded output is bounded to the computed duration. Shorts auto-fit rounds speed upward so the cap is not exceeded. Existing finalizer tolerances remain unchanged.
+
+The API uploader returns `{url, warnings}` after main-video verification. Thumbnail HTTP failures, malformed responses and transport errors preserve the verified video result. Warnings persist on the queue and attempt and remain visible after restart. No automatic video or comment retry is added. API and Studio both reject unsupported pin intent before upload; existing option text is preserved, and `/api/upload-capabilities` reports the limitation. The former API path that silently created an ordinary comment is removed.
+
+Validation: 336 tests / 146 subtests including Chromium passed (9 opt-in media methods skipped in that run). The explicit real-media run passed all 28 cases: 18 core, 3 controls, 6 edges and 1080p, including final-frame motion, music signal, duration, audio presence and stop cleanup. CI now runs the media matrix separately. HTTP 403/500, timeout, malformed/success responses and durable Completed-with-warning behavior are covered offline.
+
 PRs are committed and pushed per completed phase, stacked on the previous branch. Merge and live publishing are separate actions.
