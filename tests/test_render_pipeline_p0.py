@@ -287,6 +287,7 @@ class RenderOwnerPropagationTests(unittest.TestCase):
             manager._lock = threading.Lock()
 
             with mock.patch.object(pm, "get_conn", side_effect=lambda: _FakeConn(row)), \
+                    mock.patch.object(pm, "queue_requires_review", return_value=False), \
                     mock.patch.object(pm, "add_log"), \
                     mock.patch.object(pm, "get_settings", return_value={}), \
                     mock.patch.object(pm, "sha256_file", return_value="test-fingerprint"), \

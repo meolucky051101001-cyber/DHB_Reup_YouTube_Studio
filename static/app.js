@@ -808,13 +808,6 @@ ${lines.join(NL_CHAR) || '(không có profile Antidetect nào)'}`);
   }
 }
 
-function escapeJs(str) {
-  return String(str ?? '')
-    .replace(/\\/g, '\\\\')
-    .replace(/'/g, "\\'")
-    .replace(/"/g, '&quot;');
-}
-
 function renderProfilesTable() {
   const tbody = document.getElementById('profiles-tbody');
   if (!tbody) return;
@@ -822,7 +815,7 @@ function renderProfilesTable() {
     tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; padding:18px; color:var(--text-muted)">Chưa có Profile Chrome nào. Hãy thêm kênh ở trên hoặc bấm "🔄 Nạp Cài Đặt & Profile" ở góc trên bên phải.</td></tr>`;
     return;
   }
-  tbody.innerHTML = gProfiles.map(p => {
+  tbody.innerHTML = gProfiles.map((p, profileIndex) => {
     const st = p.login_status || '';
     let stBadge = '<span class="badge badge-wait">Chưa kiểm tra</span>';
     if (st === 'Đã đăng nhập') stBadge = '<span class="badge badge-ok">✅ Đã đăng nhập</span>';
@@ -841,25 +834,31 @@ function renderProfilesTable() {
       : (p.proxy ? escapeHtml(p.proxy) : '<span style="color:var(--text-muted)">Trực tiếp</span>');
     const proxyBtn = isAd
       ? '<button class="btn btn-outline btn-sm" disabled title="Proxy do Antidetect quản lý — sửa trong Antidetect">🔒</button>'
-      : `<button class="btn btn-outline btn-sm" onclick="profileEditProxy('${escapeJs(p.name)}')" title="Sửa Proxy của Profile">⚙️</button>`;
+      : `<button class="btn btn-outline btn-sm" data-profile-index="${profileIndex}" data-profile-action="profileEditProxy" title="Sửa Proxy của Profile">⚙️</button>`;
 
     return `
       <tr>
         <td><b>${escapeHtml(p.name)}</b><div style="font-size:10.5px; color:var(--text-muted);">${pathLine}</div></td>
         <td><span class="badge ${sourceClass}">${escapeHtml(sourceLabel)}</span></td>
         <td style="font-size:11px; color:#38bdf8;">${proxyCell}</td>
-        <td>${p.channel_count || 0}</td>
+        <td>${Number(p.channel_count) || 0}</td>
         <td>${stBadge}${p.last_login_check ? `<div style="font-size:10px; color:var(--text-muted)">${escapeHtml(p.last_login_check)}</div>` : ''}</td>
         <td>
-          <button class="btn btn-success btn-sm" onclick="profileOpenBrowser('${escapeJs(p.name)}')" title="Mở Chrome để đăng nhập Google thủ công">🌐 Mở Đăng Nhập</button>
-          <button class="btn btn-accent btn-sm" onclick="profileCheckLogin('${escapeJs(p.name)}')" title="Tự kiểm tra phiên đăng nhập Google của Profile">🔍 Kiểm Tra</button>
-          <button class="btn btn-purple btn-sm" onclick="profileRefreshChannels('${escapeJs(p.name)}')" title="Quét danh sách kênh YouTube thật trong Profile">🔄 Quét Kênh</button>
+          <button class="btn btn-success btn-sm" data-profile-index="${profileIndex}" data-profile-action="profileOpenBrowser" title="Mở Chrome để đăng nhập Google thủ công">🌐 Mở Đăng Nhập</button>
+          <button class="btn btn-accent btn-sm" data-profile-index="${profileIndex}" data-profile-action="profileCheckLogin" title="Tự kiểm tra phiên đăng nhập Google của Profile">🔍 Kiểm Tra</button>
+          <button class="btn btn-purple btn-sm" data-profile-index="${profileIndex}" data-profile-action="profileRefreshChannels" title="Quét danh sách kênh YouTube thật trong Profile">🔄 Quét Kênh</button>
           ${proxyBtn}
-          <button class="btn btn-outline btn-sm" style="color:#f87171; border-color:rgba(248,113,113,0.3);" onclick="profileDelete('${escapeJs(p.name)}')" title="Xóa Profile khỏi hệ thống (không xóa thư mục)">🗑️</button>
+          <button class="btn btn-outline btn-sm" style="color:#f87171; border-color:rgba(248,113,113,0.3);" data-profile-index="${profileIndex}" data-profile-action="profileDelete" title="Xóa Profile khỏi hệ thống (không xóa thư mục)">🗑️</button>
         </td>
       </tr>
     `;
   }).join('');
+  const actions = { profileOpenBrowser, profileCheckLogin, profileRefreshChannels, profileEditProxy, profileDelete };
+  tbody.querySelectorAll('[data-profile-action]').forEach(button => {
+    const profile = gProfiles[Number(button.dataset.profileIndex)];
+    const action = actions[button.dataset.profileAction];
+    if (profile && action) button.addEventListener('click', () => action(profile.name));
+  });
 }
 
 async function profileOpenBrowser(name) {
@@ -1558,7 +1557,7 @@ async function loadQueue(preserveSelection = false) {
     let statusBadge = `<span class="badge badge-wait">${escapeHtml(item.status)}</span>`;
     if (item.status === 'Completed') {
       statusBadge = `<span class="badge badge-ok">✅ Đã đăng</span>`;
-    } else if (item.status === 'NeedsReview') {
+    } else if ((item.requires_review || item.status === 'NeedsReview')) {
       statusBadge = `<span class="badge" style="background:rgba(245,158,11,0.2); color:#f59e0b; border:1px solid #f59e0b; font-weight:700;" title="${escapeHtml(item.error_message || 'Hãy kiểm tra YouTube Studio trước khi chạy lại')}">🔎 Cần đối soát</span>`;
     } else if (item.status === 'Stopped' || (item.status && item.status.includes('Dừng'))) {
       statusBadge = `<span class="badge" style="background:rgba(245,158,11,0.2); color:#f59e0b; border:1px solid #f59e0b; font-weight:700;" title="${escapeHtml(item.error_message || 'Đã dừng theo yêu cầu')}">⏹️ Đã dừng</span>`;
@@ -1656,7 +1655,7 @@ async function loadQueue(preserveSelection = false) {
             <button class="btn btn-accent btn-sm" onclick="openPreviewModal(${item.id})" title="Xem thử video trực tiếp">▶️</button>
             <button class="btn btn-outline btn-sm" onclick="openEditModal(${item.id})" title="Chỉnh sửa chi tiết tiêu đề, mô tả, chất lượng...">✏️</button>
             ${item.status === 'Completed' ? `<button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'reupload')" title="Ghi lý do và cho phép đăng lại riêng video này">🔁</button>` : ''}
-            ${item.status === 'NeedsReview' ? `<button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'reupload')" title="Xác nhận chưa đăng rồi cho phép chạy lại video này">🔁</button><button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'confirmed_published')" title="Xác nhận đã đăng và lưu URL vào lịch sử">✅</button>` : ''}
+            ${(item.requires_review || item.status === 'NeedsReview') ? `<button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'reupload')" title="Xác nhận chưa đăng rồi cho phép chạy lại video này">🔁</button><button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'confirmed_published')" title="Xác nhận đã đăng và lưu URL vào lịch sử">✅</button>` : ''}
           </div>
         </td>
       </tr>
@@ -2281,7 +2280,7 @@ async function manualReuploadQueueItem(itemId, action) {
 
   const payload = { action, reason: reason.trim() };
   if (action === 'reupload') {
-    if (item.status === 'NeedsReview') {
+    if ((item.requires_review || item.status === 'NeedsReview')) {
       if (!confirm('Bạn đã kiểm tra YouTube Studio và xác nhận lượt trước CHƯA đăng video này?')) return;
       payload.confirm_not_published = true;
     } else if (!confirm('Cho phép đăng lại riêng video này? Thao tác có thể tạo video trùng trên kênh.')) {

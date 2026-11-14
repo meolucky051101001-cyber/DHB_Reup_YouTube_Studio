@@ -62,6 +62,7 @@ from database import (
     content_identity_migration_report,
     set_channel_group_memberships,
     register_managed_artifact,
+    queue_requires_review,
 )
 from antidetect_client import AntidetectClient, AntidetectError
 from scanner_downloader import scan_social_urls, probe_video_info, probe_video_infos, VIDEO_EXTENSIONS, VideoProbeError
@@ -671,7 +672,9 @@ def api_get_queue(project: str = ""):
         p_row = conn.execute("SELECT name FROM projects ORDER BY id ASC LIMIT 1").fetchone()
         project = p_row["name"] if p_row else "Dự án YouTube #1"
     rows = conn.execute(
-        "SELECT *, COALESCE(claim_token, '') <> '' AS is_claimed "
+        "SELECT *, COALESCE(claim_token, '') <> '' AS is_claimed, "
+        "(status = 'NeedsReview' OR EXISTS (SELECT 1 FROM content_reservations r "
+        "WHERE r.queue_id = video_queue.id AND r.state = 'NeedsReview')) AS requires_review "
         "FROM video_queue WHERE project_name = ? ORDER BY id DESC",
         (project,),
     ).fetchall()
@@ -1389,6 +1392,7 @@ def api_bulk_update_queue(data: Dict[str, Any] = Body(...)):
     try:
         conn.execute("BEGIN IMMEDIATE")
         marks = ",".join("?" for _ in ids)
+        _ensure_queue_items_idle(conn, ids, "sửa hàng loạt")
         rows = conn.execute(f"SELECT * FROM video_queue WHERE id IN ({marks})", ids).fetchall()
         current_by_id = {int(row["id"]): dict(row) for row in rows}
         existing_ids = set(current_by_id)
@@ -1595,6 +1599,7 @@ def api_edit_queue_metadata(data: Dict[str, Any] = Body(...)):
         row = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
         if not row:
             raise HTTPException(404, f"Không tìm thấy video #{item_id} trong hàng đợi.")
+        _ensure_queue_items_idle(conn, [item_id], "sửa metadata")
         current = dict(row)
         updates: Dict[str, Any] = {
             "title": (data.get("title") or "").strip(),
@@ -2521,6 +2526,9 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int],
                 _row_warnings.append(message)
                 warn(f"Dòng {_row['row']} (#{_item_id}): {message}")
 
+            if _blocked_queue_rows(conn, [item_id]):
+                row_error("Video đang được giữ hoặc cần đối soát; không thể sửa bằng Excel.")
+
             title = values.get("title")
             if title is not None and str(title).strip() != "":
                 title_text = str(title).strip()
@@ -3238,6 +3246,8 @@ def api_manual_reupload(item_id: int, data: Dict[str, Any] = Body(...)):
             "SELECT content_key, channel_id, state FROM content_reservations WHERE queue_id = ?",
             (item_id,),
         ).fetchall()
+        if queue_requires_review(conn, item_id):
+            status = "NeedsReview"
         if any(str(reservation["state"] or "") == "Active" for reservation in reservations):
             conn.rollback()
             raise HTTPException(409, "Reservation vẫn đang hoạt động; chưa thể thay đổi kết quả upload.")
@@ -3394,6 +3404,9 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
     conn = get_conn()
     try:
         placeholders = ",".join("?" * len(ids))
+        held = [item_id for item_id in ids if queue_requires_review(conn, item_id)]
+        if held:
+            raise HTTPException(409, f"Video cần đối soát trước khi chạy: {held}")
         rows = conn.execute(
             f"SELECT id, title, status, published_url FROM video_queue WHERE id IN ({placeholders})",
             ids,
@@ -3418,7 +3431,7 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
         result = pipeline_manager.start_batch(
             ids, do_dl, do_rd, do_up, preview_token=preview_token if isinstance(preview_token, str) else "",
         )
-        if result.get("code") == "PREVIEW_STALE":
+        if result.get("code") in {"PREVIEW_STALE", "REVIEW_REQUIRED"}:
             return JSONResponse({**result, "detail": result["message"]}, status_code=409)
         return result
 
@@ -3451,6 +3464,8 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
         )
 
     result = pipeline_manager.start_batch(run_ids, do_dl, do_rd, do_up, force_reupload=False)
+    if result.get("code") == "REVIEW_REQUIRED":
+        return JSONResponse({**result, "detail": result["message"]}, status_code=409)
     if skipped:
         result["skipped"] = skipped
         result["message"] = (result.get("message") or "") + f" Bỏ qua {len(skipped)} video đã đăng/đang upload dở."

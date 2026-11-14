@@ -2,7 +2,6 @@ import json
 import hashlib
 import math
 import os
-import shutil
 import threading
 import time
 import uuid
@@ -14,7 +13,7 @@ from typing import List, Dict, Any, Optional
 
 from database import (
     get_conn, add_log, get_settings, register_managed_artifact,
-    set_log_context, clear_log_context,
+    set_log_context, clear_log_context, queue_requires_review,
 )
 from config import APP_OUTPUT_DIR, APP_TEMP_DIR
 from scanner_downloader import download_video, scan_social_urls
@@ -1016,6 +1015,11 @@ class PipelineManager:
             if self._is_running or self._active_threads > 0:
                 return {"ok": False, "message": "Hệ thống đang chạy hoặc đang dừng một tiến trình khác."}
 
+            with closing(get_conn()) as conn:
+                held = [item_id for item_id in item_ids if queue_requires_review(conn, item_id)]
+            if held:
+                return {"ok": False, "code": "REVIEW_REQUIRED", "message": f"Video cần đối soát: {held}"}
+
             batch_token = uuid.uuid4().hex
             if do_upload:
                 try:
@@ -1082,7 +1086,7 @@ class PipelineManager:
                     raise PreviewStale(f"Video #{item_id} không còn trong hàng đợi.")
                 item = dict(row)
                 status = str(item.get("status") or "").strip()
-                if (item.get("claim_token") or item.get("published_url") or status in ("Completed", "NeedsReview")
+                if (queue_requires_review(conn, item_id) or item.get("claim_token") or item.get("published_url") or status in ("Completed", "NeedsReview")
                         or status.startswith(("Uploading", "Downloading", "Rendering", "Đang đăng"))):
                     raise PreviewStale(f"Video #{item_id} đã đổi trạng thái. Hãy xem trước lại.")
 
@@ -1196,7 +1200,7 @@ class PipelineManager:
                             entry["warnings"].append("nội dung đã có trong lịch sử đăng ở kênh này")
                     except Exception:
                         entry["warnings"].append("không kiểm tra được lịch sử đăng trùng")
-                    if str(item.get("status") or "").strip() == "NeedsReview":
+                    if queue_requires_review(conn, item_id):
                         entry["reasons"].append("cần đối soát lượt đăng trước")
                     status = str(item.get("status") or "")
                     if status.strip() == "Completed" or item.get("published_url"):
@@ -1432,7 +1436,7 @@ class PipelineManager:
         # A publish request may already have reached YouTube even when Studio did
         # not return a verifiable URL. Never turn that ambiguous result into an
         # automatic retry, including when force_reupload was requested.
-        if do_upload and existing_status == "NeedsReview":
+        if existing_status == "NeedsReview":
             add_log(
                 "Pipeline",
                 f"Giữ '{title}' ở trạng thái cần đối soát: lượt đăng trước chưa xác minh. "
@@ -1463,6 +1467,18 @@ class PipelineManager:
 
         token = claim_token or uuid.uuid4().hex
         conn = get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        if queue_requires_review(conn, item_id):
+            conn.rollback()
+            conn.close()
+            return
+        # Read under the same write lock as the claim; API checks can be stale.
+        fresh = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
+        if not fresh:
+            conn.rollback()
+            conn.close()
+            return
+        item = dict(fresh)
         cur = conn.execute(
             "UPDATE video_queue SET claim_token = ? WHERE id = ? AND COALESCE(claim_token, '') = ''",
             (token, item_id),
@@ -2027,33 +2043,6 @@ class PipelineManager:
                         channel_name=channel["name"],
                         video_title=title,
                     )
-
-                # Tự động di chuyển video nguồn trên máy vào thư mục uploaded/ (chỉ khi đăng thành công)
-                is_local_file = item.get("source_type") in ("File", "LocalFile") or item.get("platform") == "LocalFile"
-                if not is_cancelled and not result_unverified and pub_url and is_local_file and input_path and os.path.exists(input_path):
-                    try:
-                        p = Path(input_path)
-                        if p.parent.name != "uploaded":
-                            uploaded_dir = p.parent / "uploaded"
-                            uploaded_dir.mkdir(exist_ok=True)
-                            dest_file = uploaded_dir / p.name
-                            if not dest_file.exists():
-                                shutil.move(str(p), str(dest_file))
-                                _update_row(input_video_path=str(dest_file))
-                                try:
-                                    temp_root = os.path.normcase(str(APP_TEMP_DIR.resolve()))
-                                    moved_path = os.path.normcase(str(dest_file.resolve()))
-                                    if os.path.commonpath([moved_path, temp_root]) == temp_root:
-                                        try:
-                                            register_managed_artifact(str(dest_file), "upload_archive", "queue", item_id)
-                                        except Exception as manifest_err:
-                                            add_log("Storage", f"Không ghi được manifest cho file archive queue #{item_id}; file được giữ lại ({type(manifest_err).__name__}).", "WARNING", video_title=title)
-                                except (OSError, ValueError):
-                                    pass
-                                input_path = str(dest_file)
-                                add_log("Pipeline", f"Đã lưu trữ video gốc vào: {dest_file}", "INFO")
-                    except Exception as mv_err:
-                        add_log("Pipeline", f"Không thể di chuyển file vào uploaded/: {mv_err}", "WARNING")
 
                 # Xóa file tạm nếu cài đặt yêu cầu — chỉ xóa file nằm trong thư mục temp/ của tool
                 settings = get_settings()

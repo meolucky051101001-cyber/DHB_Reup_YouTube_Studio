@@ -25,3 +25,9 @@ jobs:
         run: node --check static/app.js
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+      - name: Install browser for DOM regressions
+        run: python -m playwright install chromium
+      - name: Run browser regressions
+        env:
+          DHB_BROWSER_TESTS: '1'
+        run: python -m unittest discover -s tests -p test_review_browser.py -v

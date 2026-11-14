@@ -27,6 +27,15 @@ class SecretCollectionError(RuntimeError):
     """Không đọc được nguồn bí mật — thà che toàn bộ còn hơn lộ dữ liệu thật."""
 
 
+def queue_requires_review(conn, queue_id: int) -> bool:
+    """The reservation is durable evidence even if a legacy worker changed status."""
+    return bool(conn.execute(
+        "SELECT 1 FROM video_queue q WHERE q.id = ? AND (q.status = 'NeedsReview' OR EXISTS "
+        "(SELECT 1 FROM content_reservations r WHERE r.queue_id = q.id AND r.state = 'NeedsReview'))",
+        (queue_id,),
+    ).fetchone())
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(APP_DB_PATH), timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
