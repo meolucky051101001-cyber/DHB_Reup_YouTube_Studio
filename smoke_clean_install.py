@@ -11,6 +11,7 @@ from pathlib import Path
 
 import requests
 from config import FFMPEG_EXE
+from scanner_downloader import _terminate_download_process
 
 
 def smoke(python):
@@ -33,7 +34,8 @@ def smoke(python):
         with (root/'server.log').open('w',encoding='utf-8') as log:
             proc=subprocess.Popen([str(python),'-m','uvicorn','app:app','--host','127.0.0.1','--port',str(port)],
                                   cwd=root,env=env,stdout=log,stderr=log,
-                                  creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+                                  creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0,
+                                  start_new_session=os.name!='nt')
             try:
                 base=f'http://127.0.0.1:{port}'
                 deadline=time.monotonic()+30
@@ -62,12 +64,9 @@ def smoke(python):
                         'version':diag['version'],'fingerprint':diag['runtime']['startup_fingerprint'],
                         'ffmpeg_path_fallback':True,'schemas':diag['database']['schemas']}
             finally:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
+                # Windows venv python.exe may launch the actual server as a child.
+                # Stop the entire owned tree before removing its DB and lock file.
+                _terminate_download_process(proc)
 
 
 if __name__=='__main__':
