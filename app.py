@@ -328,7 +328,7 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.15-review-remediation"
+APP_BUILD_VERSION = "2026.11.15-scan-csv"
 RUNTIME_IDENTITY = capture_runtime(APP_ROOT)
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
@@ -1855,6 +1855,7 @@ def api_auto_schedule(data: Dict[str, Any] = Body(...)):
 def api_export_csv(project: str = "Default"):
     import csv
     import io
+    from csv_safety import ENCODING_COLUMN, ENCODING_VERSION, encode_csv_cell
     from fastapi.responses import Response
 
     conn = get_conn()
@@ -1875,14 +1876,15 @@ def api_export_csv(project: str = "Default"):
         "ID", "Platform", "Title", "Description", "Tags", "Duration", "Source_URL",
         "Render_Mode", "Upload_To", "Status", "Published_URL",
         "Visibility", "Schedule_Time", "Made_For_Kids", "Age_Restriction", "Altered_Content",
+        ENCODING_COLUMN,
     ])
     for r in rows:
-        writer.writerow([
+        writer.writerow([encode_csv_cell(value) for value in [
             r["id"], r["platform"], r["title"], r["description"], r["tags"], r["duration"],
             r["source_url"], r["render_mode"], r["upload_to"], r["status"], r["published_url"],
             r["visibility"] or "public", r["schedule_time"] or "",
             r["made_for_kids"] or 0, r["age_restriction"] or 0, r["altered_content"] or 0,
-        ])
+        ]] + [ENCODING_VERSION])
 
     csv_data = "\ufeff" + output.getvalue()
     from urllib.parse import quote
@@ -4675,6 +4677,7 @@ def api_log_modules():
 
 @app.get("/api/logs/export")
 def api_export_logs(module: str = "", status: str = "", q: str = ""):
+    from csv_safety import ENCODING_COLUMN, ENCODING_VERSION, encode_csv_cell
     where_sql, params = _log_query_parts(module, status, q)
     conn = get_conn()
     rows = conn.execute(
@@ -4688,16 +4691,17 @@ def api_export_logs(module: str = "", status: str = "", q: str = ""):
     writer.writerow([
         "id", "created_at", "module", "status", "channel_name", "video_title", "message",
         "run_id", "queue_id", "attempt_id", "phase", "error_code",
+        ENCODING_COLUMN,
     ])
     secrets = collect_secret_values()
     for row in rows:
-        writer.writerow([
+        writer.writerow([encode_csv_cell(value) for value in [
             row["id"], row["created_at"], row["module"], row["status"],
             redact_secrets(row["channel_name"], secrets), redact_secrets(row["video_title"], secrets),
             redact_secrets(row["message"], secrets), redact_secrets(row["run_id"], secrets),
             row["queue_id"], row["attempt_id"], redact_secrets(row["phase"], secrets),
             redact_secrets(row["error_code"], secrets),
-        ])
+        ]] + [ENCODING_VERSION])
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     add_log("System", f"Đã xuất {len(rows)} dòng nhật ký ra file CSV.", "SUCCESS")
     return Response(

@@ -611,6 +611,8 @@ def export_all_tables_csv(target_dir: str, keep: int = 10) -> Dict[str, Any]:
 
     Dùng cho backup ngoài ổ tool; giữ tối đa `keep` bản export gần nhất.
     """
+    from csv_safety import ENCODING_VERSION, encode_csv_cell
+
     raw_target = str(target_dir or "").strip()
     if not raw_target:
         raise ValueError("Chưa cấu hình thư mục export CSV.")
@@ -654,7 +656,7 @@ def export_all_tables_csv(target_dir: str, keep: int = 10) -> Dict[str, Any]:
                             value = ""
                         elif isinstance(value, str):
                             value = redact_secrets(value, secret_values)
-                        out_row.append(value)
+                        out_row.append(encode_csv_cell(value))
                     writer.writerow(out_row)
             table_rows[table] = len(rows)
             total_rows += len(rows)
@@ -665,6 +667,7 @@ def export_all_tables_csv(target_dir: str, keep: int = 10) -> Dict[str, Any]:
         "exported_at": datetime.now().isoformat(timespec="seconds"),
         "database": str(APP_DB_PATH),
         "tables": table_rows,
+        "cell_encoding": ENCODING_VERSION,
     }
     (dest / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
