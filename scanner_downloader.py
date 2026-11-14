@@ -8,12 +8,12 @@ import re
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, List, Any, Optional
-import yt_dlp
 
 from config import (
     APP_TEMP_DIR,
@@ -28,6 +28,61 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".m4v"}
 # Giới hạn số ffprobe chạy song song để không nghẽn đĩa/CPU khi quét thư mục lớn
 PROBE_MAX_WORKERS = max(1, min(8, os.cpu_count() or 4))
 DOWNLOAD_TIMEOUT_SEC = 30 * 60
+SCAN_TIMEOUT_SEC = 5 * 60
+MAX_SCAN_ITEMS = 1000
+
+
+class ScanSourceError(RuntimeError):
+    """A source could not be scanned; do not insert an incomplete selection."""
+
+
+def _scan_remote_source(url, limit, stop_event=None):
+    if stop_event is not None and stop_event.is_set():
+        raise InterruptedError('Đã dừng quét nguồn.')
+    started = time.monotonic()
+    # Job files keep signed source URLs out of the OS process command line.
+    with tempfile.TemporaryDirectory(prefix='scan-', dir=APP_TEMP_DIR) as folder:
+        request = Path(folder) / 'request.json'
+        request.write_text(json.dumps({'url':url,'limit':limit}),encoding='utf-8')
+        result_path = request.with_name('result.json')
+        proc = subprocess.Popen(
+            [sys.executable,str(Path(__file__).with_name('scan_worker.py')),str(request)],
+            stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+            shell=False,creationflags=subprocess.CREATE_NO_WINDOW | getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)
+            if os.name == 'nt' else 0,start_new_session=os.name != 'nt',
+        )
+        try:
+            while proc.poll() is None:
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError('Đã dừng quét nguồn.')
+                if time.monotonic()-started >= SCAN_TIMEOUT_SEC:
+                    raise TimeoutError(f'Quét một nguồn vượt quá {SCAN_TIMEOUT_SEC} giây; đã dừng tiến trình quét.')
+                if stop_event is not None:
+                    stop_event.wait(.1)
+                else:
+                    time.sleep(.1)
+            proc.wait(timeout=5)
+            if stop_event is not None and stop_event.is_set():
+                raise InterruptedError('Đã dừng quét nguồn.')
+            if time.monotonic()-started >= SCAN_TIMEOUT_SEC:
+                raise TimeoutError(f'Quét một nguồn vượt quá {SCAN_TIMEOUT_SEC} giây; đã dừng tiến trình quét.')
+            if not result_path.is_file() or result_path.stat().st_size > 32*1024*1024:
+                raise ScanSourceError('Tiến trình quét không trả kết quả hợp lệ.')
+            try:
+                result = json.loads(result_path.read_text(encoding='utf-8'))
+            except (ValueError, OSError) as exc:
+                raise ScanSourceError('Không đọc được kết quả quét nguồn.') from exc
+            if proc.returncode != 0 or not isinstance(result,dict) or result.get('ok') is not True:
+                raise ScanSourceError('Không lấy được metadata nguồn. Kiểm tra đường dẫn hoặc quyền truy cập rồi thử lại.')
+            entries = result.get('entries')
+            if not isinstance(entries,list) or len(entries)>limit or any(not isinstance(entry,dict) for entry in entries):
+                raise ScanSourceError('Kết quả quét nguồn sai định dạng.')
+            return entries
+        finally:
+            if proc.poll() is None:
+                _terminate_download_process(proc)
+            if proc.poll() is None:
+                raise ScanSourceError('Chưa xác nhận được tiến trình quét đã dừng.')
 
 
 class VideoProbeError(RuntimeError):
@@ -232,102 +287,96 @@ def scan_social_urls(
 ) -> List[Dict[str, Any]]:
     """
     Quét danh sách video từ link kênh hoặc link video lẻ (TikTok, Douyin, YouTube, FB, IG, Twitter...).
-    stop_event: khi được truyền (làn Monitor), kiểm tra giữa các URL để bấm Dừng có hiệu lực
-    ngay thay vì quét hết toàn bộ nguồn mới thoát.
+    Làn Monitor có thể dừng ngay cả khi extractor đang chờ mạng.
+    Mỗi URL mạng có deadline riêng và worker riêng; không gửi video.
     """
+    if not 1 <= max_items_per_url <= MAX_SCAN_ITEMS:
+        raise ValueError(f'Số video mỗi nguồn phải từ 1 đến {MAX_SCAN_ITEMS}.')
     results: List[Dict[str, Any]] = []
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": "in_playlist",
-        "playlistend": max_items_per_url,
-        "ignoreerrors": True,
-    }
+    for raw_url in urls:
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError('Đã dừng quét nguồn.')
+        url = raw_url.strip()
+        if not url:
+            continue
+        # Nếu người dùng nhập đường dẫn thư mục hoặc file nội bộ
+        if os.path.exists(url):
+            if os.path.isdir(url):
+                results.extend(scan_local_folder(url, max_items=max_items_per_url, recursive=recursive_local))
+            elif os.path.isfile(url):
+                probe = probe_video_info(url)
+                f = Path(url)
+                results.append({
+                    "source_type": "File",
+                    "platform": "LocalFile",
+                    "post_id": hashlib.md5(url.encode("utf-8")).hexdigest()[:16].upper(),
+                    "source_url": url,
+                    "input_video_path": url,
+                    "title": f.stem,
+                    "description": f.stem,
+                    "tags": "#shorts",
+                    "duration": probe["duration"],
+                    "view_count": 0,
+                    "like_count": 0,
+                    "upload_to": "Shorts" if probe["seconds"] <= 65 else "Video",
+                })
+            continue
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        for raw_url in urls:
-            if stop_event is not None and stop_event.is_set():
-                break
-            url = raw_url.strip()
-            if not url:
-                continue
-            # Nếu người dùng nhập đường dẫn thư mục hoặc file nội bộ
-            if os.path.exists(url):
-                if os.path.isdir(url):
-                    results.extend(scan_local_folder(url, max_items=max_items_per_url, recursive=recursive_local))
-                elif os.path.isfile(url):
-                    probe = probe_video_info(url)
-                    f = Path(url)
-                    results.append({
-                        "source_type": "File",
-                        "platform": "LocalFile",
-                        "post_id": hashlib.md5(url.encode("utf-8")).hexdigest()[:16].upper(),
-                        "source_url": url,
-                        "input_video_path": url,
-                        "title": f.stem,
-                        "description": f.stem,
-                        "tags": "#shorts",
-                        "duration": probe["duration"],
-                        "view_count": 0,
-                        "like_count": 0,
-                        "upload_to": "Shorts" if probe["seconds"] <= 65 else "Video",
-                    })
-                continue
+        platform = detect_platform(url)
+        try:
+            entries = _scan_remote_source(url, max_items_per_url, stop_event)
+            for entry in entries:
+                if not entry:
+                    continue
+                vid_id = str(entry.get("id") or hashlib.md5(url.encode()).hexdigest()[:12])
+                vid_url = entry.get("webpage_url") or entry.get("url") or url
+                if vid_url and not vid_url.startswith("http"):
+                    if platform == "YouTube":
+                        vid_url = f"https://www.youtube.com/watch?v={vid_id}"
+                    elif platform == "TikTok":
+                        vid_url = url
 
-            platform = detect_platform(url)
-            try:
-                info = ydl.extract_info(url, download=False)
-                if not info:
+                views = int(entry.get("view_count") or 0)
+                likes = int(entry.get("like_count") or 0)
+                dur_sec = float(entry.get("duration") or 0)
+                comments = entry.get("comment_count")
+
+                if min_views > 0 and views < min_views:
+                    continue
+                if min_likes > 0 and likes < min_likes:
+                    continue
+                # Lọc theo bình luận (học IsCmt của filter.json DHB) — chỉ lọc khi yt-dlp trả được số liệu
+                if min_comments > 0 and comments is not None and int(comments or 0) < min_comments:
+                    continue
+                if only_shorts and dur_sec > 90:
                     continue
 
-                entries = info.get("entries") if "entries" in info else [info]
-                for entry in entries:
-                    if not entry:
-                        continue
-                    vid_id = str(entry.get("id") or hashlib.md5(url.encode()).hexdigest()[:12])
-                    vid_url = entry.get("webpage_url") or entry.get("url") or url
-                    if vid_url and not vid_url.startswith("http"):
-                        if platform == "YouTube":
-                            vid_url = f"https://www.youtube.com/watch?v={vid_id}"
-                        elif platform == "TikTok":
-                            vid_url = url
+                title = (entry.get("title") or entry.get("description") or f"{platform} Video {vid_id}").strip()
+                desc = (entry.get("description") or title).strip()
+                tags_list = entry.get("tags") or []
+                tags_str = ", ".join(tags_list[:15]) if isinstance(tags_list, list) else ""
 
-                    views = int(entry.get("view_count") or 0)
-                    likes = int(entry.get("like_count") or 0)
-                    dur_sec = float(entry.get("duration") or 0)
-                    comments = entry.get("comment_count")
-
-                    if min_views > 0 and views < min_views:
-                        continue
-                    if min_likes > 0 and likes < min_likes:
-                        continue
-                    # Lọc theo bình luận (học IsCmt của filter.json DHB) — chỉ lọc khi yt-dlp trả được số liệu
-                    if min_comments > 0 and comments is not None and int(comments or 0) < min_comments:
-                        continue
-                    if only_shorts and dur_sec > 90:
-                        continue
-
-                    title = (entry.get("title") or entry.get("description") or f"{platform} Video {vid_id}").strip()
-                    desc = (entry.get("description") or title).strip()
-                    tags_list = entry.get("tags") or []
-                    tags_str = ", ".join(tags_list[:15]) if isinstance(tags_list, list) else ""
-
-                    results.append({
-                        "source_type": "URL",
-                        "platform": platform,
-                        "post_id": vid_id,
-                        "source_url": vid_url,
-                        "input_video_path": "",
-                        "title": title[:100],
-                        "description": desc,
-                        "tags": tags_str,
-                        "duration": format_duration(dur_sec),
-                        "view_count": views,
-                        "like_count": likes,
-                        "upload_to": "Shorts" if (dur_sec <= 65 or "/shorts/" in vid_url or platform in ("TikTok", "Douyin")) else "Video",
-                    })
-            except Exception as e:
-                add_log("Scanner", f"Lỗi quét link {url}: {e}", "ERROR")
+                results.append({
+                    "source_type": "URL",
+                    "platform": platform,
+                    "post_id": vid_id,
+                    "source_url": vid_url,
+                    "input_video_path": "",
+                    "title": title[:100],
+                    "description": desc,
+                    "tags": tags_str,
+                    "duration": format_duration(dur_sec),
+                    "view_count": views,
+                    "like_count": likes,
+                    "upload_to": "Shorts" if (dur_sec <= 65 or "/shorts/" in vid_url or platform in ("TikTok", "Douyin")) else "Video",
+                })
+        except InterruptedError:
+            raise
+        except (TimeoutError, ScanSourceError):
+            add_log('Scanner', f'Không hoàn tất quét nguồn {platform}; không thêm hàng đợi từ lần quét này.', 'ERROR')
+            raise
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ScanSourceError('Metadata nguồn có giá trị không hợp lệ.') from exc
 
     return results
 

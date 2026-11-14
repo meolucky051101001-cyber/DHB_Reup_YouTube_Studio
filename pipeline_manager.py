@@ -3020,6 +3020,9 @@ class PipelineManager:
 
                     self._update_monitor_status(monitor_id, f"Hoàn tất chu kỳ. Quét tiếp sau {interval_min} phút.")
 
+            except InterruptedError:
+                # A requested Stop during extraction is a lifecycle transition.
+                break
             except Exception as e:
                 self._update_monitor_status(monitor_id, f"Lỗi: {e}")
                 add_log("Monitor", f"Lỗi luồng Monitor [{mon_name}]: {e}", "ERROR")

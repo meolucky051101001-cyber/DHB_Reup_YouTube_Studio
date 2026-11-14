@@ -66,7 +66,7 @@ from database import (
     queue_requires_review,
 )
 from antidetect_client import AntidetectClient, AntidetectError
-from scanner_downloader import scan_social_urls, probe_video_info, probe_video_infos, VIDEO_EXTENSIONS, VideoProbeError
+from scanner_downloader import scan_social_urls, probe_video_info, probe_video_infos, VIDEO_EXTENSIONS, VideoProbeError, ScanSourceError
 from ai_engine import ai_optimize_youtube_metadata, apply_batch_text_edit, SourceLinksTooLongError
 from youtube_uploader import (
     open_profile_for_login,
@@ -726,7 +726,15 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
             raise HTTPException(400, str(exc)) from exc
     urls = normalized_sources
 
-    max_items = int(data.get("max_items", 20) or 20)
+    try:
+        raw_max_items = data.get("max_items", 20)
+        if isinstance(raw_max_items, bool) or not re.fullmatch(r"[0-9]+", str(raw_max_items).strip()):
+            raise ValueError()
+        max_items = int(raw_max_items)
+        if not 1 <= max_items <= 1000:
+            raise ValueError()
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(400, 'Số video mỗi nguồn phải là số nguyên từ 1 đến 1000.')
     min_views = int(data.get("min_views", 0) or 0)
     min_likes = int(data.get("min_likes", 0) or 0)
     min_comments = int(data.get("min_comments", 0) or 0)
@@ -797,6 +805,10 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
         )
     except VideoProbeError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(504, str(exc)) from exc
+    except ScanSourceError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
     conn = get_conn()
     with _import_insert_lock:
