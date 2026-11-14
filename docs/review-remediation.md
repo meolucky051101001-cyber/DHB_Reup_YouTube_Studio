@@ -23,6 +23,8 @@ Validation: 317 tests and 139 subtests including Chromium passed; real SQLite te
 
 G1–G6 are complete for the user's selected scope: offline acceptance and local rollout. See `RELEASE_2026_11_15.md` for evidence, the deployed revision and pre-existing data gaps. No live YouTube upload/comment was performed.
 
+Follow-up G7–G9 is now deployed locally as `2026.11.15-scan-csv`. See `G7_SCAN_LIFECYCLE.md`, `G8_CSV_SAFETY.md` and `G9_LOCAL_SCAN_CSV.md` for scan cancellation/deadlines, reversible CSV escaping, current deployment evidence and remaining roadmap. The earlier release record remains historical.
+
 ## G3: queue preparation
 
 Bulk destination edits now retain canonical group JSON, remove request aliases before SQL and reject conflicting destinations/aliases or missing queue IDs atomically. Excel export converts SQLite rows at the boundary and preserves formula-like text. Tests cover Unicode multi-group and schedule round trips, preview destinations, project filtering and rollback. Chromium exercises actual form submission, workbook download and preview/apply import against the isolated API/DB. Full suite: 330 tests / 139 subtests including both browser tests; Ruff critical checks and diff validation passed.
