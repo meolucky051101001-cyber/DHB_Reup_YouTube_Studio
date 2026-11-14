@@ -739,6 +739,8 @@ class MonitorLifecycleApiTests(unittest.TestCase):
     def test_list_uses_durable_stopped_state_after_sqlite_lock_is_released(self):
         conn = database.get_conn()
         monitor_id = conn.execute("INSERT INTO monitors (name, source_urls) VALUES ('Stop DB lock', 'https://example.test/source')").lastrowid
+        from monitor_fixture import confirm_monitor
+        confirm_monitor(conn, monitor_id)
         conn.commit()
         conn.close()
         manager = pm.PipelineManager()
@@ -798,6 +800,8 @@ class MonitorLifecycleApiTests(unittest.TestCase):
         conn = database.get_conn()
         conn.execute("INSERT INTO monitors (name, source_urls) VALUES ('API lifecycle', 'https://example.test/source')")
         monitor_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        from monitor_fixture import confirm_monitor
+        confirm_monitor(conn, monitor_id)
         conn.commit()
         conn.close()
 

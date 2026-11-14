@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import uuid
+import monitor_policy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime
@@ -443,6 +444,15 @@ def insert_monitor_queue_item(
     )
     if cur.rowcount != 1:
         return None
+    if mon.get('metadata_policy_json'):
+        import monitor_policy
+        approved = monitor_policy.validate_session(conn, mon)
+        conn.execute('UPDATE video_queue SET monitor_metadata_policy_json=? WHERE id=?',
+                     (monitor_policy.encode(approved['envelope']), cur.lastrowid))
+        item = dict(conn.execute('SELECT * FROM video_queue WHERE id=?', (cur.lastrowid,)).fetchone())
+        channel, _ = choose_target_channel(conn, item)
+        monitor_policy.resolve_item(conn, item, channel)
+        monitor_policy.persist_values(conn, item)
     return cur.lastrowid
 
 
@@ -1099,6 +1109,7 @@ class PipelineManager:
                 channel, frozen_groups = choose_target_channel(conn, item, validate_existing_assignment=True)
                 if snapshots[item_id] != encode(approval_item(conn, item, channel, frozen_groups)):
                     raise PreviewStale(f"Video #{item_id} đã đổi đích hoặc cấu hình. Hãy xem trước lại.")
+                monitor_policy.persist_values(conn, item)
                 _preview_upload_file(item, options)
                 channel_id = int(channel["id"])
                 groups = frozen_groups
@@ -2172,6 +2183,9 @@ class PipelineManager:
                     if current != snapshot:
                         raise PreviewStale("Đích hoặc cấu hình đã thay đổi sau khi xác nhận.")
                 elif item.get("_upload_origin") == "monitor":
+                    if not item.get('monitor_metadata_policy_json'):
+                        raise PreviewStale('Video monitor cũ thiếu chính sách; cần xác nhận metadata thủ công.')
+                    monitor_policy.persist_values(conn, item)
                     snapshot = current
                     approval_token = uuid.uuid4().hex
                     conn.execute(
@@ -2361,7 +2375,7 @@ class PipelineManager:
             conn = None
             try:
                 conn = get_conn()
-                mon_row = conn.execute("SELECT name FROM monitors WHERE id = ?", (monitor_id,)).fetchone()
+                mon_row = conn.execute("SELECT * FROM monitors WHERE id = ?", (monitor_id,)).fetchone()
                 if not mon_row:
                     stop_ev.set()
                     with self._monitor_lock:
@@ -2370,6 +2384,7 @@ class PipelineManager:
                     return {"ok": False, "lifecycle_state": "Stopped",
                             "message": f"Không tìm thấy Monitor #{monitor_id}."}
 
+                monitor_policy.validate_session(conn, dict(mon_row))
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 conn.execute(
                     "UPDATE monitors SET is_running = 1, status = 'Starting', last_checked_at = ?, last_heartbeat_at = ? WHERE id = ?",
@@ -2378,6 +2393,14 @@ class PipelineManager:
                 conn.commit()
             except Exception as exc:
                 stop_ev.set()
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                        conn.execute("UPDATE monitors SET is_running=0,status=? WHERE id=?",
+                                     (f'Cần xem lại cấu hình: {exc}', monitor_id))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
                 with self._monitor_lock:
                     if self._monitor_threads.get(monitor_id) is stop_ev:
                         self._monitor_threads.pop(monitor_id, None)
@@ -2860,6 +2883,15 @@ class PipelineManager:
             interval_min = max(1, int(mon.get("check_interval_minutes") or 30))
 
             try:
+                with closing(get_conn()) as policy_conn:
+                    try:
+                        monitor_policy.validate_session(policy_conn, mon)
+                    except ValueError as exc:
+                        policy_conn.execute('UPDATE monitors SET is_running=0,status=? WHERE id=?',
+                                            (f'Cần xác nhận metadata: {exc}', monitor_id))
+                        policy_conn.commit()
+                        stop_ev.set()
+                        break
                 self._update_monitor_status(monitor_id, f"Đang quét {len(urls)} nguồn...")
                 scanned = scan_social_urls(
                     urls,

@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import hashlib
+import monitor_policy
 import threading
 import subprocess
 from datetime import datetime
@@ -1488,6 +1489,7 @@ def api_bulk_update_queue(data: Dict[str, Any] = Body(...)):
             safe = {key: value for key, value in item_updates.items() if key in allowed or key in {
                 "target_group_names_json", "assigned_channel_id", "assigned_group_names_json"
             }}
+            monitor_policy.manual_override(current_by_id[item_id], safe)
             changed = {key: value for key, value in safe.items() if current_by_id[item_id].get(key) != value}
             if not changed:
                 continue
@@ -1686,6 +1688,7 @@ def api_edit_queue_metadata(data: Dict[str, Any] = Body(...)):
             "target_channel_id", "target_group_name", "target_group_names_json", "target_type",
             "target_profile_name", "assigned_channel_id", "assigned_group_names_json", "group_schema_version",
         }}
+        monitor_policy.manual_override(current, safe)
         changed = {key: value for key, value in safe.items() if current.get(key) != value}
         if changed:
             columns = ", ".join(f"{key} = ?" for key in changed)
@@ -1788,7 +1791,7 @@ def api_auto_schedule(data: Dict[str, Any] = Body(...)):
         for item_id in normalized:
             curr_str = curr.strftime("%Y-%m-%d %H:%M:%S")
             conn.execute(
-                "UPDATE video_queue SET schedule_time = ?, visibility = 'schedule', is_premiere = ? "
+                "UPDATE video_queue SET monitor_metadata_policy_json='', schedule_time = ?, visibility = 'schedule', is_premiere = ? "
                 "WHERE id = ? AND COALESCE(claim_token, '') = ''",
                 (curr_str, is_premiere, item_id),
             )
@@ -2753,6 +2756,7 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int],
             ))
             current = current_by_id[item_id]
             _ensure_destination_not_active(current, destination_changed)
+            monitor_policy.manual_override(current, safe_updates)
             changed = {k: v for k, v in safe_updates.items() if current.get(k) != v}
             if not changed:
                 continue
@@ -4488,14 +4492,18 @@ def api_create_monitor(data: Dict[str, Any] = Body(...)):
     source_urls = (data.get("source_urls") or "").strip()
     if not name or not source_urls:
         raise HTTPException(400, "Vui lòng nhập Tên luồng Monitor và Danh sách link kênh nguồn.")
+    try:
+        metadata_policy = monitor_policy.encode(monitor_policy.policy(data.get('metadata_policy')))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     conn = get_conn()
     conn.execute(
         """
         INSERT INTO monitors (
             name, source_urls, target_channel_id, target_group_name,
             upload_to, render_mode, option_group_id, ai_Action, ai_provider,
-            ai_target_lang, min_views, check_interval_minutes, max_videos_per_scan
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ai_target_lang, min_views, check_interval_minutes, max_videos_per_scan, metadata_policy_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             name,
@@ -4511,11 +4519,52 @@ def api_create_monitor(data: Dict[str, Any] = Body(...)):
             int(data.get("min_views") or 0),
             int(data.get("check_interval_minutes") or 30),
             int(data.get("max_videos_per_scan") or 3),
+            metadata_policy,
         ),
     )
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+@app.get("/api/monitors/{monitor_id}/metadata-preview")
+def api_monitor_metadata_preview(monitor_id: int):
+    conn = get_conn()
+    try:
+        row = conn.execute('SELECT * FROM monitors WHERE id=?', (monitor_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, 'Không tìm thấy monitor.')
+        mon = dict(row)
+        result = monitor_policy.preview(conn, mon, mon.get('metadata_policy_json') or monitor_policy.DEFAULT_POLICY)
+        result.pop('envelope')
+        return result
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.post("/api/monitors/{monitor_id}/metadata-confirm")
+def api_monitor_metadata_confirm(monitor_id: int, data: Dict[str, Any] = Body(...)):
+    conn = get_conn()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM monitors WHERE id=?', (monitor_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, 'Không tìm thấy monitor.')
+        if row['is_running'] or pipeline_manager._monitor_handles_alive(monitor_id):
+            raise HTTPException(409, 'Dừng monitor và đợi worker kết thúc trước khi xác nhận.')
+        result = monitor_policy.preview(conn, dict(row), data.get('policy'))
+        if result['revision'] != data.get('revision'):
+            raise HTTPException(409, 'Cấu hình đã đổi. Hãy xem trước lại.')
+        conn.execute("UPDATE monitors SET metadata_policy_json=?,metadata_revision=?,status='Stopped' WHERE id=?",
+                     (monitor_policy.encode(result['policy']), result['revision'], monitor_id))
+        conn.commit()
+        return {'ok': True}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        conn.close()
 
 
 @app.post("/api/monitors/{monitor_id}/toggle")

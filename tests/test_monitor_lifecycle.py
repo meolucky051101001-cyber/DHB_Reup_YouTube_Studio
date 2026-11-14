@@ -37,6 +37,9 @@ class MonitorLifecycleTests(unittest.TestCase):
         conn.execute("INSERT INTO monitors (name, source_urls) VALUES ('Lifecycle test', 'https://example.test/source')")
         conn.commit()
         self.monitor_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        from monitor_fixture import confirm_monitor
+        confirm_monitor(conn, self.monitor_id)
+        conn.commit()
         conn.close()
 
         self.manager = pm.PipelineManager()

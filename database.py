@@ -446,6 +446,11 @@ def init_db():
     """)
     conn.execute("INSERT OR IGNORE INTO upload_slot (id, state) VALUES (1, 'idle')")
     _add_col_if_missing("monitors", "last_heartbeat_at", "TEXT DEFAULT ''")
+    _add_col_if_missing("monitors", "metadata_policy_json", "TEXT DEFAULT ''")
+    _add_col_if_missing("monitors", "metadata_revision", "TEXT DEFAULT ''")
+    _add_col_if_missing("video_queue", "monitor_metadata_policy_json", "TEXT DEFAULT ''")
+    conn.execute("UPDATE monitors SET is_running=0, status='Cần xác nhận metadata' "
+                 "WHERE COALESCE(metadata_policy_json,'')='' OR COALESCE(metadata_revision,'')=''")
     _add_col_if_missing("system_logs", "run_id", "TEXT DEFAULT ''")
     _add_col_if_missing("system_logs", "queue_id", "INTEGER DEFAULT NULL")
     _add_col_if_missing("system_logs", "attempt_id", "INTEGER DEFAULT NULL")

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import monitor_policy
 
 
 class PreviewStale(ValueError):
@@ -17,6 +18,7 @@ _QUEUE_FIELDS = (
     "made_for_kids", "altered_content", "age_restriction", "is_premiere",
     "render_mode", "render_config_json", "cut_start", "cut_end", "resolution",
     "emulate_mobile", "manual_reupload_authorized", "manual_reupload_reason",
+    "monitor_metadata_policy_json",
 )
 _CHANNEL_FIELDS = (
     "id", "channel_id", "profile_name", "profile_path", "upload_mode", "proxy",
@@ -49,6 +51,7 @@ def upload_source_path(item):
 
 
 def approval_item(conn, item, channel, groups):
+    monitor_policy.resolve_item(conn, item, channel)
     channel_id = str(channel.get("channel_id") or "").strip()
     if not channel_id:
         raise PreviewStale("Kênh đích chưa có YouTube Channel ID.")
@@ -77,6 +80,7 @@ def approval_item(conn, item, channel, groups):
     options = conn.execute("SELECT * FROM upload_option_groups WHERE id = ?", (option_id,)).fetchone() if option_id else None
     paths = [item.get(key) or "" for key in ("input_video_path", "output_video_path", "thumbnail_path")]
     return {
+        "schema_version": 2,
         "id": item["id"],
         "channel_id": channel["id"],
         "youtube_channel_id": channel_id,

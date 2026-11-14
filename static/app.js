@@ -3334,7 +3334,9 @@ async function loadMonitors() {
 }
 
 async function addMonitor() {
+  const flag = id => document.getElementById(id).value === 'inherit' ? 'inherit' : document.getElementById(id).value === 'true';
   const payload = {
+    metadata_policy: { version: 1, visibility: document.getElementById('mon-visibility').value, made_for_kids: flag('mon-kids'), altered_content: flag('mon-altered') },
     name: document.getElementById('mon-name').value,
     source_urls: document.getElementById('mon-urls').value,
     target_channel_id: document.getElementById('mon-channel').value ? parseInt(document.getElementById('mon-channel').value, 10) : null,
@@ -3360,6 +3362,15 @@ async function addMonitor() {
 
 async function toggleMonitor(id) {
   try {
+    const monitors = await apiFetch('/api/monitors');
+    const current = monitors.find(m => m.id === id);
+    if (current && !current.is_running) {
+      const preview = await apiFetch(`/api/monitors/${id}/metadata-preview`);
+      const sourceLabel = { monitor: 'monitor', option: 'bộ tùy chọn', channel: 'kênh' };
+      const lines = preview.channels.map(c => `${c.channel_name}: ${c.visibility} (${sourceLabel[c.sources.visibility]}), Trẻ em: ${c.made_for_kids ? 'Có' : 'Không'} (${sourceLabel[c.sources.made_for_kids]}), AI: ${c.altered_content ? 'Có' : 'Không'} (${sourceLabel[c.sources.altered_content]})`);
+      if (!confirm(`Xác nhận metadata trước khi bật monitor:\n\n${lines.join('\n')}\n\nThay đổi cấu hình sau xác nhận sẽ chặn các lượt đăng tiếp theo.`)) return;
+      await apiFetch(`/api/monitors/${id}/metadata-confirm`, { method: 'POST', body: JSON.stringify({ policy: preview.policy, revision: preview.revision }) });
+    }
     const result = await apiFetch(`/api/monitors/${id}/toggle`, { method: 'POST' });
     if (result.message) showToast(result.message, result.ok ? 'success' : 'warning');
   } catch (e) {
