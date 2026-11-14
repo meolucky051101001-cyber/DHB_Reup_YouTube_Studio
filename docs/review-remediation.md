@@ -23,4 +23,8 @@ Validation: 317 tests and 139 subtests including Chromium passed; real SQLite te
 
 G3: group editing and workbook round trip. G4: render timelines, optional upload warnings and truthful pin capability. G5: integrated offline release validation. G6: controlled rollout and explicitly scoped live acceptance.
 
+## G3: queue preparation
+
+Bulk destination edits now retain canonical group JSON, remove request aliases before SQL and reject conflicting destinations/aliases or missing queue IDs atomically. Excel export converts SQLite rows at the boundary and preserves formula-like text. Tests cover Unicode multi-group and schedule round trips, preview destinations, project filtering and rollback. Chromium exercises actual form submission, workbook download and preview/apply import against the isolated API/DB. Full suite: 330 tests / 139 subtests including both browser tests; Ruff critical checks and diff validation passed.
+
 PRs are committed and pushed per completed phase, stacked on the previous branch. Merge and live publishing are separate actions.

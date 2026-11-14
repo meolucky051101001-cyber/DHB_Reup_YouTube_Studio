@@ -173,6 +173,17 @@ def _queue_target_updates(conn, updates: Dict[str, Any], current: Dict[str, Any]
     if not destination_changed:
         return target
 
+    try:
+        aliases = [normalize_group_names(updates[key]) for key in ('target_group_names', 'target_group_names_json') if key in updates]
+        if len(aliases) == 2 and aliases[0] != aliases[1]:
+            raise ValueError('Các trường nhóm kênh có giá trị mâu thuẫn.')
+        if aliases and 'target_group_name' in updates:
+            legacy = normalize_group_names(updates['target_group_name'])
+            if legacy and legacy != aliases[0][:1]:
+                raise ValueError('Tên nhóm cũ không khớp danh sách nhóm.')
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
     channel_id = target.get("target_channel_id", current.get("target_channel_id"))
     profile_name = str(target.get("target_profile_name", current.get("target_profile_name")) or "").strip()
     raw_groups = target.get("target_group_names", target.get("target_group_names_json"))
@@ -184,6 +195,13 @@ def _queue_target_updates(conn, updates: Dict[str, Any], current: Dict[str, Any]
         has_groups = raw_groups is not None and bool(normalize_group_names(raw_groups))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    requested_type = str(updates.get('target_type') or '').upper()
+    if has_groups and (explicit_channel or explicit_profile or requested_type in ('CHANNEL', 'PROFILE')):
+        raise HTTPException(400, 'Chỉ chọn kênh/profile hoặc nhóm; không chọn đồng thời.')
+    if requested_type == 'GROUP' and (explicit_channel or explicit_profile):
+        raise HTTPException(400, 'Đích GROUP không được kèm kênh/profile cụ thể.')
+    if explicit_profile and not explicit_channel:
+        channel_id = None
     if not explicit_channel and not explicit_profile and (has_groups or (raw_groups is not None and str(target.get("target_type") or "").upper() == "GROUP")):
         groups = _validated_group_names(conn, raw_groups, default="Mặc định")
         target["target_group_names_json"] = serialize_group_names(groups)
@@ -222,6 +240,7 @@ def _queue_target_updates(conn, updates: Dict[str, Any], current: Dict[str, Any]
     # Editing a destination is explicit confirmation; stale assignments must be cleared.
     target["assigned_channel_id"] = None
     target["assigned_group_names_json"] = ""
+    target.pop('target_group_names', None)
     return target
 
 
@@ -1398,6 +1417,8 @@ def api_bulk_update_queue(data: Dict[str, Any] = Body(...)):
         current_by_id = {int(row["id"]): dict(row) for row in rows}
         existing_ids = set(current_by_id)
         missing_ids = [item_id for item_id in ids if item_id not in existing_ids]
+        if missing_ids:
+            raise HTTPException(404, f'Video không còn tồn tại: {missing_ids}')
         target_keys = {
             "target_type", "target_channel_id", "target_group_name", "target_group_names",
             "target_group_names_json", "target_profile_name",
@@ -1443,11 +1464,7 @@ def api_bulk_update_queue(data: Dict[str, Any] = Body(...)):
                 continue
             item_updates = dict(filtered)
             item_updates.pop("schedule_time", None)
-            if "target_group_names" in item_updates or "target_group_names_json" in item_updates:
-                raw_groups = item_updates.pop("target_group_names", item_updates.get("target_group_names_json"))
-                item_updates.update(_queue_target_updates(conn, {"target_group_names": raw_groups}, current))
-                item_updates.pop("target_group_names_json", None)
-            elif dest_changed:
+            if dest_changed:
                 item_updates = _queue_target_updates(conn, item_updates, current)
 
             if base_dt:
@@ -2267,6 +2284,7 @@ def api_export_excel(project: str = "Default", ids: str = ""):
     ws.freeze_panes = "A2"
 
     for row_idx, item in enumerate(rows, start=2):
+        item = dict(item)
         ch = channels.get(int(item["target_channel_id"])) if item["target_channel_id"] else None
         values = {
             "id": item["id"],

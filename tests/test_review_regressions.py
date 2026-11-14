@@ -1,5 +1,7 @@
 """HTTP and worker regressions using the production SQLite schema, never live data."""
 import os
+import io
+from openpyxl import load_workbook
 import tempfile
 import threading
 import unittest
@@ -105,6 +107,80 @@ class ReviewRegressions(unittest.TestCase):
         with closing(database.get_conn()) as conn:
             self.assertEqual(conn.execute('SELECT state FROM content_reservations').fetchone()[0], 'NeedsReview')
 
+
+    def test_bulk_groups_persist_canonical_json(self):
+        with closing(database.get_conn()) as conn, conn:
+            for group in ('New-A','New-B'):
+                conn.execute('INSERT INTO channel_groups(name) VALUES (?)',(group,))
+        response = self.client.post('/api/queue/bulk-update',headers=self.headers,
+            json={'ids':[901],'updates':{'target_group_names':['New-A','New-B']}})
+        self.assertEqual(response.status_code,200,response.text)
+        from group_distribution import target_group_names
+        self.assertEqual(target_group_names(self.row()),['New-A','New-B'])
+        self.assertIsNone(self.row()['target_channel_id'])
+
+    def test_excel_export_nonempty_keeps_text(self):
+        with closing(database.get_conn()) as conn, conn:
+            conn.execute("UPDATE video_queue SET title='=1+1' WHERE id=901")
+        response=self.client.get('/api/queue/export-excel?project=review',headers=self.headers)
+        self.assertEqual(response.status_code,200,response.text if response.status_code!=200 else '')
+        workbook=load_workbook(io.BytesIO(response.content))
+        cells=[cell for row in workbook['Danh sách'] for cell in row if cell.value=='=1+1']
+        self.assertEqual(len(cells),1)
+        self.assertEqual(cells[0].data_type,'s')
+        workbook.close()
+
+    def test_group_alias_conflicts_and_batch_rollback(self):
+        with closing(database.get_conn()) as conn, conn:
+            for name in ('Nhóm A', 'Nhóm B'):
+                conn.execute('INSERT INTO channel_groups(name) VALUES(?)', (name,))
+        before = self.row()
+        invalid = [
+            {'target_group_names':['Nhóm A'], 'target_group_names_json':'["Nhóm B"]'},
+            {'target_group_names':['Nhóm A'], 'target_channel_id':901},
+            {'target_group_names':['Missing']},
+        ]
+        for updates in invalid:
+            response = self.client.post('/api/queue/bulk-update',headers=self.headers,json={'ids':[901,902],'updates':updates})
+            self.assertEqual(response.status_code,400,response.text)
+            self.assertEqual(self.row(),before)
+        response = self.client.post('/api/queue/bulk-update',headers=self.headers,
+                                   json={'ids':[901,99999],'updates':{'description':'Must rollback'}})
+        self.assertEqual(response.status_code,404,response.text)
+        self.assertEqual(self.row(),before)
+
+    def test_group_workbook_preview_apply_roundtrip(self):
+        import json
+        from datetime import datetime, timedelta
+        with closing(database.get_conn()) as conn, conn:
+            for name, channel in [('Nhóm A',901),('Nhóm B',902)]:
+                conn.execute('INSERT INTO channel_groups(name) VALUES(?)',(name,))
+                conn.execute('INSERT INTO channel_group_memberships(group_name,channel_id) VALUES(?,?)',(name,channel))
+        updates = {'target_group_names':['Nhóm A','Nhóm B','Nhóm A'], 'title':'=Tiêu đề Việt',
+                   'description':'Nội dung & Unicode', 'visibility':'schedule',
+                   'schedule_time':(datetime.now()+timedelta(days=2)).strftime('%Y-%m-%d %H:%M:%S'),
+                   'made_for_kids':1,'altered_content':1}
+        response=self.client.post('/api/queue/bulk-update',headers=self.headers,json={'ids':[901],'updates':updates})
+        self.assertEqual(response.status_code,200,response.text)
+        before=self.row()
+        self.assertEqual(json.loads(before['target_group_names_json']),['Nhóm A','Nhóm B'])
+        preview=self.manager.preview_distribution([901],[False,False,True])
+        self.assertFalse(preview['items'][0]['blocked'],preview)
+        self.assertIn(preview['items'][0]['channel_id'],[901,902])
+        response=self.client.get('/api/queue/export-excel?project=review&ids=901,902',headers=self.headers)
+        self.assertEqual(response.status_code,200)
+        workbook=load_workbook(io.BytesIO(response.content))
+        self.assertEqual(workbook['Danh sách'].max_row,2)
+        self.assertTrue(any(cell.value=='Nhóm A | Nhóm B' for cell in workbook['Danh sách'][2]))
+        workbook.close()
+        for preview_only in ('true','false'):
+            imported=self.client.post('/api/queue/import-excel',headers=self.headers,
+                data={'project_name':'review','ids':'901','preview_only':preview_only},
+                files={'file':('roundtrip.xlsx',response.content,'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')})
+            self.assertEqual(imported.status_code,200,imported.text)
+        after=self.row()
+        for key in ('title','description','target_group_names_json','schedule_time','visibility','made_for_kids','altered_content'):
+            self.assertEqual(after[key],before[key],key)
 
 
 if __name__ == '__main__':
