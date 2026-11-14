@@ -102,4 +102,17 @@ class PreparationBrowserTests(unittest.TestCase):
             self.assertEqual(fixture.row()['description'],'Mô tả nhập lại từ Excel')
             self.assertEqual(requests.count(('POST','/api/queue/import-excel')),2)
             self.assertFalse(any('Lỗi ' in message for message in dialogs),dialogs)
+            import json
+            warning='<img src=x onerror="globalThis.warningExecuted=1"> thumbnail failed'
+            with closing(database.get_conn()) as conn, conn:
+                conn.execute("UPDATE video_queue SET status='Completed',post_upload_warnings_json=? WHERE id=901",
+                             (json.dumps([{'step':'thumbnail','code':'HTTP_403','message':warning}]),))
+            page.evaluate('async () => { globalThis.warningExecuted=0; await loadQueue(true); }')
+            self.assertIn('cảnh báo bước phụ',page.locator('#queue-tbody').inner_text())
+            page.locator('#queue-tbody details summary').click()
+            self.assertIn(warning,page.locator('#queue-tbody').inner_text())
+            self.assertEqual(page.evaluate('warningExecuted'),0)
+            fixture.reserve_review('Completed')
+            page.evaluate('loadQueue(true)')
+            self.assertIn('Cần đối soát',page.locator('#queue-tbody').inner_text())
             browser.close()

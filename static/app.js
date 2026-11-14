@@ -1555,7 +1555,7 @@ async function loadQueue(preserveSelection = false) {
       : `📂 Nhóm: ${escapeHtml(groupNamesFromItem(item).join(' + ') || item.target_group_name || 'Mặc định')}`;
 
     let statusBadge = `<span class="badge badge-wait">${escapeHtml(item.status)}</span>`;
-    if (item.status === 'Completed') {
+    if (item.status === 'Completed' && !item.requires_review) {
       statusBadge = `<span class="badge badge-ok">✅ Đã đăng</span>`;
     } else if ((item.requires_review || item.status === 'NeedsReview')) {
       statusBadge = `<span class="badge" style="background:rgba(245,158,11,0.2); color:#f59e0b; border:1px solid #f59e0b; font-weight:700;" title="${escapeHtml(item.error_message || 'Hãy kiểm tra YouTube Studio trước khi chạy lại')}">🔎 Cần đối soát</span>`;

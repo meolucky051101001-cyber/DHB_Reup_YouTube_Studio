@@ -451,6 +451,23 @@ def init_db():
     _add_col_if_missing("video_queue", "monitor_metadata_policy_json", "TEXT DEFAULT ''")
     _add_col_if_missing("video_queue", "post_upload_warnings_json", "TEXT DEFAULT '[]'")
     _add_col_if_missing("upload_attempts", "post_upload_warnings_json", "TEXT DEFAULT '[]'")
+    required_review_columns = {
+        'monitors': {'metadata_policy_json', 'metadata_revision'},
+        'video_queue': {'monitor_metadata_policy_json', 'post_upload_warnings_json'},
+        'upload_attempts': {'post_upload_warnings_json'},
+    }
+    for table, required in required_review_columns.items():
+        actual = {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
+        if not required <= actual:
+            conn.rollback()
+            conn.close()
+            raise RuntimeError(f'Migration review không đầy đủ ở bảng {table}; dừng khởi động để giữ dữ liệu.')
+    schema = conn.execute("SELECT version FROM app_schema_versions WHERE schema_key='review_metadata'").fetchone()
+    if schema and schema[0] > 1:
+        conn.rollback()
+        conn.close()
+        raise RuntimeError('Schema review_metadata mới hơn ứng dụng; không tự hạ phiên bản.')
+    conn.execute("INSERT OR IGNORE INTO app_schema_versions(schema_key,version) VALUES('review_metadata',1)")
     conn.execute("UPDATE monitors SET is_running=0, status='Cần xác nhận metadata' "
                  "WHERE COALESCE(metadata_policy_json,'')='' OR COALESCE(metadata_revision,'')=''")
     _add_col_if_missing("system_logs", "run_id", "TEXT DEFAULT ''")
