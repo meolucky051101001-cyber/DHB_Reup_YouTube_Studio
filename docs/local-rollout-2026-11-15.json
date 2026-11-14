@@ -1,0 +1,56 @@
+{
+  "release": "2026.11.15-review-remediation",
+  "scope": "offline acceptance and local rollout",
+  "code_revision": "b9cacf838dd526c3f18c51a13b2b31dc7ad828ab",
+  "previous_revision": "e71ea456b3beff52010a22b7789eb98cdda0808e",
+  "runtime_fingerprint": "787961a53630431ad8dee4a6db92755c9e3b4e6f776f6559a5a3e254c487e1c5",
+  "backup_sha256": "a8dbd938bf39ea01c1d43525415fa3f73688f17e2bc7f6b9f073b8019e192fae",
+  "migration": {
+    "quick_check": "ok",
+    "idempotent": true,
+    "restore_verified": true
+  },
+  "counts": {
+    "video_queue": 34,
+    "published_history": 19,
+    "upload_attempts": 32,
+    "content_reservations": 1,
+    "youtube_channels": 16,
+    "monitors": 0
+  },
+  "existing_rows_unchanged_after_restart": true,
+  "review_holds": [
+    {
+      "id": 212,
+      "status": "NeedsReview"
+    }
+  ],
+  "browser": {
+    "all_six_tabs_visible": true,
+    "javascript_errors": 0,
+    "failed_http_requests": [],
+    "needs_review_212_visible": true,
+    "exported_rows": 4,
+    "live_publish": false
+  },
+  "media_cases": 28,
+  "no_automatic_jobs": true,
+  "live_uploads": 0,
+  "preexisting_data_gaps": {
+    "error_rows_missing_files": [
+      193,
+      194,
+      195,
+      196
+    ],
+    "channels_missing_channel_id": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ]
+  }
+}

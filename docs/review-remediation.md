@@ -19,9 +19,9 @@ Rollback: stop all monitors before using an older binary, which does not underst
 
 Validation: 317 tests and 139 subtests including Chromium passed; real SQLite tests cover inherited payload/snapshot, explicit false, group channel defaults, changed revisions, atomic freeze rejection, legacy migration and manual overrides. Lifecycle fixtures now carry explicit confirmed policies. No live upload performed.
 
-## Remaining phases
+## Release status
 
-G3: group editing and workbook round trip. G4: render timelines, optional upload warnings and truthful pin capability. G5: integrated offline release validation. G6: controlled rollout and explicitly scoped live acceptance.
+G1–G6 are complete for the user's selected scope: offline acceptance and local rollout. See `RELEASE_2026_11_15.md` for evidence, the deployed revision and pre-existing data gaps. No live YouTube upload/comment was performed.
 
 ## G3: queue preparation
 
