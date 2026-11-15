@@ -6,7 +6,7 @@ from pathlib import Path
 
 @unittest.skipUnless(os.environ.get('DHB_BROWSER_TESTS') == '1', 'Run in the browser CI job')
 class ConfigBrowserTests(unittest.TestCase):
-    def test_channel_and_option_forms_keep_boolean_and_empty_text_values(self):
+    def test_configuration_forms_keep_values_and_validate_monitor_limits(self):
         import re
         from contextlib import closing
         from urllib.parse import urlsplit
@@ -27,7 +27,7 @@ class ConfigBrowserTests(unittest.TestCase):
             if parsed.path == '/':
                 route.fulfill(status=200, content_type='text/html', body=html)
                 return
-            if not parsed.path.startswith(('/api/auth','/api/channels','/api/groups','/api/options','/api/profiles','/api/overview','/static/')):
+            if not parsed.path.startswith(('/api/auth','/api/channels','/api/groups','/api/options','/api/profiles','/api/overview','/api/monitors','/static/')):
                 route.abort()
                 return
             response = fixture.client.request(request.method, parsed.path + ('?'+parsed.query if parsed.query else ''),
@@ -72,6 +72,21 @@ class ConfigBrowserTests(unittest.TestCase):
             with closing(database.get_conn()) as conn:
                 row = conn.execute('SELECT append_hashtags,affiliate_CTA,made_for_kids,ai_label FROM upload_option_groups WHERE id=?',(option_id,)).fetchone()
             self.assertEqual(tuple(row),('','',0,0))
+            page.fill('#mon-name','Monitor Việt G11')
+            page.fill('#mon-urls','https://www.youtube.com/@fixture')
+            page.select_option('#mon-channel',str(channel_id))
+            page.fill('#mon-interval','5.5')
+            page.locator('[onclick="addMonitor()"]').click(force=True)
+            self.assertFalse(page.locator('#mon-interval').evaluate('input => input.validity.valid'))
+            with closing(database.get_conn()) as conn:
+                self.assertEqual(conn.execute('SELECT COUNT(*) FROM monitors').fetchone()[0],0)
+            page.fill('#mon-interval','5')
+            page.fill('#mon-max','1000')
+            page.locator('[onclick="addMonitor()"]').click(force=True)
+            page.wait_for_function("document.getElementById('mon-name').value === ''")
+            with closing(database.get_conn()) as conn:
+                row = conn.execute("SELECT check_interval_minutes,max_videos_per_scan,is_running,metadata_revision FROM monitors WHERE name='Monitor Việt G11'").fetchone()
+            self.assertEqual(tuple(row),(5,1000,0,''))
             self.assertEqual(dialogs,[])
             browser.close()
 

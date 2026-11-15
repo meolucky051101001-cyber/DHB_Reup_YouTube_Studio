@@ -8,6 +8,7 @@ import hashlib
 import monitor_policy
 import threading
 import subprocess
+import sqlite3
 from contextlib import closing
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -87,6 +88,7 @@ from app_instance_lock import AppInstanceAlreadyRunning, acquire_app_instance_lo
 from render_engine import normalize_render_speed
 from runtime_identity import capture_runtime, runtime_status
 from config_validation import validate_config, validate_option_state
+from monitor_validation import validate_monitor_create
 from storage_manager import (
     DEFAULT_RETENTION_DAYS,
     cleanup_managed_artifacts,
@@ -330,7 +332,7 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.15-config-validation"
+APP_BUILD_VERSION = "2026.11.15-monitor-validation"
 RUNTIME_IDENTITY = capture_runtime(APP_ROOT)
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
@@ -4446,42 +4448,27 @@ def api_upload_capabilities():
 
 @app.post("/api/monitors")
 def api_create_monitor(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    source_urls = (data.get("source_urls") or "").strip()
-    if not name or not source_urls:
-        raise HTTPException(400, "Vui lòng nhập Tên luồng Monitor và Danh sách link kênh nguồn.")
     try:
-        metadata_policy = monitor_policy.encode(monitor_policy.policy(data.get('metadata_policy')))
+        data = validate_monitor_create(data)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO monitors (
-            name, source_urls, target_channel_id, target_group_name,
-            upload_to, render_mode, option_group_id, ai_Action, ai_provider,
-            ai_target_lang, min_views, check_interval_minutes, max_videos_per_scan, metadata_policy_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            name,
-            source_urls,
-            data.get("target_channel_id") or None,
-            data.get("target_group_name") or "Mặc định",
-            data.get("upload_to") or "Shorts",
-            data.get("render_mode") or "shorts_9_16",
-            data.get("option_group_id") or None,
-            data.get("ai_Action") or "rewrite_seo",
-            data.get("ai_provider") or "gemini",
-            data.get("ai_target_lang") or "Tiếng Việt",
-            int(data.get("min_views") or 0),
-            int(data.get("check_interval_minutes") or 30),
-            int(data.get("max_videos_per_scan") or 3),
-            metadata_policy,
-        ),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        with closing(get_conn()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if data['target_channel_id'] is not None:
+                if not conn.execute('SELECT 1 FROM youtube_channels WHERE id=?', (data['target_channel_id'],)).fetchone():
+                    raise HTTPException(400, 'Kênh đích không còn tồn tại; hãy chọn lại kênh.')
+            elif not conn.execute('SELECT 1 FROM channel_groups WHERE name=?', (data['target_group_name'],)).fetchone():
+                raise HTTPException(400, 'Nhóm kênh đích không còn tồn tại; hãy chọn lại nhóm.')
+            if data['option_group_id'] is not None and not conn.execute('SELECT 1 FROM upload_option_groups WHERE id=?', (data['option_group_id'],)).fetchone():
+                raise HTTPException(400, 'Bộ tùy chọn không còn tồn tại; hãy chọn lại.')
+            columns = ', '.join(data)
+            placeholders = ', '.join('?' for _ in data)
+            conn.execute(f'INSERT INTO monitors ({columns}) VALUES ({placeholders})', list(data.values()))
+    except sqlite3.IntegrityError as exc:
+        if 'UNIQUE constraint failed: monitors.name' in str(exc):
+            raise HTTPException(409, 'Tên monitor đã tồn tại; hãy chọn tên khác.') from None
+        raise
     return {"ok": True}
 
 

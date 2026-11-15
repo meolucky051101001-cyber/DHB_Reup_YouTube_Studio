@@ -152,9 +152,7 @@ class OptionCreate(OptionInput):
     name: Name
 
 
-def validate_config(data, kind, *, create=False):
-    schemas = {'channel': (ChannelInput, ChannelCreate), 'option': (OptionInput, OptionCreate)}
-    schema = schemas[kind][int(create)]
+def parse_config_input(schema, data, *, partial=False):
     try:
         model = schema.model_validate(data)
     except ValidationError as exc:
@@ -162,7 +160,12 @@ def validate_config(data, kind, *, create=False):
         error = exc.errors(include_input=False, include_url=False, include_context=False)[0]
         field = '.'.join(str(part) for part in error['loc'])
         raise ValueError(f"{field}: {error['msg']}") from None
-    values = model.model_dump(exclude_unset=not create)
+    return model.model_dump(exclude_unset=partial)
+
+
+def validate_config(data, kind, *, create=False):
+    schemas = {'channel': (ChannelInput, ChannelCreate), 'option': (OptionInput, OptionCreate)}
+    values = parse_config_input(schemas[kind][int(create)], data, partial=not create)
     if kind == 'channel' and values.get('group_names') is not None and values.get('group_name'):
         if normalize_group_names(values['group_name']) != values['group_names'][:1]:
             raise ValueError('group_name và group_names có nhóm đầu tiên mâu thuẫn.')

@@ -17,7 +17,7 @@ from database import (
     set_log_context, clear_log_context, queue_requires_review,
 )
 from config import APP_OUTPUT_DIR, APP_TEMP_DIR
-from scanner_downloader import download_video, scan_social_urls
+from scanner_downloader import download_video, scan_social_urls, MAX_SCAN_ITEMS
 from render_engine import render_video, generate_thumbnail_from_video
 from ai_engine import ai_optimize_youtube_metadata
 from youtube_uploader import (
@@ -2904,7 +2904,7 @@ class PipelineManager:
                 self._update_monitor_status(monitor_id, f"Đang quét {len(urls)} nguồn...")
                 scanned = scan_social_urls(
                     urls,
-                    max_items_per_url=max_vids * 2,
+                    max_items_per_url=min(MAX_SCAN_ITEMS, max_vids * 2),
                     min_views=min_views,
                     stop_event=stop_ev,
                 )

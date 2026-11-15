@@ -3339,6 +3339,10 @@ async function loadMonitors() {
 }
 
 async function addMonitor() {
+  for (const id of ['mon-interval', 'mon-max']) {
+    const input = document.getElementById(id);
+    if (!input.reportValidity()) return;
+  }
   const flag = id => document.getElementById(id).value === 'inherit' ? 'inherit' : document.getElementById(id).value === 'true';
   const payload = {
     metadata_policy: { version: 1, visibility: document.getElementById('mon-visibility').value, made_for_kids: flag('mon-kids'), altered_content: flag('mon-altered') },
@@ -3353,8 +3357,8 @@ async function addMonitor() {
     })(),
     ai_Action: document.getElementById('mon-ai-action').value,
     ai_target_lang: document.getElementById('mon-ai-lang').value,
-    check_interval_minutes: parseInt(document.getElementById('mon-interval').value || '30', 10),
-    max_videos_per_scan: parseInt(document.getElementById('mon-max').value || '3', 10),
+    check_interval_minutes: document.getElementById('mon-interval').value || '30',
+    max_videos_per_scan: document.getElementById('mon-max').value || '3',
   };
   try {
     await apiFetch('/api/monitors', { method: 'POST', body: JSON.stringify(payload) });

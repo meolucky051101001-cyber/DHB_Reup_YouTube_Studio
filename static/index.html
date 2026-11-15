@@ -1187,11 +1187,11 @@
           <div class="row-inline form-group">
             <div>
               <label>Chu Kỳ Quét Lặp Lại (Phút):</label>
-              <input type="number" id="mon-interval" value="30" min="5" />
+              <input type="number" id="mon-interval" value="30" min="5" max="10080" step="1" />
             </div>
             <div>
               <label>Số Video Mới Tối Đa / Lần Quét:</label>
-              <input type="number" id="mon-max" value="3" min="1" max="20" />
+              <input type="number" id="mon-max" value="3" min="1" max="1000" step="1" />
             </div>
           </div>
           <button class="btn btn-success" style="width:100%" onclick="addMonitor()">

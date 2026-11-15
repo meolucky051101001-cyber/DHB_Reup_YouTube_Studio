@@ -17,7 +17,7 @@ def policy(raw):
         value = json.loads(raw) if isinstance(raw, str) else raw
     except ValueError as exc:
         raise ValueError('Chính sách monitor không phải JSON hợp lệ.') from exc
-    if not isinstance(value, dict) or value.get('version') != 1:
+    if not isinstance(value, dict) or type(value.get('version')) is not int or value['version'] != 1:
         raise ValueError('Monitor cần xác nhận chính sách metadata phiên bản 1.')
     result = {'version': 1}
     for key in FIELDS:
