@@ -3,6 +3,7 @@ import hashlib
 import json
 
 from group_distribution import resolve_target_candidates
+from upload_capabilities import UploadCapabilityError, capability_issues, legacy_option_requests
 
 FIELDS = ('visibility', 'made_for_kids', 'altered_content')
 DEFAULT_POLICY = {'version': 1, 'visibility': 'inherit', 'made_for_kids': 'inherit', 'altered_content': 'inherit'}
@@ -85,13 +86,22 @@ def preview(conn, mon, raw_policy=None):
     rows = []
     for channel in channels:
         values, sources = effective(choices, channel, options)
-        rows.append({'channel_id': channel['id'], 'channel_name': channel['name'], **values, 'sources': sources})
+        try:
+            issues = capability_issues(channel.get('upload_mode'), {**values, **legacy_option_requests(options)})
+        except UploadCapabilityError as exc:
+            issues = exc.issues
+        rows.append({'channel_id': channel['id'], 'channel_name': channel['name'], **values, 'sources': sources,
+                     'blocked': bool(issues), 'reasons': [issue['message'] for issue in issues],
+                     'reason_codes': [issue['code'] for issue in issues], 'capability_issues': issues})
     envelope = {'version': 1, 'choices': choices, 'context': target, 'revision': revision}
-    return {'policy': choices, 'revision': revision, 'channels': rows, 'envelope': envelope}
+    return {'policy': choices, 'revision': revision, 'channels': rows, 'envelope': envelope,
+            'blocked': any(row['blocked'] for row in rows)}
 
 
 def validate_session(conn, mon):
     result = preview(conn, mon)
+    if result['blocked']:
+        raise UploadCapabilityError([issue for row in result['channels'] for issue in row['capability_issues']])
     if result['revision'] != mon.get('metadata_revision'):
         raise ValueError('Cấu hình/nhóm kênh monitor đã đổi. Xem trước và xác nhận lại trước khi chạy.')
     return result

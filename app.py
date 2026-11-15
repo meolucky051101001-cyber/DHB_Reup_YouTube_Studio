@@ -4592,6 +4592,8 @@ def api_monitor_metadata_confirm(monitor_id: int, data: Dict[str, Any] = Body(..
         if row['is_running'] or pipeline_manager._monitor_handles_alive(monitor_id):
             raise HTTPException(409, 'Dừng monitor và đợi worker kết thúc trước khi xác nhận.')
         result = monitor_policy.preview(conn, dict(row), data.get('policy'))
+        if result['blocked']:
+            raise HTTPException(409, ' '.join(reason for channel in result['channels'] for reason in channel['reasons']))
         if result['revision'] != data.get('revision'):
             raise HTTPException(409, 'Cấu hình đã đổi. Hãy xem trước lại.')
         conn.execute("UPDATE monitors SET metadata_policy_json=?,metadata_revision=?,status='Stopped' WHERE id=?",

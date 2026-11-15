@@ -1088,6 +1088,27 @@
         </div>
       </div>
 
+      <section class="card" style="margin-top:12px;" aria-labelledby="upload-capabilities-title">
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+          <h3 class="card-title" id="upload-capabilities-title">Khả năng đăng theo phương thức</h3>
+          <button class="btn btn-outline btn-sm" type="button" onclick="loadUploadCapabilities()">Tải lại khả năng đăng</button>
+        </div>
+        <p style="font-size:12px; line-height:1.6; color:var(--text-muted)">
+          Cấu hình đã lưu có thể chưa được áp dụng khi đăng. Kiểm thử offline chưa xác nhận thao tác trên YouTube thực tế.
+          Các giới hạn đăng không ngăn bước chỉ tải hoặc render video.
+        </p>
+        <p id="upload-capabilities-status" role="status" aria-live="polite">Chưa tải thông tin khả năng đăng.</p>
+        <details>
+          <summary style="cursor:pointer; margin-bottom:10px;">Xem danh mục, ngôn ngữ, remix và các giới hạn đăng</summary>
+          <div class="table-wrap">
+            <table aria-label="Khả năng đăng của YouTube API và YouTube Studio">
+              <thead><tr><th scope="col">Tính năng</th><th scope="col">YouTube API</th><th scope="col">YouTube Studio</th></tr></thead>
+              <tbody id="upload-capabilities-tbody"></tbody>
+            </table>
+          </div>
+        </details>
+      </section>
+
       <!-- QUẢN LÝ PROFILE CHROME & TRẠNG THÁI ĐĂNG NHẬP GOOGLE -->
       <div class="card" style="margin-top:12px;">
         <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">

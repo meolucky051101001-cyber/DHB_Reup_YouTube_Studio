@@ -1212,6 +1212,59 @@ async function loadOptions() {
     el.value = cur;
     if (el.value !== cur) el.value = '';
   });
+  await loadUploadCapabilities();
+}
+
+let uploadCapabilitiesRequestId = 0;
+const uploadCapabilityKeys = ['category', 'video_language', 'remix', 'age_restriction', 'premiere', 'pin_comment', 'thumbnail'];
+
+function renderUploadCapabilities(data) {
+  const tbody = document.getElementById('upload-capabilities-tbody');
+  if (!tbody) return;
+  const modes = ['youtube_api', 'playwright'];
+  const readbackLabels = {
+    none: 'Chưa đọc lại',
+    before_publish: 'Kiểm tra trước khi đăng',
+    response: 'Kiểm tra phản hồi sau khi gửi',
+  };
+  const valid = modes.every(mode => data?.[mode]?.schema_version === 1 &&
+    uploadCapabilityKeys.every(key => {
+      const feature = data[mode].features?.[key];
+      return feature && typeof feature.label === 'string' && typeof feature.reason === 'string' &&
+        ['stored', 'can_set', 'offline_verified', 'live_verified', 'enabled'].every(field => typeof feature[field] === 'boolean') &&
+        Object.hasOwn(readbackLabels, feature.readback);
+    }));
+  if (!valid) throw new Error('Thông tin khả năng đăng chưa đầy đủ hoặc không tương thích.');
+  const cell = feature => `<td style="min-width:240px; white-space:normal; vertical-align:top; line-height:1.6;">
+    <strong>${feature.enabled ? 'Đang bật' : 'Chưa bật'}</strong>
+    <div>Lưu cấu hình: ${feature.stored ? 'Có' : 'Không'} · Áp dụng: ${feature.can_set ? 'Có' : 'Chưa có'}</div>
+    <div>Xác minh: ${readbackLabels[feature.readback]}</div>
+    <div>Kiểm thử offline: ${feature.offline_verified ? 'Đã có' : 'Chưa có'} · Nghiệm thu thực tế: ${feature.live_verified ? 'Đã có' : 'Chưa có'}</div>
+    <div style="color:var(--text-muted)">${escapeHtml(feature.reason)}</div>
+  </td>`;
+  tbody.innerHTML = uploadCapabilityKeys.map(key => `<tr data-capability="${key}">
+    <th scope="row" style="vertical-align:top; white-space:normal">${escapeHtml(data.youtube_api.features[key].label)}</th>
+    ${modes.map(mode => cell(data[mode].features[key])).join('')}
+  </tr>`).join('');
+}
+
+async function loadUploadCapabilities() {
+  const status = document.getElementById('upload-capabilities-status');
+  const tbody = document.getElementById('upload-capabilities-tbody');
+  if (!status || !tbody) return;
+  const requestId = ++uploadCapabilitiesRequestId;
+  status.textContent = 'Đang kiểm tra khả năng đăng của bản hiện tại…';
+  tbody.replaceChildren();
+  try {
+    const data = await apiFetch('/api/upload-capabilities', { cache: 'no-store' });
+    if (requestId !== uploadCapabilitiesRequestId) return;
+    renderUploadCapabilities(data);
+    status.textContent = 'Đã tải khả năng đăng của bản hiện tại. Xem phạm vi và giới hạn bên dưới.';
+  } catch (_) {
+    if (requestId !== uploadCapabilitiesRequestId) return;
+    tbody.replaceChildren();
+    status.textContent = 'Chưa xác định khả năng đăng: không tải được thông tin đầy đủ. Hãy thử tải lại; không xem trạng thái này là đã hỗ trợ.';
+  }
 }
 
 function renderOptionsTable() {

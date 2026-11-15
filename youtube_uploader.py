@@ -16,6 +16,9 @@ from config import APP_PROFILES_DIR
 from database import add_log, get_settings
 from scanner_downloader import probe_video_info
 from upload_approval import upload_source_path
+from upload_capabilities import (
+    capability_matrix, legacy_option_requests, normalize_flag, normalize_mode, require_capabilities,
+)
 from antidetect_client import (
     AntidetectNotReady,
     AntidetectBrowserLease,
@@ -215,7 +218,8 @@ def build_final_metadata(
         if ("made_for_kids" in video_item and video_item.get("made_for_kids") is not None)
         else (option_group.get("made_for_kids") if option_group is not None else channel.get("made_for_kids", 0))
     )
-    age_restriction = bool(video_item.get("age_restriction", 0))
+    option_requests = legacy_option_requests(option_group)
+    age_restriction = normalize_flag(video_item.get("age_restriction", 0), 'age_restriction')
     if made_for_kids and age_restriction:
         raise ValueError(
             f"Video '{title}' không thể vừa 'Dành cho trẻ em' vừa giới hạn độ tuổi 18+. Hãy chọn lại một trong hai."
@@ -242,10 +246,10 @@ def build_final_metadata(
         ),
         "privacy_status": privacy_status,
         "schedule_time": sched_time,
-        "is_premiere": bool(video_item.get("is_premiere", 0)),
+        "is_premiere": normalize_flag(video_item.get("is_premiere", 0), 'premiere'),
         "pin_comment": (
             option_group.get("pin_comment_text")
-            if (option_group and option_group.get("pin_comment_enabled"))
+            if option_requests['pin_comment_requested']
             else ""
         ),
         "emulate_mobile": bool(
@@ -255,6 +259,7 @@ def build_final_metadata(
         ),
         "resolution": str(video_item.get("resolution") or "1080p"),
         "channel_name": channel.get("name", ""),
+        **option_requests,
     }
 
 
@@ -1673,13 +1678,7 @@ def _upload_via_youtube_api_with_session(
     Đăng video lên YouTube qua YouTube Data API v3 Resumable Upload (cắt mảnh 8MB).
     Trả về URL đã xác minh và cảnh báo độc lập của các bước phụ.
     """
-    if metadata.get('pin_comment'):
-        raise RuntimeError('Ghim bình luận chưa được hỗ trợ; hãy tắt yêu cầu ghim trước khi đăng.')
-    if metadata.get("age_restriction"):
-        raise RuntimeError(
-            "Chế độ YouTube API không xác nhận được giới hạn độ tuổi 18+ trên YouTube Studio. "
-            "Hãy dùng phương thức Playwright Studio cho video này."
-        )
+    require_capabilities('youtube_api', metadata)
 
     file_size = os.path.getsize(video_path)
     if file_size <= 0:
@@ -1911,6 +1910,7 @@ def upload_via_youtube_api(
     thumbnail_path: str = "",
     progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> Dict[str, Any]:
+    require_capabilities('youtube_api', metadata)
     with _http_session_for_channel(channel) as session:
         return _upload_via_youtube_api_with_session(
             video_path=video_path,
@@ -3157,16 +3157,7 @@ def upload_via_playwright_studio(
     Với Profile Antidetect: dùng chung trình duyệt qua CDP, không tự mở Chrome/user_data_dir.
     """
     warnings = []
-    if metadata.get('pin_comment'):
-        raise RuntimeError('Ghim bình luận chưa được hỗ trợ; hãy tắt yêu cầu ghim trước khi đăng.')
-    # Radio 18+ trên Studio chưa từng được xác minh trong DOM thật (xem HANDOVER v7).
-    # Chặn trước khi mở trình duyệt/nạp file để không tạo bản nháp rác rồi phải dọn.
-    if metadata.get("age_restriction"):
-        raise RuntimeError(
-            "Chưa hỗ trợ xác minh giới hạn độ tuổi 18+ trên giao diện YouTube Studio hiện tại. "
-            "Đã chặn trước khi mở trình duyệt và nạp file. Hãy tắt giới hạn tuổi, "
-            "hoặc probe lại DOM và bổ sung selector trước khi bật tính năng này."
-        )
+    require_capabilities('playwright', metadata)
     settings = get_settings()
     hide_browser = bool(channel.get("use_hidden_desktop") or settings.get("hide_browser", False))
     prof_name = channel.get("profile_name") or f"channel_{channel.get('id', 'default')}"
@@ -3856,7 +3847,7 @@ def upload_video_to_youtube(
     Hàm điều phối trung tâm: Tự động chọn phương thức đăng (Playwright YouTube Studio hoặc YouTube Data API v3).
     """
     metadata = validate_upload_preflight(video_item, channel, option_group)
-    mode = (channel.get("upload_mode") or "playwright").strip().lower()
+    mode = normalize_mode(channel.get("upload_mode"))
     video_path = upload_source_path(video_item)
     if not video_path or not os.path.isfile(video_path):
         raise FileNotFoundError(f"Không tìm thấy file video để upload: {video_path}")
@@ -3892,20 +3883,9 @@ def validate_upload_preflight(
             "Hãy đồng bộ hoặc nhập Channel ID trước khi chạy video."
         )
     metadata = build_final_metadata(video_item, channel, option_group)
-    if option_group and option_group.get('pin_comment_enabled'):
-        raise RuntimeError('Ghim bình luận chưa được hỗ trợ trên YouTube API hoặc Studio. Tắt yêu cầu ghim trong bộ tùy chọn trước khi đăng; nội dung bình luận vẫn được giữ.')
-    mode = (channel.get("upload_mode") or "playwright").strip().lower()
+    mode = normalize_mode(channel.get("upload_mode"))
+    require_capabilities(mode, metadata)
     if mode == "youtube_api":
-        unsupported = []
-        if metadata.get("age_restriction"):
-            unsupported.append("giới hạn độ tuổi 18+")
-        if metadata.get("is_premiere"):
-            unsupported.append("Công chiếu")
-        if unsupported:
-            raise RuntimeError(
-                "YouTube Data API hiện không thể xác minh/thiết lập " + ", ".join(unsupported)
-                + "; hãy chuyển sang YouTube Studio trước khi tải hoặc render video."
-            )
         oauth = get_oauth_token_local_status(channel)
         if not oauth["configured"] or oauth["error"]:
             raise RuntimeError(oauth["error"] or "Kênh chưa có OAuth hợp lệ.")
@@ -3916,6 +3896,4 @@ def validate_upload_preflight(
 
 
 def upload_capabilities():
-    return {mode: {'pin_comment': False, 'thumbnail': True,
-                   'pin_comment_reason': 'Chưa có quy trình ghim và xác minh được hỗ trợ. Yêu cầu ghim sẽ chặn trước khi gửi video.'}
-            for mode in ('youtube_api', 'playwright')}
+    return capability_matrix()

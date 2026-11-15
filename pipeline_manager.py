@@ -23,6 +23,7 @@ from ai_engine import ai_optimize_youtube_metadata
 from youtube_uploader import (
     UploadNotSent, upload_video_to_youtube, validate_upload_preflight, normalize_published_video_url,
 )
+from upload_capabilities import UploadCapabilityError
 from content_identity import normalize_source_url, sha256_file, source_dedupe_key
 from group_distribution import choose_target_channel, target_group_names
 from upload_approval import PreviewStale, approval_item, asset_stamps, encode, upload_source_path
@@ -1175,6 +1176,7 @@ class PipelineManager:
                     "channel_name": "",
                     "warnings": [],
                     "reasons": [],
+                    "reason_codes": [],
                     "blocked": False,
                 }
                 try:
@@ -1198,10 +1200,11 @@ class PipelineManager:
                     entry["upload_mode"] = channel.get("upload_mode") or "playwright"
                     option_id = item.get("option_group_id")
                     option = conn.execute("SELECT * FROM upload_option_groups WHERE id = ?", (option_id,)).fetchone() if option_id else None
-                    metadata = validate_upload_preflight(item, channel, dict(option) if option else None)
-                    entry["title"] = metadata["title"]
-                    entry["visibility"] = metadata["privacy_status"]
-                    entry["schedule_time"] = metadata["schedule_time"]
+                    if options[2]:
+                        metadata = validate_upload_preflight(item, channel, dict(option) if option else None)
+                        entry["title"] = metadata["title"]
+                        entry["visibility"] = metadata["privacy_status"]
+                        entry["schedule_time"] = metadata["schedule_time"]
                     entry.update(_preview_upload_file(item, options))
                     if entry["upload_mode"] == "youtube_api":
                         entry["warnings"].append("DHB sẽ kiểm tra Channel ID của OAuth trước khi gửi file qua YouTube Data API.")
@@ -1223,6 +1226,8 @@ class PipelineManager:
                         entry["reasons"].append("đang được worker khác giữ")
                 except Exception as exc:
                     entry["reasons"].append(str(exc))
+                    if isinstance(exc, UploadCapabilityError):
+                        entry["reason_codes"] = [issue['code'] for issue in exc.issues]
                 entry["blocked"] = bool(entry["reasons"])
                 previews.append(entry)
             if previews and not any(item["blocked"] for item in previews):
@@ -1809,13 +1814,9 @@ class PipelineManager:
                     verify_approval()
                     channel["_verify_approval"] = verify_approval
 
-                # Radio 18+ của Studio chưa được xác minh (HANDOVER v7). Chặn trước
-                # khi giữ reservation/gọi uploader để không tạo bản nháp rác.
-                if bool(fresh_item.get("age_restriction")):
-                    raise RuntimeError(
-                        "Chưa hỗ trợ xác minh giới hạn độ tuổi 18+ trên YouTube Studio. "
-                        "Đã dừng trước khi nạp file. Hãy tắt giới hạn tuổi hoặc probe lại DOM/selector trước."
-                    )
+                # Recheck fresh queue metadata before reserving content, using the
+                # same guard as preview and both direct upload adapters.
+                validate_upload_preflight(fresh_item, channel, option_group)
 
                 reservation_key, reservation_result = _acquire_content_reservation(
                     item_id,

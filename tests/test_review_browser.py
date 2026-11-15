@@ -6,6 +6,91 @@ from pathlib import Path
 
 @unittest.skipUnless(os.environ.get('DHB_BROWSER_TESTS') == '1', 'Run in the browser CI job')
 class ConfigBrowserTests(unittest.TestCase):
+    def test_upload_capabilities_show_limits_and_clear_stale_support_on_failure(self):
+        import copy
+        import json
+        import re
+        from urllib.parse import urlsplit
+        from playwright.sync_api import sync_playwright
+        from test_review_regressions import ReviewRegressions
+        fixture = ReviewRegressions()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        root = Path(__file__).resolve().parents[1]
+        html = re.sub(r'<script\b[^>]*>.*?</script>', '', (root/'static/index.html').read_text(encoding='utf-8'), flags=re.S)
+        response_mode = {'value': 'real'}
+        requests = []
+        marker = '<img src=x onerror="globalThis.capabilityExecuted=1"> & tiếng Việt'
+
+        def dispatch(route):
+            request = route.request
+            parsed = urlsplit(request.url)
+            if parsed.netloc != '127.0.0.1:8686':
+                route.abort()
+                return
+            if parsed.path == '/':
+                route.fulfill(status=200, content_type='text/html', body=html)
+                return
+            if not parsed.path.startswith(('/api/auth', '/api/options', '/api/upload-capabilities', '/static/')):
+                route.abort()
+                return
+            requests.append((request.method, parsed.path))
+            if parsed.path == '/api/upload-capabilities' and response_mode['value'] == 'unavailable':
+                route.fulfill(status=503, content_type='application/json', body='{"detail":"Unavailable"}')
+                return
+            response = fixture.client.request(request.method, parsed.path,
+                headers=dict(request.headers), content=request.post_data_buffer)
+            if parsed.path == '/api/upload-capabilities' and response_mode['value'] != 'real':
+                data = copy.deepcopy(response.json())
+                if response_mode['value'] == 'legacy':
+                    data = {mode: {'pin_comment': False, 'thumbnail': True} for mode in ('youtube_api', 'playwright')}
+                elif response_mode['value'] == 'malformed':
+                    data['youtube_api']['features']['category']['enabled'] = 'yes'
+                else:
+                    data['youtube_api']['features']['category']['label'] = marker
+                    data['playwright']['features']['category']['reason'] = marker
+                route.fulfill(status=200, content_type='application/json', body=json.dumps(data))
+                return
+            route.fulfill(status=response.status_code, headers=dict(response.headers), body=response.content)
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.route('**/*', dispatch)
+                page.goto('http://127.0.0.1:8686/')
+                page.add_script_tag(content=(root/'static/app.js').read_text(encoding='utf-8'))
+                page.add_style_tag(content='.tab-pane {display:block!important}')
+                page.evaluate('loadOptions()')
+                page.locator('section[aria-labelledby="upload-capabilities-title"] summary').click()
+                rows = page.locator('#upload-capabilities-tbody tr')
+                self.assertEqual(rows.count(), 7)
+                category = page.locator('[data-capability="category"] td')
+                self.assertIn('Áp dụng: Có', category.nth(0).inner_text())
+                self.assertIn('Xác minh: Chưa đọc lại', category.nth(0).inner_text())
+                self.assertIn('Chưa bật', category.nth(1).inner_text())
+                for key in ('video_language', 'remix', 'age_restriction', 'pin_comment'):
+                    for cell in page.locator(f'[data-capability="{key}"] td').all():
+                        self.assertIn('Chưa bật', cell.inner_text())
+                        self.assertIn('Nghiệm thu thực tế: Chưa có', cell.inner_text())
+                self.assertEqual(page.locator('#opt-category').input_value(), '22')
+                self.assertFalse(page.locator('#opt-pin-enabled').is_checked())
+                for mode in ('unavailable', 'legacy', 'malformed'):
+                    response_mode['value'] = mode
+                    page.get_by_role('button', name='Tải lại khả năng đăng', exact=True).click()
+                    page.wait_for_function("document.getElementById('upload-capabilities-status').textContent.startsWith('Chưa xác định')")
+                    self.assertEqual(rows.count(), 0)
+                response_mode['value'] = 'escaped'
+                page.evaluate('globalThis.capabilityExecuted=0')
+                page.get_by_role('button', name='Tải lại khả năng đăng', exact=True).click()
+                page.wait_for_function("document.querySelectorAll('#upload-capabilities-tbody tr').length === 7")
+                self.assertIn(marker, rows.first.inner_text())
+                self.assertEqual(page.locator('#upload-capabilities-tbody img').count(), 0)
+                self.assertEqual(page.evaluate('capabilityExecuted'), 0)
+                self.assertTrue(all(method == 'GET' for method, _ in requests), requests)
+            finally:
+                browser.close()
+
     def test_preset_roundtrip_keeps_hidden_fields_and_rejects_stale_edit(self):
         import json
         import re
