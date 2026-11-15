@@ -25,6 +25,8 @@ G1–G6 are complete for the user's selected scope: offline acceptance and local
 
 Follow-up G7–G9 is now deployed locally as `2026.11.15-scan-csv`. See `G7_SCAN_LIFECYCLE.md`, `G8_CSV_SAFETY.md` and `G9_LOCAL_SCAN_CSV.md` for scan cancellation/deadlines, reversible CSV escaping, current deployment evidence and remaining roadmap. The earlier release record remains historical.
 
+Current local rollout is G10–G12, build `2026.11.15-monitor-validation` at `10f236e`. Channel/option configuration and monitor creation now validate inputs before writes. See `G12_LOCAL_CONFIG_ROLLOUT.md` for offline checks, preserved data, rollback and remaining scope; G7–G9 records describe the previous release.
+
 ## G3: queue preparation
 
 Bulk destination edits now retain canonical group JSON, remove request aliases before SQL and reject conflicting destinations/aliases or missing queue IDs atomically. Excel export converts SQLite rows at the boundary and preserves formula-like text. Tests cover Unicode multi-group and schedule round trips, preview destinations, project filtering and rollback. Chromium exercises actual form submission, workbook download and preview/apply import against the isolated API/DB. Full suite: 330 tests / 139 subtests including both browser tests; Ruff critical checks and diff validation passed.
