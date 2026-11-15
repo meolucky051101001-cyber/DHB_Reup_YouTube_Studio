@@ -3059,6 +3059,7 @@ async function applyRenderStudioToSelected() {
   if (renderSpeed === null) return;
   const mode = document.getElementById('rc-mode').value;
   const cfg = {
+    ...(gLoadedRenderPreset?.config || {}),
     speed: renderSpeed,
     volume: parseFloat(document.getElementById('rc-volume').value || '1.0'),
     brightness: parseFloat(document.getElementById('rc-brightness').value || '0.0'),
@@ -3072,18 +3073,22 @@ async function applyRenderStudioToSelected() {
   };
   collectBrandingConfig(cfg);
   collectEditConfig(cfg);
-  await apiFetch('/api/queue/bulk-update', {
-    method: 'POST',
-    body: JSON.stringify({
-      ids,
-      updates: {
-        render_mode: mode,
-        render_config_json: JSON.stringify(cfg),
-      },
-    }),
-  });
-  alert(`Đã lưu cấu hình Render (${mode}) cho ${ids.length} video!`);
-  await loadQueue(true);
+  try {
+    await apiFetch('/api/queue/bulk-update', {
+      method: 'POST',
+      body: JSON.stringify({
+        ids,
+        updates: {
+          render_mode: mode,
+          render_config_json: JSON.stringify(cfg),
+        },
+      }),
+    });
+    alert(`Đã lưu cấu hình Render (${mode}) cho ${ids.length} video!`);
+    await loadQueue(true);
+  } catch (e) {
+    alert('Lỗi áp dụng cấu hình render: ' + e.message);
+  }
 }
 
 // ===== LỚP PHỦ BRANDING (kế thừa DHB) =====
@@ -3125,10 +3130,7 @@ function collectEditConfig(cfg) {
 }
 
 function fillEditForm(cfg) {
-  const set = (id, v) => {
-    const el = document.getElementById(id);
-    if (el && v !== undefined && v !== null) el.value = v;
-  };
+  const set = setRenderFormValue;
   const setChk = (id, v) => {
     const el = document.getElementById(id);
     if (el) el.checked = !!v;
@@ -3162,8 +3164,8 @@ function collectBrandingConfig(cfg) {
   cfg.logo_video_size = val('rc-logo-size', '300:150');
   cfg.logo_video_pos = val('rc-logo-pos', '10:10');
   cfg.logo_video_chroma = val('rc-logo-chroma', '13FE06');
-  cfg.logo_video_similarity = 0.4;
-  cfg.logo_video_blend = 0.1;
+  cfg.logo_video_similarity ??= 0.4;
+  cfg.logo_video_blend ??= 0.1;
   cfg.watermark_text = val('rc-wm-text', '');
   cfg.watermark_text_size = parseInt(val('rc-wm-text-size', '50'), 10);
   cfg.watermark_text_pos = val('rc-wm-text-pos', '350:80');
@@ -3172,7 +3174,7 @@ function collectBrandingConfig(cfg) {
   cfg.text_scroll_size = parseInt(val('rc-scroll-size', '40'), 10);
   cfg.text_scroll_speed = parseInt(val('rc-scroll-speed', '10'), 10);
   cfg.text_scroll_color = val('rc-scroll-color', 'yellow');
-  cfg.text_scroll_height = 60;
+  cfg.text_scroll_height ??= 60;
   cfg.intro_enabled = chk('rc-intro-enable');
   cfg.intro_random = chk('rc-intro-random');
   cfg.intro_name = val('rc-intro', '');
@@ -3185,10 +3187,7 @@ function collectBrandingConfig(cfg) {
 }
 
 function fillBrandingForm(cfg) {
-  const set = (id, v) => {
-    const el = document.getElementById(id);
-    if (el && v !== undefined && v !== null) el.value = v;
-  };
+  const set = setRenderFormValue;
   const setChk = (id, v) => {
     const el = document.getElementById(id);
     if (el) el.checked = !!v;
@@ -3215,20 +3214,38 @@ function fillBrandingForm(cfg) {
   setChk('rc-outro-enable', cfg.outro_enabled);
   setChk('rc-outro-random', cfg.outro_random);
   set('rc-outro', cfg.outro_name || '');
-  set('rc-audio-orig', cfg.audio_original_percent !== undefined ? cfg.audio_original_percent : 100);
-  set('rc-audio-bg', cfg.bg_music_percent !== undefined ? cfg.bg_music_percent : 25);
+  set('rc-audio-orig', cfg.audio_original_percent ?? (cfg.volume ?? 1) * 100);
+  set('rc-audio-bg', cfg.bg_music_percent ?? (cfg.bg_music_volume ?? 0.25) * 100);
   setChk('rc-bg-random', cfg.bg_video_random);
 }
 
 // ===== PRESET RENDER CÓ TÊN (học quy trình preset JSON của DHB) =====
+let gLoadedRenderPreset = null;
+
+function setRenderFormValue(id, value) {
+  const el = document.getElementById(id);
+  if (!el || value === undefined || value === null) return;
+  if (el.tagName === 'SELECT' && value !== '' && !Array.from(el.options).some(option => option.value === String(value))) {
+    el.add(new Option(`${value} (chưa có trong kho)`, String(value)));
+  }
+  el.value = value;
+}
+
+function showLoadedPreset() {
+  const status = document.getElementById('rp-editing');
+  if (status) status.textContent = gLoadedRenderPreset ? `Đang sửa: ${gLoadedRenderPreset.name}` : 'Nạp một preset để cập nhật.';
+}
+
 async function loadRenderPresets() {
   try {
     gRenderPresets = await apiFetch('/api/render-presets');
     const sel = document.getElementById('rp-select');
     if (sel) {
+      const current = sel.value;
       sel.innerHTML = gRenderPresets.length
-        ? gRenderPresets.map(p => `<option value="${p.id}">${escapeHtml(p.name)} (${escapeHtml(p.render_mode)})</option>`).join('')
+        ? gRenderPresets.map(p => `<option value="${p.id}">${p.valid === false ? "⚠ " : ""}${escapeHtml(p.name)} (${escapeHtml(p.render_mode)})</option>`).join('')
         : `<option value="">-- Chưa có preset nào --</option>`;
+      if (Array.from(sel.options).some(option => option.value === current)) sel.value = current;
     }
   } catch (e) {
     console.error('Lỗi loadRenderPresets:', e);
@@ -3237,7 +3254,11 @@ async function loadRenderPresets() {
 
 function onSelectRenderPreset() {}
 
-async function saveRenderPreset() {
+async function saveRenderPreset(updateExisting = false) {
+  if (updateExisting && (!gLoadedRenderPreset || String(gLoadedRenderPreset.id) !== document.getElementById('rp-select').value)) {
+    alert('Hãy nạp preset đã chọn vào form trước khi cập nhật.');
+    return;
+  }
   const name = document.getElementById('rp-name').value.trim();
   if (!name) {
     alert('Nhập tên preset trước khi lưu!');
@@ -3247,6 +3268,7 @@ async function saveRenderPreset() {
   if (renderSpeed === null) return;
   const mode = document.getElementById('rc-mode').value;
   const cfg = {
+    ...(gLoadedRenderPreset?.config || {}),
     speed: renderSpeed,
     volume: parseFloat(document.getElementById('rc-volume').value || '1.0'),
     brightness: parseFloat(document.getElementById('rc-brightness').value || '0.0'),
@@ -3261,13 +3283,16 @@ async function saveRenderPreset() {
   collectBrandingConfig(cfg);
   collectEditConfig(cfg);
   try {
-    await apiFetch('/api/render-presets', {
-      method: 'POST',
-      body: JSON.stringify({ name, render_mode: mode, config: cfg }),
+    const body = { name, render_mode: mode, config: cfg, note: document.getElementById('rp-note').value };
+    if (updateExisting) body.expected_revision = gLoadedRenderPreset.revision;
+    const result = await apiFetch(updateExisting ? `/api/render-presets/${gLoadedRenderPreset.id}` : '/api/render-presets', {
+      method: updateExisting ? 'PUT' : 'POST', body: JSON.stringify(body),
     });
+    gLoadedRenderPreset = result;
+    showLoadedPreset();
     showToast(`💾 Đã lưu Preset Render "${name}"!`, 'info');
-    document.getElementById('rp-name').value = '';
     await loadRenderPresets();
+    document.getElementById('rp-select').value = String(result.id);
   } catch (e) {
     alert('Lỗi lưu preset: ' + e.message);
   }
@@ -3280,12 +3305,17 @@ function loadPresetToForm() {
     alert('Chưa chọn preset hợp lệ.');
     return;
   }
+  if (p.valid === false) {
+    alert(p.validation_error || 'Preset không hợp lệ; dữ liệu gốc được giữ nguyên.');
+    return;
+  }
+  gLoadedRenderPreset = structuredClone(p);
+  document.getElementById('rp-name').value = p.name;
+  document.getElementById('rp-note').value = p.note || '';
+  showLoadedPreset();
   document.getElementById('rc-mode').value = p.render_mode || 'shorts_9_16';
   const cfg = p.config || {};
-  const set = (id, v) => {
-    const el = document.getElementById(id);
-    if (el && v !== undefined && v !== null) el.value = v;
-  };
+  const set = setRenderFormValue;
   const setChk = (id, v) => {
     const el = document.getElementById(id);
     if (el) el.checked = !!v;
@@ -3298,7 +3328,7 @@ function loadPresetToForm() {
   setChk('rc-hflip', cfg.hflip);
   setChk('rc-pitch', cfg.audio_pitch_shift);
   setChk('rc-shorts-enforce', cfg.enforce_shorts_duration !== false);
-  setChk('rc-shorts-visual', cfg.shorts_visual_pop !== false);
+  setChk('rc-shorts-visual', cfg.shorts_visual_pop ?? cfg.shorts_vibrant_colors ?? true);
   set('rc-custom-cmd', cfg.custom_command || '');
   fillBrandingForm(cfg);
   fillEditForm(cfg);
@@ -3312,10 +3342,16 @@ async function deleteRenderPreset() {
     alert('Chưa chọn preset để xóa.');
     return;
   }
-  if (!confirm(`Xóa preset "${p.name}"?`)) return;
-  await apiFetch(`/api/render-presets/${id}`, { method: 'DELETE' });
-  showToast('🗑️ Đã xóa preset.', 'warning');
-  await loadRenderPresets();
+  if (!confirm(`Xóa preset "${p.name}"? Cấu hình đã áp vào video được giữ nguyên.`)) return;
+  try {
+    await apiFetch(`/api/render-presets/${id}?expected_revision=${encodeURIComponent(p.revision)}`, { method: 'DELETE' });
+    if (gLoadedRenderPreset?.id === id) gLoadedRenderPreset = null;
+    showLoadedPreset();
+    showToast('🗑️ Đã xóa preset.', 'warning');
+    await loadRenderPresets();
+  } catch (e) {
+    alert('Lỗi xóa preset: ' + e.message);
+  }
 }
 
 async function applyShortsBooster() {

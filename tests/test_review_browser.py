@@ -6,6 +6,81 @@ from pathlib import Path
 
 @unittest.skipUnless(os.environ.get('DHB_BROWSER_TESTS') == '1', 'Run in the browser CI job')
 class ConfigBrowserTests(unittest.TestCase):
+    def test_preset_roundtrip_keeps_hidden_fields_and_rejects_stale_edit(self):
+        import json
+        import re
+        from contextlib import closing
+        from urllib.parse import urlsplit
+        from playwright.sync_api import sync_playwright
+        import database
+        from test_render_preset_crud import RenderPresetCrudTests
+        fixture = RenderPresetCrudTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        preset = fixture.create(config={'speed':1.2,'framerate':60,'bitrate':'7000k',
+            'logo_video_similarity':.6,'text_scroll_height':90,'bg_music_name':'missing-local.mp3',
+            'bg_music_volume':.35,'shorts_vibrant_colors':False},note='original note')
+        root = Path(__file__).resolve().parents[1]
+        html = re.sub(r'<script\b[^>]*>.*?</script>', '', (root/'static/index.html').read_text(encoding='utf-8'), flags=re.S)
+        def dispatch(route):
+            request = route.request
+            parsed = urlsplit(request.url)
+            if parsed.netloc != '127.0.0.1:8686':
+                route.abort()
+                return
+            if parsed.path == '/':
+                route.fulfill(status=200, content_type='text/html', body=html)
+                return
+            if not parsed.path.startswith(('/api/auth','/api/render-presets','/api/queue','/api/projects','/static/')):
+                route.abort()
+                return
+            response = fixture.client.request(request.method, parsed.path + ('?'+parsed.query if parsed.query else ''),
+                                              headers=dict(request.headers), content=request.post_data_buffer)
+            route.fulfill(status=response.status_code, headers=dict(response.headers), body=response.content)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.route('**/*', dispatch)
+            dialogs = []
+            page.on('dialog',lambda dialog: (dialogs.append(dialog.message),dialog.accept()))
+            page.goto('http://127.0.0.1:8686/')
+            page.add_script_tag(content=(root/'static/app.js').read_text(encoding='utf-8'))
+            page.add_style_tag(content='.tab-pane {display:block!important}')
+            page.evaluate('async () => { await loadRenderPresets(); await loadProjects(); }')
+            page.locator('[onclick="loadPresetToForm()"]').click(force=True)
+            self.assertEqual(page.input_value('#rc-bg-music'),'missing-local.mp3')
+            self.assertEqual(page.input_value('#rp-note'),'original note')
+            self.assertFalse(page.is_checked('#rc-shorts-visual'))
+            page.fill('#rc-speed','1.5')
+            page.fill('#rp-name','Preset đã sửa')
+            page.fill('#rp-note','new note')
+            page.locator('[onclick="saveRenderPreset(true)"]').click(force=True)
+            page.wait_for_function("gRenderPresets.some(p => p.name === 'Preset đã sửa')")
+            saved = fixture.request('GET').json()[0]
+            self.assertEqual(saved['id'],preset['id'])
+            for key in ('framerate','bitrate','logo_video_similarity','text_scroll_height','bg_music_name'):
+                self.assertEqual(saved['config'][key],preset['config'][key])
+            self.assertEqual(saved['config']['bg_music_percent'],35)
+            self.assertIs(saved['config']['shorts_visual_pop'],False)
+            self.assertEqual(saved['config']['speed'],1.5)
+            page.select_option('#sel-project','review')
+            page.evaluate('loadQueue()')
+            page.evaluate('applyRenderStudioToSelected()')
+            with closing(database.get_conn()) as conn:
+                queue_copy = conn.execute('SELECT render_config_json FROM video_queue WHERE id=901').fetchone()[0]
+            self.assertEqual(json.loads(queue_copy)['framerate'],60)
+            latest = fixture.request('PUT',f"/{preset['id']}",{'note':'other window','expected_revision':saved['revision']}).json()
+            page.fill('#rp-note','stale edit')
+            page.evaluate('saveRenderPreset(true)')
+            self.assertTrue(any('Preset đã thay đổi' in message for message in dialogs))
+            self.assertEqual(fixture.request('GET').json()[0]['note'],'other window')
+            page.evaluate('async () => { await loadRenderPresets(); await deleteRenderPreset(); }')
+            self.assertEqual(fixture.request('GET').json(),[])
+            with closing(database.get_conn()) as conn:
+                self.assertEqual(conn.execute('SELECT render_config_json FROM video_queue WHERE id=901').fetchone()[0],queue_copy)
+            self.assertNotEqual(latest['revision'],saved['revision'])
+            browser.close()
+
     def test_local_profile_create_note_and_delete_use_real_api(self):
         import re
         from urllib.parse import urlsplit

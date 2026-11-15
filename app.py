@@ -89,6 +89,7 @@ from render_engine import normalize_render_speed
 from runtime_identity import capture_runtime, runtime_status
 from config_validation import parse_config_input, validate_config, validate_option_state
 from profile_crud import ProfileCreate, ProfileUpdate, binding_references
+from render_preset_validation import PresetCreate, PresetUpdate, validate_render_config, public_preset, preset_revision
 from monitor_validation import validate_monitor_create
 from storage_manager import (
     DEFAULT_RETENTION_DAYS,
@@ -382,7 +383,7 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.15-monitor-validation.1"
+APP_BUILD_VERSION = "2026.11.15-crud"
 RUNTIME_IDENTITY = capture_runtime(APP_ROOT)
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
@@ -1474,14 +1475,11 @@ def api_bulk_update_queue(data: Dict[str, Any] = Body(...)):
             render_config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, "Cấu hình render phải là JSON hợp lệ.") from exc
-        if not isinstance(render_config, dict):
-            raise HTTPException(400, "Cấu hình render phải là một object JSON.")
-        if "speed" in render_config:
-            try:
-                render_config["speed"] = normalize_render_speed(render_config["speed"])
-            except ValueError as exc:
-                raise HTTPException(400, str(exc)) from exc
-        filtered["render_config_json"] = json.dumps(render_config, ensure_ascii=False)
+        try:
+            render_config = validate_render_config(render_config, filtered.get('render_mode'))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        filtered['render_config_json'] = json.dumps(render_config, ensure_ascii=False, allow_nan=False)
 
     try:
         interval = int(updates.get("schedule_interval_minutes") or 0)
@@ -3752,7 +3750,7 @@ def api_get_profile_channels(profile_name: str):
     return get_channels_by_profile(profile_name)
 
 
-def _profile_input(schema, data, *, partial=False):
+def _validated_crud_input(schema, data, *, partial=False):
     try:
         return parse_config_input(schema, data, partial=partial)
     except ValueError as exc:
@@ -3781,7 +3779,7 @@ def _ensure_binding_deletable(conn, channel_ids, profile_name=''):
 
 @app.post('/api/profiles')
 def api_create_profile(data: Dict[str, Any] = Body(...)):
-    values = _profile_input(ProfileCreate, data)
+    values = _validated_crud_input(ProfileCreate, data)
     name, proxy, note = values['name'], values['proxy'], values['note']
     from config import APP_PROFILES_DIR
     root = APP_PROFILES_DIR.resolve()
@@ -3826,7 +3824,7 @@ def api_create_profile(data: Dict[str, Any] = Body(...)):
 
 @app.put('/api/profiles/{profile_name:path}')
 def api_update_profile(profile_name: str, data: Dict[str, Any] = Body(...)):
-    values = _profile_input(ProfileUpdate, data, partial=True)
+    values = _validated_crud_input(ProfileUpdate, data, partial=True)
     with closing(get_conn()) as conn, conn:
         conn.execute('BEGIN IMMEDIATE')
         row = conn.execute('SELECT * FROM chrome_profiles WHERE name=?', (profile_name,)).fetchone()
@@ -4457,62 +4455,73 @@ def api_get_render_resources():
 # ==========================================================
 # PRESET RENDER CÓ TÊN (học quy trình preset JSON của DHB)
 # ==========================================================
-@app.get("/api/render-presets")
+@app.get('/api/render-presets')
 def api_list_render_presets():
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM render_presets ORDER BY name ASC").fetchall()
-    conn.close()
-    res = []
-    for r in rows:
-        d = dict(r)
-        try:
-            d["config"] = json.loads(d.get("config_json") or "{}")
-        except Exception:
-            d["config"] = {}
-        res.append(d)
-    return res
+    with closing(get_conn()) as conn:
+        return [public_preset(row) for row in conn.execute('SELECT * FROM render_presets ORDER BY name')]
 
 
-@app.post("/api/render-presets")
+def _validated_preset_config(values):
+    try:
+        return validate_render_config(values['config'], values['render_mode'])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _check_preset_revision(row, expected):
+    if not expected or expected != preset_revision(row):
+        raise HTTPException(409, 'Preset đã thay đổi hoặc thiếu phiên bản đã đọc. Hãy nạp lại trước khi cập nhật/xóa.')
+
+
+@app.post('/api/render-presets')
 def api_save_render_preset(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Tên preset không được để trống.")
-    render_mode = data.get("render_mode") or "shorts_9_16"
-    cfg = data.get("config") or {}
-    if not isinstance(cfg, dict):
-        raise HTTPException(400, "Cấu hình preset phải là một object JSON.")
-    if "speed" in cfg:
-        try:
-            cfg["speed"] = normalize_render_speed(cfg["speed"])
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-    note = (data.get("note") or "").strip()
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO render_presets (name, render_mode, config_json, note)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(name) DO UPDATE SET
-            render_mode = excluded.render_mode,
-            config_json = excluded.config_json,
-            note = excluded.note
-        """,
-        (name, render_mode, json.dumps(cfg, ensure_ascii=False), note),
-    )
-    conn.commit()
-    conn.close()
-    add_log("Render", f"Đã lưu Preset Render '{name}' (chế độ {render_mode}).", "SUCCESS")
-    return {"ok": True}
+    values = _validated_crud_input(PresetCreate, data)
+    cfg = _validated_preset_config(values)
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if conn.execute('SELECT 1 FROM render_presets WHERE name=?', (values['name'],)).fetchone():
+            raise HTTPException(409, 'Tên preset đã tồn tại. Hãy nạp preset và chọn Cập nhật, hoặc nhập tên mới.')
+        cursor = conn.execute('INSERT INTO render_presets(name,render_mode,config_json,note) VALUES(?,?,?,?)',
+            (values['name'],values['render_mode'],json.dumps(cfg,ensure_ascii=False,allow_nan=False),values['note']))
+        row = conn.execute('SELECT * FROM render_presets WHERE id=?', (cursor.lastrowid,)).fetchone()
+    return {'ok': True, **public_preset(row)}
 
 
-@app.delete("/api/render-presets/{preset_id}")
-def api_delete_render_preset(preset_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM render_presets WHERE id = ?", (preset_id,))
-    conn.commit()
-    conn.close()
-    return {"ok": True}
+@app.put('/api/render-presets/{preset_id}')
+def api_update_render_preset(preset_id: int, data: Dict[str, Any] = Body(...)):
+    updates = _validated_crud_input(PresetUpdate, data, partial=True)
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM render_presets WHERE id=?', (preset_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, 'Không tìm thấy preset này.')
+        _check_preset_revision(row, updates.pop('expected_revision', ''))
+        values = {key: row[key] for key in ('name','render_mode','note')}
+        if 'config' not in updates:
+            try:
+                values['config'] = json.loads(row['config_json'])
+            except (ValueError, TypeError):
+                raise HTTPException(400, 'Cấu hình cũ bị lỗi. Cần cung cấp cấu hình thay thế đầy đủ.') from None
+        values.update(updates)
+        cfg = _validated_preset_config(values)
+        if conn.execute('SELECT 1 FROM render_presets WHERE name=? AND id<>?', (values['name'],preset_id)).fetchone():
+            raise HTTPException(409, 'Tên preset đã tồn tại; không thể ghi đè preset khác.')
+        conn.execute('UPDATE render_presets SET name=?,render_mode=?,config_json=?,note=? WHERE id=?',
+            (values['name'],values['render_mode'],json.dumps(cfg,ensure_ascii=False,allow_nan=False),values['note'],preset_id))
+        result = public_preset(conn.execute('SELECT * FROM render_presets WHERE id=?', (preset_id,)).fetchone())
+    return {'ok': True, **result}
+
+
+@app.delete('/api/render-presets/{preset_id}')
+def api_delete_render_preset(preset_id: int, expected_revision: str = ''):
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM render_presets WHERE id=?', (preset_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, 'Không tìm thấy preset này.')
+        _check_preset_revision(row, expected_revision)
+        conn.execute('DELETE FROM render_presets WHERE id=?', (preset_id,))
+    return {'ok': True}
 
 
 # ==========================================================
