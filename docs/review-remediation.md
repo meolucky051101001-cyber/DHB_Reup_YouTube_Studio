@@ -27,6 +27,8 @@ Follow-up G7–G9 is now deployed locally as `2026.11.15-scan-csv`. See `G7_SCAN
 
 Current local rollout is G13–G16, build `2026.11.15-crud` at `74005a4`. Projects, profiles and render presets now validate mutations, preserve references and prevent silent overwrites. All existing fields in 15 tables survived backup/rehearsal/restart and read-only Chromium acceptance. See `G16_LOCAL_CRUD_ROLLOUT.md` for evidence, API compatibility changes and rollback. G7–G12 records describe previous releases.
 
+The proposed next milestone is documented in [PLAN_G17_G22_UPLOAD_METADATA.md](PLAN_G17_G22_UPLOAD_METADATA.md): capability and metadata intent, category/language verification, an explicit remix support decision, durable evidence and offline/local acceptance. This is a plan only; G17–G22 have not been implemented and the deployed revision is unchanged.
+
 ## G3: queue preparation
 
 Bulk destination edits now retain canonical group JSON, remove request aliases before SQL and reject conflicting destinations/aliases or missing queue IDs atomically. Excel export converts SQLite rows at the boundary and preserves formula-like text. Tests cover Unicode multi-group and schedule round trips, preview destinations, project filtering and rollback. Chromium exercises actual form submission, workbook download and preview/apply import against the isolated API/DB. Full suite: 330 tests / 139 subtests including both browser tests; Ruff critical checks and diff validation passed.
