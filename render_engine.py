@@ -1017,12 +1017,24 @@ def render_video(
 
 def _cleanup_partial_output(partial_output: Optional[str]):
     """Xóa file video xuất dở dang khi render thất bại hoặc bị người dùng bấm Dừng."""
-    if partial_output:
+    if not partial_output:
+        return True
+    # Windows can briefly retain a sharing lock after the encoder has exited.
+    # Retry only the owned file; never mask the original render/stop exception.
+    for attempt in range(5):
         try:
-            if os.path.exists(partial_output):
-                os.remove(partial_output)
-        except Exception:
+            os.remove(partial_output)
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            if attempt < 4:
+                time.sleep(.05 * (2 ** attempt))
+                continue
+        except OSError:
             pass
+        _log_render_warning('Render', f'Không xóa được file render dở dang; file vẫn được giữ để kiểm tra: {partial_output}')
+        return False
 
 
 def _run_ffmpeg_with_progress(

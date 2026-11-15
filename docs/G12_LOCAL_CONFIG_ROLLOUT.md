@@ -18,3 +18,11 @@
 CRUD project/profile/preset và chính sách xóa tham chiếu cần đợt riêng. Studio category/language/remix vẫn thiếu thao tác/readback; không coi việc field lưu được là capability đã nghiệm thu. Dependency warning, quy trình repo/release, refactor và soak vẫn theo roadmap. Video Error #193–196 thiếu file và kênh #1–7 thiếu Channel ID chưa có dữ liệu để tự khôi phục.
 
 Rollback: dừng app/worker, xác nhận không có claim/slot hoạt động và backup DB hiện tại; quay lại nhánh local trước rồi restart. G10–G12 không đổi schema; ưu tiên giữ DB hiện tại và evidence mới. Không restore backup cũ khi chưa bảo toàn các lần đăng phát sinh sau backup.
+
+## Bổ sung cleanup render
+
+Một job CI media ghi nhận file render dở dang còn lại sau hủy, trong khi lượt PR và 12 lượt local cùng ca đều đạt. Chưa xác định được lock cụ thể của lần CI đó. Đã tái hiện điểm yếu cleanup một lần bằng Windows handle thật không cho SHARE_DELETE: code cũ bỏ qua lỗi và giữ file dù lock đã được thả.
+
+Cleanup hiện thử tối đa 5 lần khi PermissionError, tổng chờ 0,75 giây; nếu vẫn thất bại thì ghi cảnh báo, giữ nguyên lỗi render/hủy ban đầu và không đụng file khác. Hai regression kiểm tra lock thật được thả và lock kéo dài không che lỗi dừng. Build bổ sung `2026.11.15-monitor-validation.1`.
+
+Nghiệm thu bản bổ sung: full suite 377 phương thức (368 đạt, 9 media opt-in bỏ qua), gồm Chromium; ma trận riêng 28 ca FFmpeg thật qua 9 phương thức đều đạt. Compile và Ruff critical đạt. Không đổi tolerance media hoặc bỏ kiểm tra cleanup khỏi CI.

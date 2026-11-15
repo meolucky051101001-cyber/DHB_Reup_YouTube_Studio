@@ -114,6 +114,66 @@ class _FakeFFmpegProc:
         pass
 
 
+class PartialOutputCleanupTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Windows file-sharing semantics')
+    def test_cleanup_retries_when_windows_releases_a_transient_file_lock(self):
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,
+                                      wintypes.LPVOID,wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        with tempfile.TemporaryDirectory() as folder:
+            partial = Path(folder)/'partial.mp4'
+            partial.write_bytes(b'cancelled render')
+            # Allow reads/writes, but hold a real Windows handle without SHARE_DELETE.
+            handle = kernel.CreateFileW(str(partial),0x80000000,3,None,3,0,None)
+            self.assertNotEqual(handle,wintypes.HANDLE(-1).value)
+            locked = True
+            real_remove = os.remove
+            lock_errors = []
+            def remove_after_lock_released(path):
+                nonlocal locked
+                try:
+                    return real_remove(path)
+                except PermissionError as exc:
+                    lock_errors.append(exc.winerror)
+                    kernel.CloseHandle(handle)
+                    locked = False
+                    raise
+            try:
+                with mock.patch.object(render_engine.os,'remove',side_effect=remove_after_lock_released):
+                    render_engine._cleanup_partial_output(str(partial))
+                self.assertTrue(lock_errors,'The first unlink must hit the real Windows lock')
+                self.assertFalse(partial.exists(),'Retry after the lock release must remove the partial output')
+            finally:
+                if locked:
+                    kernel.CloseHandle(handle)
+
+    def test_permanent_file_lock_does_not_mask_original_cancellation(self):
+        fake = _FakeFFmpegProc(3333,['frame=1 time=00:00:05.00 bitrate=100kbits/s\n'])
+        def cancelled(pct, message):
+            if pct > 5:
+                raise InterruptedError('original cancellation')
+        with tempfile.TemporaryDirectory() as folder:
+            partial = Path(folder)/'partial.mp4'
+            partial.write_bytes(b'cancelled render')
+            with mock.patch.object(render_engine.subprocess,'Popen',return_value=fake), \
+                 mock.patch.object(render_engine.subprocess,'run',side_effect=lambda *a,**k:fake.kill()), \
+                 mock.patch.object(render_engine.os,'remove',side_effect=PermissionError('locked')) as remove, \
+                 mock.patch.object(render_engine.time,'sleep'), \
+                 mock.patch.object(render_engine,'_log_render_warning') as warning:
+                with self.assertRaisesRegex(InterruptedError,'original cancellation'):
+                    render_engine._run_ffmpeg_with_progress(['ffmpeg'],10,cancelled,partial_output=str(partial))
+                self.assertLessEqual(remove.call_count,10,'Cleanup must remain bounded')
+                warning.assert_called_once()
+            self.assertTrue(partial.exists())
+            self.assertTrue(fake.killed)
+            self.assertFalse(render_engine._ACTIVE_FFMPEG_PROCS)
+
+
 class FFmpegOrphanTests(unittest.TestCase):
     def setUp(self):
         with render_engine._ACTIVE_FFMPEG_LOCK:

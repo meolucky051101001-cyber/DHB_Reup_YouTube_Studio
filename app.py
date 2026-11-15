@@ -332,7 +332,7 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.15-monitor-validation"
+APP_BUILD_VERSION = "2026.11.15-monitor-validation.1"
 RUNTIME_IDENTITY = capture_runtime(APP_ROOT)
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
