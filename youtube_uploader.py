@@ -34,6 +34,79 @@ class UploadNotSent(RuntimeError):
     """A guard rejected this operation before any file was sent to Studio."""
 
 
+class UploadVerificationError(RuntimeError):
+    """A bounded, structured failure after a video ID may have been received."""
+
+    def __init__(self, code: str, message: str, *, expected=None, observed=None):
+        self.code = str(code)
+        self.expected = dict(expected or {})
+        self.observed = dict(observed or {})
+        super().__init__(str(message))
+
+
+def _api_expected_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    category = str(metadata.get("category_id") or "").strip()
+    expected = {"category_id": category if re.fullmatch(r"[1-9][0-9]{0,2}", category) else None}
+    language = metadata.get("video_language")
+    if language:
+        expected["video_language"] = _safe_audio_language(language)
+    return expected
+
+
+def _safe_audio_language(value):
+    if (isinstance(value, str) and len(value) <= 64
+            and re.fullmatch(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*", value)):
+        return value
+    return None
+
+
+def _observed_api_metadata(item):
+    snippet = item.get("snippet")
+    if not isinstance(snippet, dict):
+        return {"category_id": None}
+    category = snippet.get("categoryId")
+    observed = {"category_id": category if isinstance(category, str)
+                and re.fullmatch(r"[1-9][0-9]{0,2}", category) else None}
+    if "defaultAudioLanguage" in snippet:
+        observed["video_language"] = _safe_audio_language(snippet["defaultAudioLanguage"])
+    return observed
+
+
+def _safe_video_id(value: Any) -> str:
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{11}", value) else ""
+
+
+def _emit_upload_evidence(evidence_sink, *, video_id: str, state: str,
+                          metadata: Dict[str, Any], code: str = "",
+                          observed: Optional[Dict[str, Any]] = None):
+    safe_id = _safe_video_id(video_id)
+    if not safe_id:
+        raise UploadVerificationError("API_VIDEO_ID_INVALID", "YouTube không trả Video ID hợp lệ.",
+                                      expected=_api_expected_metadata(metadata), observed={})
+    if evidence_sink is None:
+        return
+    event = {
+        "backend": "youtube_api",
+        "video_id": safe_id,
+        "verification_state": state,
+        "expected": _api_expected_metadata(metadata),
+        "observed": dict(observed or {}),
+        "code": str(code or ("API_VIDEO_ID_RECEIVED" if state == "received" else "API_VIDEO_VERIFIED")),
+    }
+    # The pipeline sink owns timestamps, channel binding, and DB schema. Never
+    # add headers, OAuth values, resumable URLs or provider response text here.
+    evidence_sink(event)
+
+
+def _verification_failure(code: str, message: str, metadata: Dict[str, Any], video_id: str,
+                          evidence_sink=None, *, observed=None):
+    _emit_upload_evidence(evidence_sink, video_id=video_id,
+                          state="mismatch" if code.endswith("_MISMATCH") else "unknown",
+                          metadata=metadata, code=code, observed=observed)
+    raise UploadVerificationError(code, message, expected=_api_expected_metadata(metadata),
+                                  observed=observed)
+
+
 _PROFILE_LOCKS_GUARD = threading.Lock()
 _PROFILE_LOCKS: Dict[str, threading.Lock] = {}
 
@@ -1532,7 +1605,21 @@ def _read_resumable_offset(response, file_size: int) -> int:
     return last + 1
 
 
-def _query_resumable_upload_status(http, upload_url: str, access_token: str, file_size: int):
+def _read_completed_api_id(response, metadata):
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        raise UploadVerificationError("API_VIDEO_ID_MALFORMED", "YouTube trả phản hồi hoàn tất không hợp lệ.",
+                                      expected=_api_expected_metadata(metadata)) from None
+    video_id = _safe_video_id(payload.get("id") if isinstance(payload, dict) else "")
+    if not video_id:
+        raise UploadVerificationError("API_VIDEO_ID_INVALID", "YouTube không trả Video ID hợp lệ.",
+                                      expected=_api_expected_metadata(metadata))
+    return video_id
+
+
+def _query_resumable_upload_status(http, upload_url: str, access_token: str, file_size: int,
+                                   *, evidence_sink=None, metadata=None):
     """Ask YouTube which bytes it stored; this is required after an ambiguous PUT."""
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -1550,9 +1637,10 @@ def _query_resumable_upload_status(http, upload_url: str, access_token: str, fil
                 continue
             raise RuntimeError(f"Không truy vấn được trạng thái phiên resumable: {exc}") from exc
         if response.status_code in (200, 201):
-            video_id = str((response.json() or {}).get("id") or "").strip()
-            if not video_id:
-                raise RuntimeError("YouTube xác nhận phiên đã hoàn tất nhưng không trả Video ID.")
+            video_id = _read_completed_api_id(response, metadata or {})
+            if metadata is not None:
+                _emit_upload_evidence(evidence_sink, video_id=video_id, state="received",
+                                      metadata=metadata)
             return {"offset": file_size, "video_id": video_id}
         if response.status_code == 308:
             retry_after = response.headers.get("Retry-After")
@@ -1576,8 +1664,9 @@ def _query_resumable_upload_status(http, upload_url: str, access_token: str, fil
     raise RuntimeError(f"Không xác định được trạng thái phiên resumable: {last_error or 'lỗi máy chủ'}")
 
 
-def _verify_api_video(http, video_id: str, access_token: str, metadata: Dict[str, Any], progress_callback=None):
-    """Wait for API processing and read back the audience/visibility/schedule fields."""
+def _verify_api_video(http, video_id: str, access_token: str, metadata: Dict[str, Any], progress_callback=None,
+                      *, evidence_sink=None):
+    """Read exact-ID metadata within a finite deadline; never retry an upload."""
     try:
         timeout_seconds = int(get_settings().get("youtube_processing_timeout_seconds", 900) or 900)
     except (TypeError, ValueError):
@@ -1586,77 +1675,109 @@ def _verify_api_video(http, video_id: str, access_token: str, metadata: Dict[str
     deadline = time.monotonic() + timeout_seconds
     delay = 2
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _verification_failure("API_VIDEO_READBACK_TIMEOUT", "Hết thời gian đọc lại video qua YouTube API.",
+                                  metadata, video_id, evidence_sink)
         try:
             response = http.get(
                 "https://www.googleapis.com/youtube/v3/videos",
-                params={"part": "status,processingDetails", "id": video_id},
+                params={"part": "snippet,status,processingDetails", "id": video_id},
                 headers={"Authorization": f"Bearer {access_token}"},
-                timeout=30,
+                timeout=min(30, remaining),
             )
-        except (requests.ConnectionError, requests.Timeout):
+        except requests.RequestException:
             if time.monotonic() >= deadline:
-                raise RuntimeError(f"Hết thời gian xác minh xử lý video qua YouTube API sau lỗi mạng.")
-            time.sleep(min(delay, max(1, int(deadline - time.monotonic()))))
+                _verification_failure("API_VIDEO_READBACK_TIMEOUT", "Hết thời gian xác minh video qua YouTube API sau lỗi mạng.",
+                                      metadata, video_id, evidence_sink)
+            time.sleep(min(delay, max(0, deadline - time.monotonic())))
             delay = min(30, delay * 2)
             continue
         if response.status_code in (429, 500, 502, 503, 504):
             if time.monotonic() >= deadline:
-                raise RuntimeError(f"Hết thời gian xác minh xử lý video qua YouTube API ({response.status_code}).")
+                _verification_failure("API_VIDEO_READBACK_TIMEOUT", "Hết thời gian xác minh video qua YouTube API.",
+                                      metadata, video_id, evidence_sink)
             retry_after = response.headers.get("Retry-After")
             try:
                 wait_seconds = min(60, max(1, int(retry_after))) if retry_after else delay
             except (TypeError, ValueError):
                 wait_seconds = delay
-            time.sleep(wait_seconds)
+            time.sleep(min(wait_seconds, max(0, deadline - time.monotonic())))
             delay = min(30, delay * 2)
             continue
         if response.status_code != 200:
-            raise RuntimeError(f"Không đọc lại được video sau upload ({response.status_code}): {response.text}")
-        items = (response.json() or {}).get("items") or []
-        item = next((candidate for candidate in items if str(candidate.get("id") or "") == video_id), None)
-        if not item:
-            raise RuntimeError("YouTube chưa trả video ID vừa tạo khi đọc lại; cần đối soát kết quả upload.")
-        status = item.get("status") or {}
+            _verification_failure("API_VIDEO_READBACK_HTTP", "Không đọc lại được video sau upload.", metadata,
+                                  video_id, evidence_sink)
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            _verification_failure("API_VIDEO_READBACK_MALFORMED", "Phản hồi xác minh video không phải JSON hợp lệ.",
+                                  metadata, video_id, evidence_sink)
+        if (not isinstance(payload, dict) or not isinstance(payload.get("items"), list)
+                or any(not isinstance(candidate, dict) for candidate in payload["items"])):
+            _verification_failure("API_VIDEO_READBACK_MALFORMED", "Cấu trúc phản hồi xác minh video không hợp lệ.",
+                                  metadata, video_id, evidence_sink)
+        items = [candidate for candidate in payload["items"] if candidate.get("id") == video_id]
+        if len(items) != 1:
+            _verification_failure("API_VIDEO_READBACK_ID_MISSING", "YouTube chưa trả video ID vừa tạo khi đọc lại; cần đối soát kết quả upload.", metadata,
+                                  video_id, evidence_sink)
+        item = items[0]
+        status, processing = item.get("status"), item.get("processingDetails")
+        if not isinstance(status, dict) or not isinstance(processing, dict):
+            _verification_failure("API_VIDEO_READBACK_MALFORMED", "Thiếu trạng thái xử lý video để xác minh.",
+                                  metadata, video_id, evidence_sink)
         upload_status = str(status.get("uploadStatus") or "").lower()
-        processing_status = str((item.get("processingDetails") or {}).get("processingStatus") or "").lower()
+        processing_status = str(processing.get("processingStatus") or "").lower()
         if upload_status in {"failed", "rejected", "deleted"} or processing_status in {"failed", "terminated"}:
-            raise RuntimeError(
-                f"YouTube không xử lý xong video (uploadStatus={upload_status or 'unknown'}, "
-                f"processingStatus={processing_status or 'unknown'})."
-            )
+            _verification_failure("API_VIDEO_PROCESSING_FAILED", "YouTube không xử lý xong video.", metadata,
+                                  video_id, evidence_sink)
         if (
             (processing_status == "processing" or upload_status == "uploaded")
             and processing_status != "succeeded"
             and upload_status != "processed"
         ):
             if time.monotonic() >= deadline:
-                raise RuntimeError(f"YouTube vẫn đang xử lý video sau {timeout_seconds}s.")
+                _verification_failure("API_VIDEO_PROCESSING_TIMEOUT", "YouTube vẫn đang xử lý video sau thời hạn xác minh.", metadata,
+                                      video_id, evidence_sink)
             if progress_callback:
                 progress_callback(96, "YouTube đang xử lý video sau khi chuyển file hoàn tất...")
-            time.sleep(min(delay, max(1, int(deadline - time.monotonic()))))
+            time.sleep(min(delay, max(0, deadline - time.monotonic())))
             delay = min(30, delay * 2)
             continue
         if upload_status != "processed" and processing_status != "succeeded":
-            raise RuntimeError(
-                f"Chưa xác định được trạng thái xử lý cuối của video "
-                f"(uploadStatus={upload_status or 'missing'}, processingStatus={processing_status or 'missing'})."
-            )
+            _verification_failure("API_VIDEO_PROCESSING_UNKNOWN", "Chưa xác định được trạng thái xử lý cuối của video.", metadata,
+                                  video_id, evidence_sink)
+
+        observed = _observed_api_metadata(item)
+        expected = _api_expected_metadata(metadata)
+        if observed["category_id"] is None:
+            _verification_failure("API_VIDEO_CATEGORY_MISSING", "YouTube không trả danh mục hợp lệ để xác minh.",
+                                  metadata, video_id, evidence_sink, observed=observed)
+        if expected["category_id"] and observed["category_id"] != expected["category_id"]:
+            _verification_failure("API_VIDEO_CATEGORY_MISMATCH", "Danh mục đọc lại từ YouTube không khớp giá trị đã yêu cầu.",
+                                  metadata, video_id, evidence_sink, observed=observed)
+        if "video_language" in expected and observed.get("video_language") is None:
+            _verification_failure("API_VIDEO_LANGUAGE_MISSING", "YouTube không trả ngôn ngữ audio hợp lệ để xác minh.",
+                                  metadata, video_id, evidence_sink, observed=observed)
+        if "video_language" in expected and observed.get("video_language") != expected["video_language"]:
+            _verification_failure("API_VIDEO_LANGUAGE_MISMATCH", "Ngôn ngữ audio đọc lại từ YouTube không khớp giá trị đã yêu cầu.",
+                                  metadata, video_id, evidence_sink, observed=observed)
 
         expected_privacy = "private" if metadata.get("privacy_status") == "schedule" else metadata.get("privacy_status")
         if str(status.get("privacyStatus") or "").lower() != expected_privacy:
-            raise RuntimeError("Visibility đọc lại từ YouTube không khớp giá trị đã yêu cầu.")
-        if "selfDeclaredMadeForKids" not in status:
-            raise RuntimeError("YouTube không trả lại trạng thái Dành cho trẻ em để xác minh.")
-        if "containsSyntheticMedia" not in status:
-            raise RuntimeError("YouTube không trả lại nhãn nội dung AI để xác minh.")
+            _verification_failure("API_VIDEO_VISIBILITY_MISMATCH", "Visibility đọc lại từ YouTube không khớp giá trị đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed)
+        if type(status.get("selfDeclaredMadeForKids")) is not bool:
+            _verification_failure("API_VIDEO_AUDIENCE_MISSING", "YouTube không trả lại trạng thái Dành cho trẻ em để xác minh.", metadata, video_id, evidence_sink, observed=observed)
+        if type(status.get("containsSyntheticMedia")) is not bool:
+            _verification_failure("API_VIDEO_AI_MISSING", "YouTube không trả lại nhãn nội dung AI để xác minh.", metadata, video_id, evidence_sink, observed=observed)
         if bool(status.get("selfDeclaredMadeForKids")) != bool(metadata.get("made_for_kids")):
-            raise RuntimeError("Thiết lập Dành cho trẻ em đọc lại từ YouTube không khớp giá trị đã yêu cầu.")
+            _verification_failure("API_VIDEO_AUDIENCE_MISMATCH", "Thiết lập Dành cho trẻ em đọc lại từ YouTube không khớp giá trị đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed)
         if bool(status.get("containsSyntheticMedia")) != bool(metadata.get("altered_content")):
-            raise RuntimeError("Nhãn nội dung AI đọc lại từ YouTube không khớp giá trị đã yêu cầu.")
+            _verification_failure("API_VIDEO_AI_MISMATCH", "Nhãn nội dung AI đọc lại từ YouTube không khớp giá trị đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed)
         if metadata.get("privacy_status") == "schedule":
             raw_publish_at = str(status.get("publishAt") or "").strip()
             if not raw_publish_at:
-                raise RuntimeError("YouTube không trả lại thời gian công bố đã hẹn.")
+                _verification_failure("API_VIDEO_SCHEDULE_MISSING", "YouTube không trả lại thời gian công bố đã hẹn.", metadata, video_id, evidence_sink, observed=observed)
             try:
                 actual_publish_at = datetime.fromisoformat(
                     raw_publish_at.replace("Z", "+00:00")  # noqa: FURB162 - supports Python 3.10
@@ -1664,10 +1785,12 @@ def _verify_api_video(http, video_id: str, access_token: str, metadata: Dict[str
                 expected_publish_at = datetime.fromisoformat(
                     str(metadata.get("schedule_time") or "").replace(" ", "T")
                 ).astimezone()
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("Không đọc/so sánh được thời gian hẹn từ YouTube.") from exc
+            except (TypeError, ValueError):
+                _verification_failure("API_VIDEO_SCHEDULE_INVALID", "Không đọc/so sánh được thời gian hẹn từ YouTube.", metadata, video_id, evidence_sink, observed=observed)
             if abs(actual_publish_at.timestamp() - expected_publish_at.timestamp()) > 60:
-                raise RuntimeError("Thời gian công bố đọc lại từ YouTube không khớp lịch đã yêu cầu.")
+                _verification_failure("API_VIDEO_SCHEDULE_MISMATCH", "Thời gian công bố đọc lại từ YouTube không khớp lịch đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed)
+        _emit_upload_evidence(evidence_sink, video_id=video_id, state="verified", metadata=metadata,
+                              observed=observed)
         return item
 
 
@@ -1678,6 +1801,7 @@ def _upload_via_youtube_api_with_session(
     thumbnail_path: str = "",
     progress_callback: Optional[Callable[[int, str], None]] = None,
     session: Optional[requests.Session] = None,
+    evidence_sink=None,
 ) -> Dict[str, Any]:
     """
     Đăng video lên YouTube qua YouTube Data API v3 Resumable Upload (cắt mảnh 8MB).
@@ -1747,6 +1871,31 @@ def _upload_via_youtube_api_with_session(
             f"Chế độ hiển thị '{privacy_status}' không hợp lệ — không tự fallback về Công khai."
         )
 
+    # Validate exact category assignability before opening a resumable upload
+    # session. This GET has no side effect and avoids silently falling back to 22.
+    try:
+        category_response = http.get(
+            "https://www.googleapis.com/youtube/v3/videoCategories",
+            params={"part": "snippet", "id": str(metadata["category_id"])},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=30,
+        )
+    except requests.RequestException:
+        raise UploadNotSent("Không đọc được danh mục YouTube trước khi tạo phiên upload.") from None
+    if category_response.status_code != 200:
+        raise UploadNotSent("Không xác minh được danh mục YouTube trước khi tạo phiên upload.")
+    try:
+        catalog = category_response.json()
+    except (TypeError, ValueError):
+        raise UploadNotSent("Phản hồi danh mục YouTube không hợp lệ; chưa tạo phiên upload.") from None
+    if (not isinstance(catalog, dict) or not isinstance(catalog.get("items"), list)
+            or any(not isinstance(entry, dict) for entry in catalog["items"])):
+        raise UploadNotSent("Cấu trúc danh mục YouTube không hợp lệ; chưa tạo phiên upload.")
+    categories = [entry for entry in catalog["items"] if entry.get("id") == str(metadata["category_id"])]
+    if (len(categories) != 1 or not isinstance(categories[0].get("snippet"), dict)
+            or categories[0]["snippet"].get("assignable") is not True):
+        raise UploadNotSent("Danh mục YouTube không tồn tại hoặc không được phép gán cho video.")
+
     init_url = "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -1807,7 +1956,10 @@ def _upload_via_youtube_api_with_session(
                 if put_resp is None or put_resp.status_code in (500, 502, 503, 504):
                     # A PUT can be accepted even when its response is lost or 5xx.
                     # Query the server before deciding whether any bytes may be resent.
-                    state = _query_resumable_upload_status(http, upload_url, access_token, file_size)
+                    state = _query_resumable_upload_status(
+                        http, upload_url, access_token, file_size,
+                        evidence_sink=evidence_sink, metadata=metadata,
+                    )
                     if state["video_id"]:
                         video_id = state["video_id"]
                         request_resolved = True
@@ -1834,9 +1986,8 @@ def _upload_via_youtube_api_with_session(
                     continue
 
                 if put_resp.status_code in (200, 201):
-                    video_id = str((put_resp.json() or {}).get("id") or "").strip()
-                    if not video_id:
-                        raise RuntimeError("YouTube hoàn tất PUT nhưng không trả Video ID.")
+                    video_id = _read_completed_api_id(put_resp, metadata)
+                    _emit_upload_evidence(evidence_sink, video_id=video_id, state="received", metadata=metadata)
                     request_resolved = True
                     break
                 if put_resp.status_code == 308:
@@ -1863,7 +2014,10 @@ def _upload_via_youtube_api_with_session(
             if progress_callback:
                 progress_callback(pct, f"Đang chuyển file lên YouTube API... {pct}%")
             if offset == file_size and not video_id:
-                state = _query_resumable_upload_status(http, upload_url, access_token, file_size)
+                state = _query_resumable_upload_status(
+                    http, upload_url, access_token, file_size,
+                    evidence_sink=evidence_sink, metadata=metadata,
+                )
                 video_id = state["video_id"]
                 if not video_id:
                     raise RuntimeError("YouTube đã nhận toàn bộ file nhưng chưa xác nhận hoàn tất phiên upload.")
@@ -1876,7 +2030,8 @@ def _upload_via_youtube_api_with_session(
 
     if progress_callback:
         progress_callback(96, "Đã chuyển file xong; đang chờ YouTube xử lý và đọc lại metadata...")
-    _verify_api_video(http, video_id, access_token, metadata, progress_callback=progress_callback)
+    _verify_api_video(http, video_id, access_token, metadata, progress_callback=progress_callback,
+                      evidence_sink=evidence_sink)
 
     warnings = []
     if thumbnail_path and not os.path.exists(thumbnail_path):
@@ -1914,6 +2069,7 @@ def upload_via_youtube_api(
     channel: Dict[str, Any],
     thumbnail_path: str = "",
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    evidence_sink=None,
 ) -> Dict[str, Any]:
     require_capabilities('youtube_api', metadata)
     with _http_session_for_channel(channel) as session:
@@ -1924,6 +2080,7 @@ def upload_via_youtube_api(
             thumbnail_path=thumbnail_path,
             progress_callback=progress_callback,
             session=session,
+            evidence_sink=evidence_sink,
         )
 
 
@@ -3847,6 +4004,7 @@ def upload_video_to_youtube(
     channel: Dict[str, Any],
     option_group: Optional[Dict[str, Any]] = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    evidence_sink=None,
 ) -> Any:
     """
     Hàm điều phối trung tâm: Tự động chọn phương thức đăng (Playwright YouTube Studio hoặc YouTube Data API v3).
@@ -3865,6 +4023,7 @@ def upload_video_to_youtube(
             channel=channel,
             thumbnail_path=video_item.get("thumbnail_path") or "",
             progress_callback=progress_callback,
+            evidence_sink=evidence_sink,
         )
     else:
         return upload_via_playwright_studio(

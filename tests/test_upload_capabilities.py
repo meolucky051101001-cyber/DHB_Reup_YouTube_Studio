@@ -207,9 +207,10 @@ class CapabilityIntegrationTests(unittest.TestCase):
                 self.assertIs(detail['live_verified'], False)
                 self.assertTrue(detail['reason'])
                 self.assertTrue(detail['evidence'])
-        # G17 publishes the current implementation honestly; readback comes in G19.
+        # G19 verifies category; language writes remain gated due to insert docs.
         self.assertTrue(matrix['youtube_api']['features']['category']['can_set'])
-        self.assertEqual(matrix['youtube_api']['features']['category']['readback'], 'none')
+        self.assertEqual(matrix['youtube_api']['features']['category']['readback'], 'response')
+        self.assertFalse(matrix['youtube_api']['features']['video_language']['enabled'])
         for feature in ('category', 'video_language', 'remix'):
             self.assertFalse(matrix['playwright']['features'][feature]['enabled'])
 
@@ -298,8 +299,8 @@ class CapabilityIntegrationTests(unittest.TestCase):
         self.assertEqual(snippet['categoryId'], '27')
         self.assertNotIn('defaultAudioLanguage', snippet)
         self.assertNotIn('defaultLanguage', snippet)
-        # Captures the G17 evidence limit instead of inferring readback from success.
-        self.assertNotIn('snippet', session.get_calls[0][1]['params']['part'])
+        readback = [call for call in session.get_calls if call[0].endswith('/videos')]
+        self.assertIn('snippet', readback[0][1]['params']['part'])
 
     def test_monitor_checks_all_group_candidates_and_cannot_confirm_blocked_options(self):
         option = self.seed_option(disable_shorts_remix=1)

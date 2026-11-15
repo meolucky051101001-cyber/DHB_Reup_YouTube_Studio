@@ -1838,7 +1838,7 @@ async function loadQueue(preserveSelection = false) {
             <button class="btn btn-accent btn-sm" onclick="openPreviewModal(${item.id})" title="Xem thử video trực tiếp">▶️</button>
             <button class="btn btn-outline btn-sm" onclick="openEditModal(${item.id})" title="Chỉnh sửa chi tiết tiêu đề, mô tả, chất lượng...">✏️</button>
             ${item.status === 'Completed' ? `<button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'reupload')" title="Ghi lý do và cho phép đăng lại riêng video này">🔁</button>` : ''}
-            ${(item.requires_review || item.status === 'NeedsReview') ? `<button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'reupload')" title="Xác nhận chưa đăng rồi cho phép chạy lại video này">🔁</button><button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'confirmed_published')" title="Xác nhận đã đăng và lưu URL vào lịch sử">✅</button>` : ''}
+            ${(item.requires_review || item.status === 'NeedsReview') ? `<button class="btn btn-outline btn-sm" onclick="openUploadEvidence(${item.id})" title="Xem bằng chứng đã nhận và kết quả xác minh, không thay đổi hàng đợi">Bằng chứng</button><button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'reupload')" title="Xác nhận chưa đăng rồi cho phép chạy lại video này">🔁</button><button class="btn btn-outline btn-sm" onclick="manualReuploadQueueItem(${item.id}, 'confirmed_published')" title="Xác nhận đã đăng và lưu URL vào lịch sử">✅</button>` : ''}
           </div>
         </td>
       </tr>
@@ -1856,6 +1856,56 @@ function onRowCheck(id, checked) {
   if (checked) gSelectedIds.add(id);
   else gSelectedIds.delete(id);
   updateQueueSelectionSummary();
+}
+
+async function openUploadEvidence(queueId) {
+  if (!Number.isSafeInteger(Number(queueId)) || Number(queueId) <= 0 || document.querySelector('.upload-evidence-dialog[open]')) return;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'workspace-dialog upload-evidence-dialog';
+  dialog.setAttribute('aria-labelledby', 'upload-evidence-title');
+  dialog.innerHTML = `<form method="dialog">
+    <header><h2 id="upload-evidence-title">Bằng chứng lượt đăng #${escapeHtml(queueId)}</h2>
+      <p>Video ID đã nhận không có nghĩa video đã đăng thành công. Đối chiếu trạng thái và metadata trước khi xử lý hàng đợi.</p>
+      <p>Thông tin này chỉ để xem; không xác nhận đã đăng và không cho phép đăng lại.</p></header>
+    <div class="upload-preview-body" data-evidence-body role="status" aria-live="polite">Đang tải bằng chứng đã lưu…</div>
+    <footer class="quick-queue-actions"><button type="submit" class="btn btn-outline" value="close" autofocus>Đóng</button></footer>
+  </form>`;
+  document.body.append(dialog);
+  dialog.addEventListener('close', () => dialog.remove(), { once: true });
+  dialog.showModal();
+  const body = dialog.querySelector('[data-evidence-body]');
+  try {
+    const result = await apiFetch(`/api/queue/${Number(queueId)}/upload-evidence`, { cache: 'no-store' });
+    if (!dialog.isConnected) return;
+    if (!Array.isArray(result.attempts) || Number(result.queue_id) !== Number(queueId)) throw new Error('Invalid evidence response');
+    const states = { received: 'Đã nhận video ID; chưa xác minh', verified: 'Đã xác minh metadata', mismatch: 'Metadata không khớp yêu cầu', unknown: 'Chưa xác định kết quả xác minh' };
+    const outcomes = { InProgress: 'Đang xử lý', NeedsReview: 'Cần đối soát', Completed: 'Đã hoàn tất lượt', Error: 'Lỗi', NotSent: 'Chưa gửi', Cancelled: 'Đã hủy' };
+    const showValue = value => value === null || value === undefined || value === '' ? 'Không có bằng chứng' : escapeHtml(String(value));
+    body.innerHTML = result.attempts.length ? result.attempts.map(attempt => {
+      const heading = `<h3>Lượt ${showValue(attempt.attempt_no)} · ${escapeHtml(outcomes[attempt.outcome] || 'Chưa rõ trạng thái lượt')}</h3>`;
+      if (attempt.evidence_error) return `<section class="upload-preview-item">${heading}<p>Không đọc được bằng chứng hợp lệ của lượt này. Cần kiểm tra riêng; không suy ra đã đăng hoặc chưa gửi.</p></section>`;
+      const evidence = attempt.evidence;
+      if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return `<section class="upload-preview-item">${heading}<p>Lượt này chưa có bằng chứng video ID được lưu. Không suy ra video chưa được gửi.</p></section>`;
+      const videoId = typeof evidence.video_id === 'string' && /^[A-Za-z0-9_-]{11}$/.test(evidence.video_id) ? evidence.video_id : '';
+      // Derive the link from the validated observed ID, never from arbitrary stored URL text.
+      const videoLink = videoId ? `https://youtu.be/${videoId}` : '';
+      const valueRows = [['category_id', 'Danh mục'], ['video_language', 'Ngôn ngữ video']].map(([key, label]) =>
+        `<tr><th scope="row">${label}</th><td>${showValue(evidence.expected?.[key])}</td><td>${showValue(evidence.observed?.[key])}</td></tr>`).join('');
+      return `<section class="upload-preview-item">${heading}
+        <p><strong>${escapeHtml(states[evidence.verification_state] || 'Chưa xác định kết quả xác minh')}</strong></p>
+        <dl><div><dt>Phương thức</dt><dd>${evidence.backend === 'youtube_api' ? 'YouTube API' : evidence.backend === 'playwright' ? 'YouTube Studio' : 'Chưa xác định'}</dd></div>
+          <div><dt>Kênh đích</dt><dd>${showValue(evidence.channel_id)}</dd></div>
+          <div><dt>Video ID đã quan sát</dt><dd>${videoId ? escapeHtml(videoId) : 'Không có ID hợp lệ'}</dd></div>
+          <div><dt>Nhận bằng chứng lúc</dt><dd>${showValue(evidence.received_at)}</dd></div>
+          <div><dt>Cập nhật xác minh lúc</dt><dd>${showValue(evidence.updated_at)}</dd></div>
+          <div><dt>Mã xác minh</dt><dd>${showValue(evidence.code)}</dd></div></dl>
+        <table aria-label="Metadata yêu cầu và quan sát"><thead><tr><th scope="col">Metadata</th><th scope="col">Đã yêu cầu</th><th scope="col">Đọc lại từ YouTube</th></tr></thead><tbody>${valueRows}</tbody></table>
+        ${videoLink ? `<p><a href="${videoLink}" target="_blank" rel="noopener noreferrer">Mở video ID đã quan sát trên YouTube</a></p>` : ''}
+      </section>`;
+    }).join('') : '<p>Chưa có lượt đăng được ghi nhận cho video này.</p>';
+  } catch (_) {
+    if (dialog.isConnected) body.textContent = 'Không tải được bằng chứng. Hãy đóng và thử lại; trạng thái hàng đợi chưa thay đổi.';
+  }
 }
 
 function toggleSelectAll(checked) {

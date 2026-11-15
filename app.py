@@ -87,6 +87,7 @@ from queue_import import preview_csv_import
 from app_instance_lock import AppInstanceAlreadyRunning, acquire_app_instance_lock
 from render_engine import normalize_render_speed
 from runtime_identity import capture_runtime, runtime_status
+from upload_evidence import EvidenceError, read_evidence
 from config_validation import parse_config_input, validate_config, validate_option_state
 from metadata_intent import MetadataIntentConflict, metadata_revision, prepare_channel_update, prepare_option_update
 from profile_crud import ProfileCreate, ProfileUpdate, binding_references
@@ -772,6 +773,36 @@ def api_get_queue(project: str = ""):
 def api_content_identity_report():
     """Read-only summary for legacy queue/history rows without fingerprints."""
     return content_identity_migration_report()
+
+
+@app.get("/api/queue/{item_id}/upload-evidence")
+def api_upload_evidence(item_id: int):
+    """Return only validated evidence, without changing reconciliation state."""
+    with closing(get_conn()) as conn:
+        if not conn.execute('SELECT 1 FROM video_queue WHERE id=?', (item_id,)).fetchone():
+            raise HTTPException(404, 'Không tìm thấy video này trong hàng đợi.')
+        rows = conn.execute(
+            'SELECT id,attempt_no,channel_id,outcome,evidence_json FROM upload_attempts '
+            'WHERE queue_id=? ORDER BY attempt_no DESC,id DESC', (item_id,)
+        ).fetchall()
+    attempts = []
+    public_outcomes = {'InProgress', 'NeedsReview', 'Completed', 'Error', 'NotSent',
+                       'Cancelled', 'Warning', 'Authorized', 'ConfirmedPublished'}
+    # Old/manual attempts can have no evidence. Never return arbitrary stored
+    # response bodies, error text, or URLs from an invalid evidence document.
+    for row in rows:
+        invalid = False
+        try:
+            if row['channel_id'] is None and row['evidence_json'] == '{}':
+                evidence = None  # Historical attempts can lack a bound channel.
+            else:
+                evidence = read_evidence(row['evidence_json'], item_id, row['id'], row['channel_id'])
+        except EvidenceError:
+            evidence, invalid = None, True
+        attempts.append({'id': row['id'], 'attempt_no': row['attempt_no'],
+                         'outcome': row['outcome'] if row['outcome'] in public_outcomes else 'Unknown', 'evidence': evidence,
+                         'evidence_error': invalid})
+    return {'queue_id': item_id, 'attempts': attempts}
 
 
 @app.post("/api/queue/scan")

@@ -128,6 +128,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                 phase TEXT DEFAULT 'Queued', outcome TEXT DEFAULT 'InProgress', reason TEXT DEFAULT '',
                 published_url TEXT DEFAULT '', error_message TEXT DEFAULT '',
                 post_upload_warnings_json TEXT DEFAULT '[]',
+                evidence_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(queue_id, attempt_no)
             );

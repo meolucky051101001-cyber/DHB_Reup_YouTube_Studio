@@ -1,6 +1,6 @@
 # Kế hoạch G17–G22: metadata đăng video và nghiệm thu offline
 
-Ngày lập: 15/11/2026. Trạng thái: **G17–G18 đã triển khai và nghiệm thu offline trong nhánh phát triển; G19–G22 chưa triển khai**. Xem [biên bản G17](G17_UPLOAD_CAPABILITIES.md) và [hợp đồng G18](G18_METADATA_INTENT.md). Tiếp nối G13–G16 đã hoàn tất CRUD Dự án, Profile và Render Preset; runtime chưa đổi.
+Ngày lập: 15/11/2026. Trạng thái: **G17–G19 đã triển khai và nghiệm thu offline trong nhánh phát triển; G20–G22 chưa triển khai**. Xem [biên bản G17](G17_UPLOAD_CAPABILITIES.md), [hợp đồng G18](G18_METADATA_INTENT.md) và [API G19](G19_API_METADATA.md)/[evidence G19](G19_UPLOAD_EVIDENCE.md). G19 giữ API audio-language tắt do chưa có hợp đồng ghi `defaultAudioLanguage` trong `videos.insert`. Tiếp nối G13–G16 đã hoàn tất CRUD Dự án, Profile và Render Preset; runtime chưa đổi.
 
 ## 1. Mục tiêu và phạm vi
 

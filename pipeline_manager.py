@@ -23,8 +23,9 @@ from ai_engine import ai_optimize_youtube_metadata
 from youtube_uploader import (
     UploadNotSent, upload_video_to_youtube, validate_upload_preflight, normalize_published_video_url,
 )
-from upload_capabilities import UploadCapabilityError
+from upload_capabilities import UploadCapabilityError, normalize_mode
 from metadata_resolution import resolve_metadata
+from upload_evidence import make_evidence_sink, read_evidence
 from content_identity import normalize_source_url, sha256_file, source_dedupe_key
 from group_distribution import choose_target_channel, target_group_names
 from upload_approval import PreviewStale, approval_item, asset_stamps, encode, upload_source_path
@@ -323,6 +324,71 @@ def _finish_upload_attempt(attempt_id, outcome, published_url="", error_message=
             conn.execute('UPDATE upload_attempts SET post_upload_warnings_json=? WHERE id=?',
                          (encode(warnings), attempt_id))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _attempt_has_upload_evidence(attempt_id):
+    """An unreadable attempt cannot prove that no video has been received."""
+    conn = None
+    try:
+        conn = get_conn()
+        row = conn.execute('SELECT evidence_json FROM upload_attempts WHERE id=?', (attempt_id,)).fetchone()
+        return not row or row[0] != '{}'
+    except Exception:
+        return True
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _complete_upload_attempt(queue_id, claim_token, attempt_id, channel, published_url, warnings,
+                             *, backend, expected_metadata):
+    """Commit queue, attempt, history and reservation as one owned completion."""
+    conn = get_conn()
+    try:
+        conn.execute('PRAGMA synchronous=FULL')
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM video_queue WHERE id=?', (queue_id,)).fetchone()
+        attempt = conn.execute('SELECT * FROM upload_attempts WHERE id=?', (attempt_id,)).fetchone()
+        channel_id = channel['id']
+        reservation = conn.execute(
+            'SELECT state FROM content_reservations WHERE queue_id=? AND channel_id=? '
+            'AND claim_token=? AND content_key=?',
+            (queue_id, channel_id, claim_token, row['content_key'] if row else '')).fetchone()
+        if (not row or row['claim_token'] != claim_token or row['last_attempt_id'] != attempt_id
+                or not attempt or attempt['queue_id'] != queue_id or attempt['channel_id'] != channel_id
+                or attempt['content_key'] != row['content_key'] or attempt['outcome'] != 'InProgress'
+                or not reservation or reservation['state'] != 'Active'):
+            raise RuntimeError('Không còn quyền ghi kết quả lượt đăng; giữ lại để đối soát.')
+        evidence = read_evidence(attempt['evidence_json'], queue_id, attempt_id, channel_id)
+        if backend == 'youtube_api' or evidence:
+            if (not evidence or evidence['verification_state'] != 'verified'
+                    or evidence['backend'] != backend or evidence['expected'] != expected_metadata
+                    or normalize_published_video_url(evidence['video_url']) != published_url):
+                raise RuntimeError('Thiếu bằng chứng xác minh khớp video ID; giữ lại để đối soát.')
+        post_id = _history_source_post_id(dict(row), queue_id)
+        conn.execute('INSERT OR IGNORE INTO published_history '
+                     '(source_post_id,source_url,channel_id,content_key,published_url) VALUES(?,?,?,?,?)',
+                     (post_id, row['source_url'] or '', channel_id, row['content_key'], published_url))
+        conn.execute("UPDATE published_history SET "
+                     "source_url=CASE WHEN COALESCE(source_url,'')='' THEN ? ELSE source_url END, "
+                     "content_key=CASE WHEN COALESCE(content_key,'')='' THEN ? ELSE content_key END, "
+                     "published_url=CASE WHEN COALESCE(published_url,'')='' THEN ? ELSE published_url END "
+                     'WHERE source_post_id=? AND channel_id=?',
+                     (row['source_url'] or '', row['content_key'], published_url, post_id, channel_id))
+        conn.execute("UPDATE video_queue SET upload_progress=100,status='Completed',published_url=?,"
+                     "error_message='',post_upload_warnings_json=? WHERE id=? AND claim_token=?",
+                     (published_url, encode(warnings), queue_id, claim_token))
+        conn.execute("UPDATE upload_attempts SET phase='Finished',outcome='Completed',published_url=?,"
+                     "error_message='',post_upload_warnings_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                     (published_url, encode(warnings), attempt_id))
+        conn.execute('DELETE FROM content_reservations WHERE queue_id=? AND channel_id=? AND claim_token=?',
+                     (queue_id, channel_id, claim_token))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1598,6 +1664,7 @@ class PipelineManager:
         reservation_owned = False
         reservation_keep = False
         upload_started = False
+        upload_committed = False
         slot_owner = None
         upload_attempt_id = None
         channel = None
@@ -1821,7 +1888,11 @@ class PipelineManager:
 
                 # Recheck fresh queue metadata before reserving content, using the
                 # same guard as preview and both direct upload adapters.
-                validate_upload_preflight(fresh_item, channel, option_group)
+                approved_upload_metadata = validate_upload_preflight(fresh_item, channel, option_group)
+                evidence_backend = normalize_mode(channel.get('upload_mode'))
+                evidence_expected = {'category_id': approved_upload_metadata['category_id']}
+                if approved_upload_metadata.get('video_language'):
+                    evidence_expected['video_language'] = approved_upload_metadata['video_language']
 
                 reservation_key, reservation_result = _acquire_content_reservation(
                     item_id,
@@ -1937,11 +2008,15 @@ class PipelineManager:
                         return
                     _mark_slot_entered(slot_owner, upload_attempt_id)
                     upload_started = True
+                evidence_sink = make_evidence_sink(
+                    get_conn, item_id, token, upload_attempt_id, channel['id'],
+                    backend=evidence_backend, expected=evidence_expected)
                 pub_res = upload_video_to_youtube(
                     video_item=fresh_item,
                     channel=channel,
                     option_group=option_group,
                     progress_callback=_make_progress_cb("upload_progress"),
+                    evidence_sink=evidence_sink,
                 )
 
                 if isinstance(pub_res, dict):
@@ -2044,21 +2119,10 @@ class PipelineManager:
                         video_title=title,
                     )
                 else:
-                    completed_saved = _update_row(
-                        upload_progress=100,
-                        status="Completed",
-                        published_url=pub_url,
-                        error_message="",
-                        post_upload_warnings_json=encode(post_warnings),
-                    )
-                    if not completed_saved:
-                        reservation_keep = True
-                        raise RuntimeError("Không lưu được trạng thái Completed sau khi YouTube trả URL.")
-                    # Ghi lịch sử cho MỌI nguồn (link, kéo-thả, local path), không chỉ Monitor.
-                    if not self._record_published_history_for_item(item_id, channel):
-                        reservation_keep = True
-                        raise RuntimeError("Không ghi được published_history sau khi YouTube trả URL.")
-                    _finish_upload_attempt(upload_attempt_id, "Completed", pub_url, warnings=post_warnings)
+                    _complete_upload_attempt(item_id, token, upload_attempt_id, channel, pub_url, post_warnings,
+                                             backend=evidence_backend, expected_metadata=evidence_expected)
+                    upload_committed = True
+                    reservation_owned = False
                     for warning in post_warnings:
                         add_log('Upload', warning.get('message') or 'Bước phụ sau đăng cần kiểm tra.', 'WARNING',
                                 video_title=title, channel_name=channel['name'])
@@ -2082,6 +2146,8 @@ class PipelineManager:
                         add_log("Storage", f"Không xóa artifact tạm thuộc queue #{item_id}; file được giữ để kiểm tra.", "WARNING", video_title=title)
 
         except InterruptedError:
+            if upload_committed:
+                return
             if upload_started:
                 reservation_keep = True
                 _finish_upload_attempt(
@@ -2103,14 +2169,18 @@ class PipelineManager:
                 _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
                 add_log("Pipeline", f"Đã dừng xử lý video: {title}", "WARNING", video_title=title)
         except Exception as e:
-            if upload_started and isinstance(e, UploadNotSent):
+            # Completion is already one durable transaction. A later log or
+            # cleanup failure cannot downgrade it or authorize a second upload.
+            if upload_committed:
+                return
+            if upload_started and isinstance(e, UploadNotSent) and not _attempt_has_upload_evidence(upload_attempt_id):
                 if owner == "batch":
                     self._stop_event.set()
                 _finish_upload_attempt(upload_attempt_id, "NotSent", error_message=str(e))
                 _update_row(status="Error", error_message=str(e))
                 add_log("Upload", str(e), "ERROR", video_title=title, error_code="ERR_STUDIO_BASELINE")
                 return
-            if upload_started and isinstance(e, AntidetectNotReady):
+            if upload_started and isinstance(e, AntidetectNotReady) and not _attempt_has_upload_evidence(upload_attempt_id):
                 _finish_upload_attempt(upload_attempt_id, "NotSent", error_message=str(e))
                 _update_row(status="Error", error_message=str(e))
                 return

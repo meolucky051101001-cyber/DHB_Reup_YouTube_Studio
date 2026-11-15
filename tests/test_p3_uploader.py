@@ -32,6 +32,8 @@ class _ResumableSession:
 
     def post(self, url, **kwargs):
         self.post_calls.append((url, kwargs))
+        if 'uploadType=resumable' in url:
+            self.upload_snippet = kwargs.get('json', {}).get('snippet', {})
         return _Response(
             200,
             headers={"Location": "https://www.googleapis.com/upload/youtube/v3/videos/session"},
@@ -46,11 +48,14 @@ class _ResumableSession:
 
     def get(self, url, **kwargs):
         self.get_calls.append((url, kwargs))
+        if "videoCategories" in url:
+            return _Response(200, body={"items": [{"id": kwargs['params']['id'], "snippet": {"assignable": True}}]})
         return _Response(
             200,
             body={
                 "items": [{
                     "id": VIDEO_ID,
+                    "snippet": {"categoryId": getattr(self, 'upload_snippet', {}).get('categoryId', '22')},
                     "status": {
                         "uploadStatus": "processed",
                         "privacyStatus": "private",
@@ -969,7 +974,8 @@ class ResumableUploadTests(unittest.TestCase):
             if kwargs["headers"].get("Content-Range") != "bytes */10"
         ]
         self.assertEqual(media_ranges, ["bytes 0-3/10", "bytes 4-7/10", "bytes 6-9/10"])
-        self.assertEqual(session.get_calls[0][1]["params"]["id"], VIDEO_ID)
+        readback = [call for call in session.get_calls if call[0].endswith('/videos')]
+        self.assertEqual(readback[0][1]["params"]["id"], VIDEO_ID)
 
     def test_lost_final_chunk_response_uses_status_query_without_resending(self):
         session = _ResumableSession([

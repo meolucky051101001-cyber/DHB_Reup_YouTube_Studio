@@ -211,7 +211,7 @@ class ConfigBrowserTests(unittest.TestCase):
                 self.assertEqual(rows.count(), 7)
                 category = page.locator('[data-capability="category"] td')
                 self.assertIn('Áp dụng: Có', category.nth(0).inner_text())
-                self.assertIn('Xác minh: Chưa đọc lại', category.nth(0).inner_text())
+                self.assertIn('Xác minh: Kiểm tra phản hồi sau khi gửi', category.nth(0).inner_text())
                 self.assertIn('Chưa bật', category.nth(1).inner_text())
                 for key in ('video_language', 'remix', 'age_restriction', 'pin_comment'):
                     for cell in page.locator(f'[data-capability="{key}"] td').all():
@@ -535,6 +535,93 @@ class ProfileDomTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('DHB_BROWSER_TESTS') == '1', 'Run in the browser CI job')
 class PreparationBrowserTests(unittest.TestCase):
+    def test_upload_evidence_is_readonly_and_does_not_claim_received_id_is_published(self):
+        import json
+        import re
+        from contextlib import closing
+        from urllib.parse import urlsplit
+        from playwright.sync_api import sync_playwright
+        import database
+        from test_review_regressions import ReviewRegressions
+        fixture = ReviewRegressions()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        secret = 'PRIVATE_EVIDENCE_SENTINEL'
+        with closing(database.get_conn()) as conn, conn:
+            conn.execute("UPDATE video_queue SET status='NeedsReview',published_url='' WHERE id=901")
+            attempt_id = conn.execute("INSERT INTO upload_attempts(queue_id,attempt_no,channel_id,outcome,error_message) VALUES(901,1,901,'NeedsReview',?)", (secret,)).lastrowid
+            evidence = {'version': 1, 'queue_id': 901, 'attempt_id': attempt_id, 'channel_id': 901,
+                'backend': 'youtube_api', 'video_id': 'dQw4w9WgXcQ', 'video_url': 'https://youtu.be/dQw4w9WgXcQ',
+                'received_at': '2026-11-15T03:00:00.000000Z', 'updated_at': '2026-11-15T03:00:00.000000Z',
+                'verification_state': 'received', 'expected': {'category_id': '27', 'video_language': 'en-US'},
+                'observed': {}, 'code': 'EVIDENCE_RECEIVED'}
+            conn.execute('UPDATE upload_attempts SET evidence_json=? WHERE id=?', (json.dumps(evidence), attempt_id))
+        before = fixture.row()
+        root = Path(__file__).resolve().parents[1]
+        html = re.sub(r'<script\b[^>]*>.*?</script>', '', (root/'static/index.html').read_text(encoding='utf-8'), flags=re.S)
+        requests, outbound = [], []
+        failures = {'value': False}
+        def dispatch(route):
+            request = route.request
+            parsed = urlsplit(request.url)
+            if parsed.netloc != '127.0.0.1:8686':
+                outbound.append(request.url)
+                route.abort()
+                return
+            if parsed.path == '/':
+                route.fulfill(status=200, content_type='text/html', body=html)
+                return
+            if request.method != 'GET' or not parsed.path.startswith(('/api/auth', '/api/queue', '/api/projects', '/static/')):
+                route.abort()
+                return
+            requests.append((request.method, parsed.path))
+            if failures['value'] and parsed.path.endswith('/upload-evidence'):
+                route.fulfill(status=503, content_type='application/json', body=json.dumps({'detail': secret}))
+                return
+            response = fixture.client.request(request.method, parsed.path + ('?' + parsed.query if parsed.query else ''), headers=dict(request.headers))
+            route.fulfill(status=response.status_code, headers=dict(response.headers), body=response.content)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.route('**/*', dispatch)
+                page.goto('http://127.0.0.1:8686/')
+                page.add_script_tag(content=(root/'static/app.js').read_text(encoding='utf-8'))
+                page.add_style_tag(content='.tab-pane {display:block!important}')
+                page.evaluate("async () => { await loadProjects(); document.getElementById('sel-project').value='review'; await loadQueue(); }")
+                page.get_by_role('button', name='Bằng chứng', exact=True).click()
+                page.wait_for_function("document.querySelector('.upload-evidence-dialog').textContent.includes('dQw4w9WgXcQ')")
+                modal = page.locator('.upload-evidence-dialog')
+                text = modal.inner_text()
+                self.assertIn('Video ID đã nhận không có nghĩa video đã đăng thành công', text)
+                self.assertIn('Đã nhận video ID; chưa xác minh', text)
+                self.assertIn('27', text)
+                self.assertIn('en-US', text)
+                self.assertIn('Không có bằng chứng', text)
+                self.assertIn('2026-11-15T03:00:00.000000Z', text)
+                self.assertNotIn(secret, text)
+                self.assertEqual(modal.locator('a').get_attribute('href'), 'https://youtu.be/dQw4w9WgXcQ')
+                self.assertEqual(modal.locator('button').count(), 1)
+                self.assertEqual(modal.locator('input').count(), 0)
+                self.assertEqual(fixture.row(), before)
+                modal.get_by_role('button', name='Đóng', exact=True).click()
+                with closing(database.get_conn()) as conn, conn:
+                    conn.execute('UPDATE upload_attempts SET evidence_json=? WHERE id=?', ('{"oauth_token":"' + secret, attempt_id))
+                page.get_by_role('button', name='Bằng chứng', exact=True).click()
+                page.wait_for_function("document.querySelector('.upload-evidence-dialog').textContent.includes('Không đọc được bằng chứng hợp lệ')")
+                self.assertNotIn(secret, page.locator('.upload-evidence-dialog').inner_text())
+                self.assertEqual(page.locator('.upload-evidence-dialog a').count(), 0)
+                page.locator('.upload-evidence-dialog').get_by_role('button', name='Đóng', exact=True).click()
+                failures['value'] = True
+                page.get_by_role('button', name='Bằng chứng', exact=True).click()
+                page.wait_for_function("document.querySelector('.upload-evidence-dialog').textContent.includes('Không tải được bằng chứng')")
+                self.assertNotIn(secret, page.locator('.upload-evidence-dialog').inner_text())
+                self.assertEqual(fixture.row(), before)
+                self.assertTrue(all(method == 'GET' for method, _ in requests), requests)
+                self.assertEqual(outbound, [])
+            finally:
+                browser.close()
+
     def test_bulk_group_edit_and_excel_download_import_use_real_api(self):
         import io
         import re

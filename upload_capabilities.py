@@ -60,13 +60,15 @@ def capability_matrix():
         api = mode == 'youtube_api'
         features = {
             'category': _feature('Danh mục',
-                'API gửi categoryId; chưa đọc lại danh mục sau đăng.' if api else
+                'API kiểm tra categoryId assignable trước phiên upload và đọc lại categoryId theo video ID.' if api else
                 'Studio hiện chỉ lưu cấu hình danh mục; chưa có thao tác đặt và đọc lại được hỗ trợ.',
                 ['youtube_uploader.py:_upload_via_youtube_api_with_session',
                  'youtube_uploader.py:_verify_api_video'] if api else
                 ['youtube_uploader.py:upload_via_playwright_studio'],
-                can_set=api, offline_verified=api, enabled=api),
+                can_set=api, readback='response' if api else 'none', offline_verified=api, enabled=api),
             'video_language': _feature('Ngôn ngữ video',
+                'YouTube videos.insert chưa có hợp đồng ghi defaultAudioLanguage được tài liệu hóa. '
+                'Không dùng defaultLanguage (ngôn ngữ tiêu đề/mô tả) thay thế; yêu cầu đặt ngôn ngữ video hiện bị chặn.' if api else
                 'Có thể lưu lựa chọn ngôn ngữ video rõ ràng, nhưng thao tác đặt và đọc lại chưa bật. Giá trị cũ không tự trở thành yêu cầu áp dụng.',
                 ['config_validation.py:validate_config', 'youtube_uploader.py:build_final_metadata']),
             'remix': _feature('Quyền remix',
