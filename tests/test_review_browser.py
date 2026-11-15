@@ -6,6 +6,58 @@ from pathlib import Path
 
 @unittest.skipUnless(os.environ.get('DHB_BROWSER_TESTS') == '1', 'Run in the browser CI job')
 class ConfigBrowserTests(unittest.TestCase):
+    def test_project_actions_keep_selection_and_report_blocked_delete(self):
+        import re
+        from urllib.parse import urlsplit
+        from playwright.sync_api import sync_playwright
+        from test_review_regressions import ReviewRegressions
+        fixture = ReviewRegressions()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        root = Path(__file__).resolve().parents[1]
+        html = re.sub(r'<script\b[^>]*>.*?</script>', '', (root/'static/index.html').read_text(encoding='utf-8'), flags=re.S)
+        def dispatch(route):
+            request = route.request
+            parsed = urlsplit(request.url)
+            if parsed.netloc != '127.0.0.1:8686':
+                route.abort()
+                return
+            if parsed.path == '/':
+                route.fulfill(status=200, content_type='text/html', body=html)
+                return
+            response = fixture.client.request(request.method, parsed.path + ('?'+parsed.query if parsed.query else ''),
+                                              headers=dict(request.headers), content=request.post_data_buffer)
+            route.fulfill(status=response.status_code, headers=dict(response.headers), body=response.content)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            self.addCleanup(browser.close)
+            page = browser.new_page()
+            page.route('**/*', dispatch)
+            prompts = iter(['Dự án Việt / thử', 'Đã đổi tên', 'Đã đổi tên'])
+            dialogs = []
+            def dialog_handler(dialog):
+                dialogs.append(dialog.message)
+                dialog.accept(next(prompts)) if dialog.type == 'prompt' else dialog.accept()
+            page.on('dialog', dialog_handler)
+            page.goto('http://127.0.0.1:8686/')
+            page.add_script_tag(content=(root/'static/app.js').read_text(encoding='utf-8'))
+            page.evaluate('loadProjects()')
+            page.locator('[onclick="createNewProject()"]').click()
+            page.wait_for_function("document.getElementById('sel-project').value === 'Dự án Việt / thử'")
+            page.locator('[onclick="renameCurrentProject()"]').click()
+            page.wait_for_function("document.getElementById('sel-project').value === 'Đã đổi tên'")
+            page.locator('[onclick="createNewProject()"]').click()
+            page.wait_for_function("document.getElementById('sel-project').options.length === 3")
+            self.assertTrue(any('đã tồn tại' in message for message in dialogs))
+            page.locator('[onclick="deleteCurrentProject()"]').click()
+            page.wait_for_function("document.getElementById('sel-project').options.length === 2")
+            page.select_option('#sel-project', 'review')
+            page.evaluate('deleteCurrentProject()')
+            self.assertTrue(any('còn video' in message for message in dialogs))
+            self.assertEqual(page.input_value('#sel-project'), 'review')
+            browser.close()
+            self._cleanups.pop()  # Browser is closed before Playwright exits.
+
     def test_configuration_forms_keep_values_and_validate_monitor_limits(self):
         import re
         from contextlib import closing

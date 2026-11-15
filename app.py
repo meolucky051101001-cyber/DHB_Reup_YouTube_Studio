@@ -313,6 +313,55 @@ def _ensure_queue_items_idle(conn, ids, action: str):
         )
 
 
+def _validate_project_name(value: Any) -> str:
+    """Validate a project label before it becomes a cross-table reference."""
+    if not isinstance(value, str):
+        raise HTTPException(400, "Tên dự án phải là chuỗi văn bản.")
+    name = value.strip()
+    if not name:
+        raise HTTPException(400, "Tên dự án không được để trống.")
+    if "\x00" in name:
+        raise HTTPException(400, "Tên dự án không được chứa ký tự NUL.")
+    if len(name) > 200:
+        raise HTTPException(400, "Tên dự án không được vượt quá 200 ký tự.")
+    if name == 'Default' or name.startswith('Monitor - '):
+        raise HTTPException(400, "Tên dự án này dành riêng cho hệ thống. Hãy chọn tên khác.")
+    return name
+
+
+def _project_monitor_name(conn, project_name: str) -> bool:
+    """Return whether a project is owned by an existing Monitor."""
+    prefix = "Monitor - "
+    if not project_name.startswith(prefix):
+        return False
+    monitor_name = project_name[len(prefix):].strip()
+    if not monitor_name:
+        return False
+    return conn.execute("SELECT 1 FROM monitors WHERE name = ? LIMIT 1", (monitor_name,)).fetchone() is not None
+
+
+def _capture_import_project(conn, name):
+    """Capture identity before slow probing; imports may create a new project."""
+    if not isinstance(name, str):
+        raise HTTPException(400, 'Tên dự án phải là chuỗi văn bản.')
+    name = name.strip()
+    row = conn.execute('SELECT id, name FROM projects WHERE name=?', (name,)).fetchone()
+    if row is None and name == 'Default':
+        row = conn.execute('SELECT id, name FROM projects ORDER BY id LIMIT 1').fetchone()
+    if row is None:
+        name = _validate_project_name(name)
+        conn.execute('INSERT INTO projects(name) VALUES(?)', (name,))
+        row = conn.execute('SELECT id, name FROM projects WHERE name=?', (name,)).fetchone()
+    return int(row['id']), row['name']
+
+
+def _current_import_project(conn, project_id):
+    row = conn.execute('SELECT name FROM projects WHERE id=?', (project_id,)).fetchone()
+    if row is None:
+        raise HTTPException(409, 'Dự án đã bị xóa trong lúc nhập video. Hãy chọn lại dự án và thử lại.')
+    return row['name']
+
+
 # Kiểm tra trùng + ghi queue phải liền mạch, trong khi ffprobe được chạy song song bên ngoài lock
 _import_insert_lock = threading.Lock()
 
@@ -652,40 +701,50 @@ def api_list_projects():
 
 @app.post("/api/projects")
 def api_create_project(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Tên dự án không được để trống.")
-    conn = get_conn()
-    conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (name,))
-    conn.commit()
-    conn.close()
+    name = _validate_project_name(data.get('name'))
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if conn.execute('SELECT 1 FROM projects WHERE name=?', (name,)).fetchone():
+            raise HTTPException(409, 'Tên dự án đã tồn tại. Hãy chọn tên khác.')
+        conn.execute('INSERT INTO projects(name) VALUES(?)', (name,))
     return {"ok": True, "name": name}
 
 
-@app.delete("/api/projects/{name}")
+@app.put('/api/projects/{name:path}')
+def api_rename_project(name: str, data: Dict[str, Any] = Body(...)):
+    new_name = _validate_project_name(data.get('name'))
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if not conn.execute('SELECT 1 FROM projects WHERE name=?', (name,)).fetchone():
+            raise HTTPException(404, 'Không tìm thấy dự án này.')
+        if _project_monitor_name(conn, name):
+            raise HTTPException(409, 'Dự án thuộc Monitor. Hãy quản lý liên kết trong Monitor trước.')
+        if new_name == name:
+            return {'ok': True, 'name': name}
+        if (conn.execute('SELECT 1 FROM projects WHERE name=?', (new_name,)).fetchone()
+                or conn.execute('SELECT 1 FROM video_queue WHERE project_name=?', (new_name,)).fetchone()):
+            raise HTTPException(409, 'Tên mới đã có dự án hoặc hàng đợi. Không thể gộp dữ liệu khi đổi tên.')
+        ids = [r[0] for r in conn.execute('SELECT id FROM video_queue WHERE project_name=?', (name,))]
+        _ensure_queue_items_idle(conn, ids, 'đổi tên dự án')
+        conn.execute('UPDATE projects SET name=?,updated_at=CURRENT_TIMESTAMP WHERE name=?', (new_name, name))
+        conn.execute('UPDATE video_queue SET project_name=? WHERE project_name=?', (new_name, name))
+    return {'ok': True, 'name': new_name}
+
+
+@app.delete("/api/projects/{name:path}")
 def api_delete_project(name: str):
-    conn = get_conn()
-    try:
+    with closing(get_conn()) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute('SELECT 1 FROM projects WHERE name=?', (name,)).fetchone():
+            raise HTTPException(404, 'Không tìm thấy dự án này.')
+        if _project_monitor_name(conn, name):
+            raise HTTPException(409, 'Dự án thuộc Monitor. Hãy quản lý liên kết trong Monitor trước.')
         total_projects = conn.execute("SELECT COUNT(*) as c FROM projects").fetchone()["c"]
         if total_projects <= 1:
-            raise HTTPException(400, "Cần giữ lại ít nhất 1 dự án để làm việc.")
-        queue_ids = [
-            int(row["id"])
-            for row in conn.execute("SELECT id FROM video_queue WHERE project_name = ?", (name,)).fetchall()
-        ]
-        _ensure_queue_items_idle(conn, queue_ids, f"xóa dự án [{name}]")
-        conn.execute("DELETE FROM video_queue WHERE project_name = ?", (name,))
+            raise HTTPException(409, "Cần giữ lại ít nhất 1 dự án để làm việc.")
+        if conn.execute('SELECT 1 FROM video_queue WHERE project_name=? LIMIT 1', (name,)).fetchone():
+            raise HTTPException(409, 'Dự án còn video. Hãy quản lý hàng đợi trước; chỉ xóa được dự án rỗng.')
         conn.execute("DELETE FROM projects WHERE name = ?", (name,))
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
     return {"ok": True}
 
 
@@ -797,6 +856,9 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
         start_dt = datetime.fromisoformat(base_schedule_time)
         schedule_interval_minutes = max(30, schedule_interval_minutes)
 
+    with closing(get_conn()) as project_conn, project_conn:
+        project_conn.execute('BEGIN IMMEDIATE')
+        project_id, project_name = _capture_import_project(project_conn, project_name)
     try:
         scanned = scan_social_urls(
             urls=urls,
@@ -814,9 +876,9 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
     except ScanSourceError as exc:
         raise HTTPException(502, str(exc)) from exc
 
-    conn = get_conn()
-    with _import_insert_lock:
-        conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (project_name,))
+    with closing(get_conn()) as conn, conn, _import_insert_lock:
+        conn.execute('BEGIN IMMEDIATE')
+        project_name = _current_import_project(conn, project_id)
         added_count = 0
         skipped_count = 0
         seen_post_ids = set()
@@ -878,8 +940,6 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
                 ),
             )
             added_count += 1
-        conn.commit()
-    conn.close()
     log_msg = f"Đã quét và thêm {added_count} video vào dự án [{project_name}] (Chế độ: {visibility})."
     if skipped_count:
         log_msg += f" Bỏ qua {skipped_count} video đã có trong dự án."
@@ -935,9 +995,10 @@ def api_upload_video_files(
         group_names = _validated_group_names(validation_conn, target_group_names, default="Mặc định")
     finally:
         validation_conn.close()
+    with closing(get_conn()) as project_conn, project_conn:
+        project_conn.execute('BEGIN IMMEDIATE')
+        project_id, project_name = _capture_import_project(project_conn, project_name)
     conn = get_conn()
-    conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (project_name,))
-
     added_count = 0
     skipped_count = 0
     added_titles = []
@@ -1003,6 +1064,7 @@ def api_upload_video_files(
         try:
             with _import_insert_lock:
                 conn.execute("BEGIN IMMEDIATE")
+                project_name = _current_import_project(conn, project_id)
                 if not _is_duplicate_content_key(conn, project_name, content_key):
                     insert_cursor = conn.execute(
                         """
@@ -1221,9 +1283,10 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
     skipped_count = 0
     seen_post_ids = set()
 
+    with closing(get_conn()) as project_conn, project_conn:
+        project_conn.execute('BEGIN IMMEDIATE')
+        project_id, project_name = _capture_import_project(project_conn, project_name)
     conn = get_conn()
-    conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (project_name,))
-    conn.commit()
     try:
         for p_str in paths:
             p = Path(p_str)
@@ -1264,6 +1327,8 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
     conn = get_conn()
     try:
         with _import_insert_lock:
+            conn.execute('BEGIN IMMEDIATE')
+            project_name = _current_import_project(conn, project_id)
             for f in pending_files:
                 post_id = hashlib.md5(str(f).encode("utf-8")).hexdigest()[:16].upper()
                 if _is_duplicate_post_id(conn, project_name, post_id):

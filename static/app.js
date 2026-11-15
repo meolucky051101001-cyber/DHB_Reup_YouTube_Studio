@@ -659,13 +659,34 @@ async function loadProjects() {
 async function createNewProject() {
   const name = prompt('Nhập tên Dự Án mới:');
   if (!name || !name.trim()) return;
-  await apiFetch('/api/projects', {
-    method: 'POST',
-    body: JSON.stringify({ name: name.trim() }),
-  });
-  await loadProjects();
-  document.getElementById('sel-project').value = name.trim();
-  await loadQueue();
+  try {
+    await apiFetch('/api/projects', {
+      method: 'POST',
+      body: JSON.stringify({ name: name.trim() }),
+    });
+    await loadProjects();
+    document.getElementById('sel-project').value = name.trim();
+    await loadQueue();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function renameCurrentProject() {
+  const sel = document.getElementById('sel-project');
+  if (!sel.value) return;
+  const name = prompt('Tên mới của dự án:', sel.value);
+  if (name === null || !name.trim() || name.trim() === sel.value) return;
+  try {
+    const result = await apiFetch(`/api/projects/${encodeURIComponent(sel.value)}`, {
+      method: 'PUT', body: JSON.stringify({ name: name.trim() }),
+    });
+    await loadProjects();
+    sel.value = result.name;
+    await loadQueue();
+  } catch (e) {
+    alert(e.message);
+  }
 }
 
 async function deleteCurrentProject() {
@@ -675,7 +696,7 @@ async function deleteCurrentProject() {
     alert('Cần giữ lại ít nhất 1 dự án để làm việc.');
     return;
   }
-  if (!confirm(`Bạn có chắc muốn xóa dự án "${sel.value}" và toàn bộ video trong dự án này?`)) return;
+  if (!confirm(`Xóa dự án "${sel.value}"? Chỉ xóa được dự án rỗng; dự án còn video sẽ được giữ lại.`)) return;
   try {
     await apiFetch(`/api/projects/${encodeURIComponent(sel.value)}`, { method: 'DELETE' });
     await loadProjects();
