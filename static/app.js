@@ -833,7 +833,7 @@ function renderProfilesTable() {
   const tbody = document.getElementById('profiles-tbody');
   if (!tbody) return;
   if (!gProfiles.length) {
-    tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; padding:18px; color:var(--text-muted)">Chưa có Profile Chrome nào. Hãy thêm kênh ở trên hoặc bấm "🔄 Nạp Cài Đặt & Profile" ở góc trên bên phải.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; padding:18px; color:var(--text-muted)">Chưa có Profile Chrome nào. Bấm "Tạo Profile local" hoặc đồng bộ Profile có sẵn.</td></tr>`;
     return;
   }
   tbody.innerHTML = gProfiles.map((p, profileIndex) => {
@@ -859,7 +859,7 @@ function renderProfilesTable() {
 
     return `
       <tr>
-        <td><b>${escapeHtml(p.name)}</b><div style="font-size:10.5px; color:var(--text-muted);">${pathLine}</div></td>
+        <td><b>${escapeHtml(p.name)}</b><div style="font-size:10.5px; color:var(--text-muted);">${pathLine}</div><div>${escapeHtml(p.note || '')}</div></td>
         <td><span class="badge ${sourceClass}">${escapeHtml(sourceLabel)}</span></td>
         <td style="font-size:11px; color:#38bdf8;">${proxyCell}</td>
         <td>${Number(p.channel_count) || 0}</td>
@@ -869,12 +869,13 @@ function renderProfilesTable() {
           <button class="btn btn-accent btn-sm" data-profile-index="${profileIndex}" data-profile-action="profileCheckLogin" title="Tự kiểm tra phiên đăng nhập Google của Profile">🔍 Kiểm Tra</button>
           <button class="btn btn-purple btn-sm" data-profile-index="${profileIndex}" data-profile-action="profileRefreshChannels" title="Quét danh sách kênh YouTube thật trong Profile">🔄 Quét Kênh</button>
           ${proxyBtn}
+          <button class="btn btn-outline btn-sm" data-profile-index="${profileIndex}" data-profile-action="profileEditNote" title="Sửa ghi chú">📝</button>
           <button class="btn btn-outline btn-sm" style="color:#f87171; border-color:rgba(248,113,113,0.3);" data-profile-index="${profileIndex}" data-profile-action="profileDelete" title="Xóa Profile khỏi hệ thống (không xóa thư mục)">🗑️</button>
         </td>
       </tr>
     `;
   }).join('');
-  const actions = { profileOpenBrowser, profileCheckLogin, profileRefreshChannels, profileEditProxy, profileDelete };
+  const actions = { profileOpenBrowser, profileCheckLogin, profileRefreshChannels, profileEditProxy, profileEditNote, profileDelete };
   tbody.querySelectorAll('[data-profile-action]').forEach(button => {
     const profile = gProfiles[Number(button.dataset.profileIndex)];
     const action = actions[button.dataset.profileAction];
@@ -963,8 +964,33 @@ async function profileEditProxy(name) {
   }
 }
 
+async function createLocalProfile() {
+  const name = prompt('Tên Profile local mới (tên thư mục Windows):');
+  if (!name || !name.trim()) return;
+  try {
+    await apiFetch('/api/profiles', { method: 'POST', body: JSON.stringify({ name: name.trim() }) });
+    await loadProfiles();
+    await loadChannels();
+    showToast('Đã tạo Profile local và kênh trống để cấu hình.', 'info');
+  } catch (e) {
+    alert('Lỗi tạo Profile: ' + e.message);
+  }
+}
+
+async function profileEditNote(name) {
+  const p = gProfiles.find(x => x.name === name);
+  const note = prompt(`Ghi chú cho Profile "${name}":`, p?.note || '');
+  if (note === null) return;
+  try {
+    await apiFetch(`/api/profiles/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ note }) });
+    await loadProfiles();
+  } catch (e) {
+    alert('Lỗi sửa ghi chú: ' + e.message);
+  }
+}
+
 async function profileDelete(name) {
-  if (!confirm(`Xóa Profile "${name}" khỏi hệ thống?\n(Chỉ xóa bản ghi trong phần mềm — KHÔNG xóa thư mục Chrome trên ổ đĩa)`)) return;
+  if (!confirm(`Xóa Profile "${name}" và các kênh đi kèm chưa được sử dụng?\nChỉ xóa khi không còn liên kết với video, Monitor hoặc lịch sử đăng. Thư mục Chrome trên đĩa được giữ lại.`)) return;
   try {
     await apiFetch(`/api/profiles/${encodeURIComponent(name)}`, { method: 'DELETE' });
     showToast('🗑️ Đã xóa Profile khỏi hệ thống.', 'warning');

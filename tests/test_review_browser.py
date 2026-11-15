@@ -6,6 +6,58 @@ from pathlib import Path
 
 @unittest.skipUnless(os.environ.get('DHB_BROWSER_TESTS') == '1', 'Run in the browser CI job')
 class ConfigBrowserTests(unittest.TestCase):
+    def test_local_profile_create_note_and_delete_use_real_api(self):
+        import re
+        from urllib.parse import urlsplit
+        from playwright.sync_api import sync_playwright
+        from test_profile_crud import ProfileCrudTests
+        fixture = ProfileCrudTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        root = Path(__file__).resolve().parents[1]
+        html = re.sub(r'<script\b[^>]*>.*?</script>', '', (root/'static/index.html').read_text(encoding='utf-8'), flags=re.S)
+        def dispatch(route):
+            request = route.request
+            parsed = urlsplit(request.url)
+            if parsed.netloc != '127.0.0.1:8686':
+                route.abort()
+                return
+            if parsed.path == '/':
+                route.fulfill(status=200, content_type='text/html', body=html)
+                return
+            if parsed.path.startswith('/api/antidetect'):
+                route.fulfill(status=200, content_type='application/json', body='{"connected":false}')
+                return
+            response = fixture.client.request(request.method, parsed.path + ('?'+parsed.query if parsed.query else ''),
+                                              headers=dict(request.headers), content=request.post_data_buffer)
+            route.fulfill(status=response.status_code, headers=dict(response.headers), body=response.content)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.route('**/*', dispatch)
+            prompts = iter(['Profile local Việt', 'Ghi chú <script> & chữ Việt', 'Profile local Việt'])
+            dialogs = []
+            def on_dialog(dialog):
+                dialogs.append(dialog.message)
+                dialog.accept(next(prompts)) if dialog.type == 'prompt' else dialog.accept()
+            page.on('dialog', on_dialog)
+            page.goto('http://127.0.0.1:8686/')
+            page.add_script_tag(content=(root/'static/app.js').read_text(encoding='utf-8'))
+            page.add_style_tag(content='.tab-pane {display:block!important}')
+            page.locator('[onclick="createLocalProfile()"]').click(force=True)
+            page.wait_for_function("gProfiles.some(p => p.name === 'Profile local Việt')")
+            index = page.evaluate("gProfiles.findIndex(p => p.name === 'Profile local Việt')")
+            page.locator(f'[data-profile-index="{index}"][data-profile-action="profileEditNote"]').click(force=True)
+            page.wait_for_function("gProfiles.some(p => p.note === 'Ghi chú <script> & chữ Việt')")
+            page.evaluate('createLocalProfile()')
+            self.assertTrue(any('đã có cấu hình' in message for message in dialogs))
+            cookie = fixture.profiles/'Profile local Việt'/'Cookies'
+            cookie.write_bytes(b'keep')
+            page.locator(f'[data-profile-index="{index}"][data-profile-action="profileDelete"]').click(force=True)
+            page.wait_for_function("!gProfiles.some(p => p.name === 'Profile local Việt')")
+            self.assertTrue(cookie.is_file())
+            browser.close()
+
     def test_project_actions_keep_selection_and_report_blocked_delete(self):
         import re
         from urllib.parse import urlsplit
@@ -149,7 +201,7 @@ class ProfileDomTests(unittest.TestCase):
         from playwright.sync_api import sync_playwright
         source = (Path(__file__).resolve().parents[1] / 'static/app.js').read_text(encoding='utf-8')
         names = ["&#39;);globalThis.reviewMarker=1;//", 'Việt & <tag> " \' \\ &#34;']
-        actions = ['profileOpenBrowser', 'profileCheckLogin', 'profileRefreshChannels', 'profileEditProxy', 'profileDelete']
+        actions = ['profileOpenBrowser', 'profileCheckLogin', 'profileRefreshChannels', 'profileEditProxy', 'profileEditNote', 'profileDelete']
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
@@ -162,6 +214,7 @@ class ProfileDomTests(unittest.TestCase):
                 profileCheckLogin = name => calls.push(['profileCheckLogin', name]);
                 profileRefreshChannels = name => calls.push(['profileRefreshChannels', name]);
                 profileEditProxy = name => calls.push(['profileEditProxy', name]);
+                profileEditNote = name => calls.push(['profileEditNote', name]);
                 profileDelete = name => calls.push(['profileDelete', name]);
                 gProfiles = names.map(name => ({ name, source: 'Local' }));
                 renderProfilesTable(); renderProfilesTable(); renderProfilesTable();

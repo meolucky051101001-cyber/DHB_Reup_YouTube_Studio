@@ -87,7 +87,8 @@ from queue_import import preview_csv_import
 from app_instance_lock import AppInstanceAlreadyRunning, acquire_app_instance_lock
 from render_engine import normalize_render_speed
 from runtime_identity import capture_runtime, runtime_status
-from config_validation import validate_config, validate_option_state
+from config_validation import parse_config_input, validate_config, validate_option_state
+from profile_crud import ProfileCreate, ProfileUpdate, binding_references
 from monitor_validation import validate_monitor_create
 from storage_manager import (
     DEFAULT_RETENTION_DAYS,
@@ -3746,123 +3747,127 @@ def api_list_profiles():
     return get_all_profiles()
 
 
-@app.get("/api/profiles/{profile_name}/channels")
+@app.get("/api/profiles/{profile_name:path}/channels")
 def api_get_profile_channels(profile_name: str):
     return get_channels_by_profile(profile_name)
 
 
-@app.post("/api/profiles")
+def _profile_input(schema, data, *, partial=False):
+    try:
+        return parse_config_input(schema, data, partial=partial)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _binding_references(conn, channel_ids, profile_name=''):
+    try:
+        return binding_references(conn, channel_ids, profile_name)
+    except ValueError as exc:
+        raise HTTPException(409, 'Liên kết nhóm không hợp lệ. Hãy kiểm tra đích trong hàng đợi trước.') from exc
+
+
+def _ensure_binding_deletable(conn, channel_ids, profile_name=''):
+    queue_ids, monitors, evidence = _binding_references(conn, channel_ids, profile_name)
+    if queue_ids or monitors or evidence:
+        details = []
+        if queue_ids:
+            details.append('video ' + ', '.join(f'#{i}' for i in queue_ids[:5]))
+        if monitors:
+            details.append('Monitor ' + ', '.join(f"#{m['id']}" for m in monitors[:5]))
+        if evidence:
+            details.append('lịch sử đăng hoặc lượt duyệt')
+        raise HTTPException(409, 'Không thể xóa vì còn liên kết: ' + '; '.join(details) + '. Hãy đối soát hoặc đổi đích trước.')
+
+
+@app.post('/api/profiles')
 def api_create_profile(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Tên Profile không được để trống.")
-
-    check_conn = get_conn()
-    existing = check_conn.execute(
-        "SELECT source, antidetect_profile_id FROM chrome_profiles WHERE name = ?",
-        (name,),
-    ).fetchone()
-    check_conn.close()
-    if existing and (
-        str(existing["source"] or "") == "Antidetect"
-        or str(existing["antidetect_profile_id"] or "").strip()
-    ):
-        raise HTTPException(
-            409,
-            "Tên này đang thuộc Profile đồng bộ từ Antidetect. "
-            "Không thể ghi đè bằng Profile Chrome cục bộ — hãy chọn tên khác.",
-        )
-
+    values = _profile_input(ProfileCreate, data)
+    name, proxy, note = values['name'], values['proxy'], values['note']
     from config import APP_PROFILES_DIR
-    p_path = str(APP_PROFILES_DIR / name)
-    Path(p_path).mkdir(parents=True, exist_ok=True)
-    proxy = (data.get("proxy") or "").strip()
-    note = (data.get("note") or "").strip()
+    root = APP_PROFILES_DIR.resolve()
+    candidate = root / name
+    if candidate.resolve().parent != root:
+        raise HTTPException(400, 'Thư mục Profile phải nằm trực tiếp trong thư mục Profile của ứng dụng.')
+    created_directory = False
+    try:
+        with closing(get_conn()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            known_names = [r[0] for r in conn.execute('SELECT name FROM chrome_profiles UNION SELECT profile_name FROM youtube_channels')]
+            if any(str(known).casefold() == name.casefold() for known in known_names):
+                raise HTTPException(409, 'Tên Profile đã có cấu hình hoặc kênh liên kết. Hãy dùng chức năng sửa hoặc chọn tên khác.')
+            known_paths = [r[0] for r in conn.execute('SELECT path FROM chrome_profiles UNION SELECT profile_path FROM youtube_channels')]
+            if any(path and not str(path).startswith('antidetect://') and
+                   str(Path(path).resolve()).casefold() == str(candidate).casefold() for path in known_paths):
+                raise HTTPException(409, 'Thư mục này đã có Profile hoặc kênh sử dụng.')
+            root.mkdir(parents=True, exist_ok=True)
+            if any(child.name.casefold() == name.casefold() for child in root.iterdir()):
+                raise HTTPException(409, 'Thư mục Profile đã tồn tại trên đĩa. Hãy chọn tên khác để bảo toàn phiên Chrome cũ.')
+            try:
+                candidate.mkdir()
+            except FileExistsError as exc:
+                raise HTTPException(409, 'Thư mục Profile đã tồn tại trên đĩa.') from exc
+            created_directory = True
+            conn.execute("INSERT INTO chrome_profiles(name,path,proxy,source,note,antidetect_profile_id) VALUES(?,?,?,'Local',?,'')",
+                         (name, str(candidate), proxy, note))
+            cursor = conn.execute("""
+                INSERT INTO youtube_channels(name,handle,group_name,upload_mode,profile_name,profile_path,proxy,emulate_mobile,status,note)
+                VALUES(?,?,'Mặc định','playwright',?,?,?,0,'Ready','Kênh chính theo Profile')
+                """, (f'YT - {name}', f"@{name.lower().replace(' ', '')}", name, str(candidate), proxy))
+            set_channel_group_memberships(conn, int(cursor.lastrowid), ['Mặc định'])
+    except BaseException:
+        if created_directory:
+            try:
+                candidate.rmdir()  # Only the empty directory created by this request.
+            except OSError:
+                pass
+        raise
+    return {'ok': True, 'name': name, 'path': str(candidate)}
 
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO chrome_profiles
-            (name, path, proxy, source, note, antidetect_profile_id)
-        VALUES (?, ?, ?, 'Local', ?, '')
-        ON CONFLICT(name) DO UPDATE SET path=excluded.path, proxy=excluded.proxy,
-            source=excluded.source, note=excluded.note, antidetect_profile_id=excluded.antidetect_profile_id
-        """,
-        (name, p_path, proxy, note),
-    )
-    chk = conn.execute("SELECT id FROM youtube_channels WHERE profile_name = ?", (name,)).fetchone()
-    if not chk:
-        cur = conn.execute(
-            """
-            INSERT INTO youtube_channels (name, handle, group_name, upload_mode, profile_name, profile_path, proxy, emulate_mobile, status, note)
-            VALUES (?, ?, 'Default', 'playwright', ?, ?, ?, 0, 'Ready', 'Kênh chính theo Profile')
-            """,
-            (f"YT - {name}", f"@{name.lower().replace(' ', '')}", name, p_path, proxy),
-        )
-        set_channel_group_memberships(conn, int(cur.lastrowid), ["Mặc định"])
-    conn.commit()
-    conn.close()
-    return {"ok": True, "name": name, "path": p_path}
 
-
-@app.put("/api/profiles/{profile_name}")
+@app.put('/api/profiles/{profile_name:path}')
 def api_update_profile(profile_name: str, data: Dict[str, Any] = Body(...)):
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT name, source, antidetect_profile_id FROM chrome_profiles WHERE name = ?",
-        (profile_name,),
-    ).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "Không tìm thấy Profile Chrome này.")
-    is_antidetect = (
-        str(row["source"] or "") == "Antidetect"
-        or bool(str(row["antidetect_profile_id"] or "").strip())
-    )
-    if "proxy" in data and is_antidetect:
-        conn.close()
-        raise HTTPException(
-            400,
-            "Proxy của Profile Antidetect do Antidetect quản lý — hãy sửa trong Antidetect.",
-        )
-    if "proxy" in data and "***" not in str(data.get("proxy") or ""):
-        proxy = (data.get("proxy") or "").strip()
-        conn.execute("UPDATE chrome_profiles SET proxy = ? WHERE name = ?", (proxy, profile_name))
-        # Quy tắc an toàn: kênh thuộc Profile phải đi cùng Proxy với lúc đăng nhập thủ công
-        conn.execute("UPDATE youtube_channels SET proxy = ? WHERE profile_name = ?", (proxy, profile_name))
-    if "note" in data:
-        conn.execute(
-            "UPDATE chrome_profiles SET note = ? WHERE name = ?",
-            ((data.get("note") or "").strip(), profile_name),
-        )
-    conn.commit()
-    conn.close()
-    add_log("Profile", f"Đã cập nhật cấu hình Profile Chrome '{profile_name}'.", "INFO")
-    return {"ok": True}
+    values = _profile_input(ProfileUpdate, data, partial=True)
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM chrome_profiles WHERE name=?', (profile_name,)).fetchone()
+        if row is None:
+            raise HTTPException(404, 'Không tìm thấy Profile Chrome này.')
+        is_antidetect = str(row['source'] or '').casefold() == 'antidetect' or bool(row['antidetect_profile_id'])
+        if 'proxy' in values and is_antidetect:
+            raise HTTPException(400, 'Proxy của Profile Antidetect do Antidetect quản lý — hãy sửa trong Antidetect.')
+        if 'proxy' in values and '***' not in values['proxy']:
+            channel_ids = [r[0] for r in conn.execute('SELECT id FROM youtube_channels WHERE profile_name=?', (profile_name,))]
+            queue_ids, monitors, evidence = _binding_references(conn, channel_ids, profile_name)
+            _ensure_queue_items_idle(conn, queue_ids, 'đổi proxy Profile')
+            if 'content_reservations' in evidence:
+                raise HTTPException(409, 'Profile còn reservation cần đối soát trước khi đổi proxy.')
+            if any(m['is_running'] or pipeline_manager._monitor_handles_alive(m['id']) for m in monitors):
+                raise HTTPException(409, 'Hãy dừng Monitor đang sử dụng Profile trước khi đổi proxy.')
+            conn.execute('UPDATE chrome_profiles SET proxy=? WHERE name=?', (values['proxy'], profile_name))
+            conn.execute('UPDATE youtube_channels SET proxy=? WHERE profile_name=?', (values['proxy'], profile_name))
+        if 'note' in values:
+            conn.execute('UPDATE chrome_profiles SET note=? WHERE name=?', (values['note'], profile_name))
+    add_log('Profile', f"Đã cập nhật cấu hình Profile Chrome '{profile_name}'.", 'INFO')
+    return {'ok': True}
 
 
-@app.delete("/api/profiles/{profile_name}")
+@app.delete('/api/profiles/{profile_name:path}')
 def api_delete_profile(profile_name: str):
-    """Xóa Profile khỏi hệ thống (CHỈ xóa bản ghi database, tuyệt đối không xóa thư mục Chrome trên ổ đĩa)."""
-    conn = get_conn()
-    row = conn.execute("SELECT path FROM chrome_profiles WHERE name = ?", (profile_name,)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "Không tìm thấy Profile Chrome này.")
-    conn.execute(
-        "DELETE FROM channel_group_memberships WHERE channel_id IN "
-        "(SELECT id FROM youtube_channels WHERE profile_name = ?)",
-        (profile_name,),
-    )
-    conn.execute("DELETE FROM youtube_channels WHERE profile_name = ?", (profile_name,))
-    conn.execute("DELETE FROM chrome_profiles WHERE name = ?", (profile_name,))
-    conn.commit()
-    conn.close()
-    add_log("Profile", f"Đã xóa Profile Chrome '{profile_name}' khỏi hệ thống (giữ nguyên thư mục trên đĩa).", "WARNING")
-    return {"ok": True}
+    """Delete unused DB bindings atomically; retain all Chrome files."""
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if not conn.execute('SELECT 1 FROM chrome_profiles WHERE name=?', (profile_name,)).fetchone():
+            raise HTTPException(404, 'Không tìm thấy Profile Chrome này.')
+        channel_ids = [r[0] for r in conn.execute('SELECT id FROM youtube_channels WHERE profile_name=?', (profile_name,))]
+        _ensure_binding_deletable(conn, channel_ids, profile_name)
+        conn.execute('DELETE FROM channel_group_memberships WHERE channel_id IN (SELECT id FROM youtube_channels WHERE profile_name=?)', (profile_name,))
+        conn.execute('DELETE FROM youtube_channels WHERE profile_name=?', (profile_name,))
+        conn.execute('DELETE FROM chrome_profiles WHERE name=?', (profile_name,))
+    add_log('Profile', f"Đã xóa Profile Chrome '{profile_name}' khỏi hệ thống (giữ nguyên thư mục trên đĩa).", 'WARNING')
+    return {'ok': True}
 
 
-@app.post("/api/profiles/{profile_name}/open-browser")
+@app.post("/api/profiles/{profile_name:path}/open-browser")
 def api_open_profile_browser(profile_name: str):
     prof = get_profile_binding(profile_name)
     if not prof:
@@ -3883,7 +3888,14 @@ def api_open_profile_browser(profile_name: str):
         raise HTTPException(500, f"Lỗi khi mở Profile: {e}")
 
 
-@app.post("/api/profiles/{profile_name}/check-login")
+def _check_profile_probe_binding(conn, profile_name, before):
+    current = conn.execute('SELECT * FROM chrome_profiles WHERE name=?', (profile_name,)).fetchone()
+    fields = ('path', 'proxy', 'source', 'antidetect_profile_id')
+    if current is None or any((current[key] or '') != (before.get(key) or '') for key in fields):
+        raise HTTPException(409, 'Profile đã bị xóa hoặc thay đổi trong lúc kiểm tra. Hãy tải lại và thử lại.')
+
+
+@app.post("/api/profiles/{profile_name:path}/check-login")
 def api_check_profile_login(profile_name: str):
     """Mở Chrome Profile ở vị trí khuất để kiểm tra phiên đăng nhập Google (kèm Proxy nếu có)."""
     prof = get_profile_binding(profile_name)
@@ -3901,14 +3913,14 @@ def api_check_profile_login(profile_name: str):
         raise HTTPException(500, f"Lỗi khi mở Profile để kiểm tra: {e}")
 
     new_status = "Đã đăng nhập" if probe.get("logged_in") else "Chưa đăng nhập"
-    conn = get_conn()
-    conn.execute(
-        "UPDATE chrome_profiles SET login_status = ?, last_login_check = ? WHERE name = ?",
-        (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), profile_name),
-    )
-    conn.execute("UPDATE youtube_channels SET status = ? WHERE profile_name = ?", (new_status, profile_name))
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        _check_profile_probe_binding(conn, profile_name, prof)
+        conn.execute(
+            "UPDATE chrome_profiles SET login_status = ?, last_login_check = ? WHERE name = ?",
+            (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), profile_name),
+        )
+        conn.execute("UPDATE youtube_channels SET status = ? WHERE profile_name = ?", (new_status, profile_name))
     add_log(
         "Profile",
         f"Kiểm tra đăng nhập Profile '{profile_name}': {new_status}. {probe.get('message', '')}",
@@ -3928,6 +3940,9 @@ def _upsert_profile_channels(
     """Đồng bộ danh sách kênh quét được từ YouTube Studio của một Profile vào
     youtube_channels: khớp theo channel_id → handle → tên; trả về (added, updated).
     Dùng chung cho refresh-channels (Profile Chrome) và sync Antidetect."""
+    current = conn.execute('SELECT path,proxy FROM chrome_profiles WHERE name=?', (profile_name,)).fetchone()
+    if current is None or (current['path'] or '') != prof_path or (current['proxy'] or '') != prof_proxy:
+        raise HTTPException(409, 'Liên kết Profile đã thay đổi. Hãy quét lại danh sách kênh.')
     added, updated = 0, 0
     for ch in found or []:
         handle = (ch.get("handle") or "").strip()
@@ -3981,7 +3996,7 @@ def _upsert_profile_channels(
     return added, updated
 
 
-@app.post("/api/profiles/{profile_name}/refresh-channels")
+@app.post("/api/profiles/{profile_name:path}/refresh-channels")
 def api_refresh_profile_channels(profile_name: str):
     """Quét danh sách kênh YouTube thật trong Chrome Profile và cập nhật vào bảng youtube_channels."""
     prof = get_profile_binding(profile_name)
@@ -4003,16 +4018,16 @@ def api_refresh_profile_channels(profile_name: str):
     found = probe.get("channels") or []
     new_status = "Đã đăng nhập" if probe.get("logged_in") else "Chưa đăng nhập"
 
-    conn = get_conn()
-    conn.execute(
-        "UPDATE chrome_profiles SET login_status = ?, last_login_check = ? WHERE name = ?",
-        (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), profile_name),
-    )
-    conn.execute("UPDATE youtube_channels SET status = ? WHERE profile_name = ?", (new_status, profile_name))
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        _check_profile_probe_binding(conn, profile_name, prof)
+        conn.execute(
+            "UPDATE chrome_profiles SET login_status = ?, last_login_check = ? WHERE name = ?",
+            (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), profile_name),
+        )
+        conn.execute("UPDATE youtube_channels SET status = ? WHERE profile_name = ?", (new_status, profile_name))
 
-    added, updated = _upsert_profile_channels(conn, profile_name, prof_path, prof_proxy, found, new_status)
-    conn.commit()
-    conn.close()
+        added, updated = _upsert_profile_channels(conn, profile_name, prof_path, prof_proxy, found, new_status)
     add_log(
         "Profile",
         f"Quét kênh Profile '{profile_name}': {new_status}. Thêm mới {added} kênh, cập nhật {updated} kênh.",
@@ -4182,11 +4197,14 @@ def api_update_channel(channel_id: int, data: Dict[str, Any] = Body(...)):
 
 @app.delete("/api/channels/{channel_id}")
 def api_delete_channel(channel_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM channel_group_memberships WHERE channel_id = ?", (channel_id,))
-    conn.execute("DELETE FROM youtube_channels WHERE id = ?", (channel_id,))
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        channel = conn.execute('SELECT profile_name FROM youtube_channels WHERE id=?', (channel_id,)).fetchone()
+        if channel is None:
+            raise HTTPException(404, 'Không tìm thấy kênh.')
+        _ensure_binding_deletable(conn, [channel_id], channel['profile_name'] or '')
+        conn.execute('DELETE FROM channel_group_memberships WHERE channel_id=?', (channel_id,))
+        conn.execute('DELETE FROM youtube_channels WHERE id=?', (channel_id,))
     return {"ok": True}
 
 
