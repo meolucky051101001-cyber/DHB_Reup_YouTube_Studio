@@ -25,7 +25,7 @@ G1–G6 are complete for the user's selected scope: offline acceptance and local
 
 Follow-up G7–G9 is now deployed locally as `2026.11.15-scan-csv`. See `G7_SCAN_LIFECYCLE.md`, `G8_CSV_SAFETY.md` and `G9_LOCAL_SCAN_CSV.md` for scan cancellation/deadlines, reversible CSV escaping, current deployment evidence and remaining roadmap. The earlier release record remains historical.
 
-Current local rollout is G10–G12, build `2026.11.15-monitor-validation.1` at `6cedb16`. Channel/option configuration and monitor creation now validate inputs before writes; partial-render cleanup retries transient file locks. See `G12_LOCAL_CONFIG_ROLLOUT.md` for offline checks, preserved data, rollback and remaining scope; G7–G9 records describe the previous release.
+Current local rollout is G13–G16, build `2026.11.15-crud` at `74005a4`. Projects, profiles and render presets now validate mutations, preserve references and prevent silent overwrites. All existing fields in 15 tables survived backup/rehearsal/restart and read-only Chromium acceptance. See `G16_LOCAL_CRUD_ROLLOUT.md` for evidence, API compatibility changes and rollback. G7–G12 records describe previous releases.
 
 ## G3: queue preparation
 
