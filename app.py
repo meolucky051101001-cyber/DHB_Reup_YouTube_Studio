@@ -8,6 +8,7 @@ import hashlib
 import monitor_policy
 import threading
 import subprocess
+from contextlib import closing
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -85,6 +86,7 @@ from queue_import import preview_csv_import
 from app_instance_lock import AppInstanceAlreadyRunning, acquire_app_instance_lock
 from render_engine import normalize_render_speed
 from runtime_identity import capture_runtime, runtime_status
+from config_validation import validate_config, validate_option_state
 from storage_manager import (
     DEFAULT_RETENTION_DAYS,
     cleanup_managed_artifacts,
@@ -328,7 +330,7 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.15-scan-csv"
+APP_BUILD_VERSION = "2026.11.15-config-validation"
 RUNTIME_IDENTITY = capture_runtime(APP_ROOT)
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
@@ -3996,9 +3998,11 @@ def api_list_channels(profile: Optional[str] = None):
 
 @app.post("/api/channels")
 def api_create_channel(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Tên kênh không được để trống.")
+    try:
+        data = validate_config(data, 'channel', create=True)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    name = data['name']
     prof_name = (data.get("profile_name") or name).strip()
     prof_path = (data.get("profile_path") or "").strip()
 
@@ -4026,136 +4030,85 @@ def api_create_channel(data: Dict[str, Any] = Body(...)):
         candidate = DHB_PROFILE_CHROME_DIR / prof_name
         prof_path = str(candidate) if candidate.exists() else str(APP_PROFILES_DIR / prof_name)
 
-    conn = get_conn()
-    group_names = _validated_group_names(
-        conn, data.get("group_names"), legacy=data.get("group_name") or "", default="Mặc định"
-    )
-    cur = conn.execute(
-        """
-        INSERT INTO youtube_channels (
-            name, channel_id, handle, group_name, upload_mode, profile_name,
-            profile_path, emulate_mobile, use_hidden_desktop, proxy, oauth_token_json,
-            default_category_id, default_privacy, made_for_kids, note
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            name,
-            data.get("channel_id") or "",
-            data.get("handle") or "",
-            group_names[0],
-            upload_mode,
-            prof_name,
-            prof_path,
-            0 if is_antidetect else (1 if data.get("emulate_mobile", False) else 0),
-            1 if data.get("use_hidden_desktop") else 0,
-            "" if is_antidetect else (data.get("proxy") or ""),
-            data.get("oauth_token_json") or "",
-            data.get("default_category_id") or "22",
-            data.get("default_privacy") or "public",
-            1 if data.get("made_for_kids") else 0,
-            data.get("note") or "",
-        ),
-    )
-    set_channel_group_memberships(conn, int(cur.lastrowid), group_names)
-    conn.commit()
-    conn.close()
+    if upload_mode == 'youtube_api':
+        _validate_channel_oauth(data)
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        group_names = _validated_group_names(
+            conn, data.pop('group_names'), legacy=data.get('group_name'), default='Mặc định'
+        )
+        data.update(group_name=group_names[0], profile_name=prof_name, profile_path=prof_path)
+        if is_antidetect:
+            data.update(emulate_mobile=0, proxy='')
+        columns = ', '.join(data)
+        placeholders = ', '.join('?' for _ in data)
+        cur = conn.execute(f'INSERT INTO youtube_channels ({columns}) VALUES ({placeholders})', list(data.values()))
+        set_channel_group_memberships(conn, int(cur.lastrowid), group_names)
     add_log("Channel", f"Đã thêm kênh YouTube: {name}", "SUCCESS", channel_name=name)
     return {"ok": True}
+
+
+def _validate_channel_oauth(values):
+    try:
+        oauth = get_oauth_token_local_status(values)
+    except (ValueError, TypeError, OverflowError, OSError):
+        raise HTTPException(400, 'Cấu hình OAuth không hợp lệ. Kiểm tra token và thời gian hết hạn.') from None
+    if not oauth['configured'] or oauth['error']:
+        raise HTTPException(400, oauth['error'] or 'Kênh chưa có OAuth hợp lệ.')
 
 
 @app.put("/api/channels/{channel_id}")
 def api_update_channel(channel_id: int, data: Dict[str, Any] = Body(...)):
     """Cập nhật thông tin kênh YouTube (tên, handle, nhóm, proxy, chế độ đăng, cấu hình mặc định...)."""
-    text_fields = (
-        "name", "channel_id", "handle", "email", "group_name", "upload_mode", "proxy",
-        "oauth_token_json", "default_category_id", "default_privacy", "note", "status",
-        "profile_name", "profile_path",
-    )
-    bool_fields = ("emulate_mobile", "use_hidden_desktop", "made_for_kids", "altered_content")
-
-    if "name" in data and not (data.get("name") or "").strip():
-        raise HTTPException(400, "Tên kênh không được để trống.")
-    if "upload_mode" in data and data.get("upload_mode") not in ("playwright", "youtube_api"):
-        raise HTTPException(400, "Phương thức đăng không hợp lệ (chỉ nhận playwright / youtube_api).")
-    if "default_privacy" in data and data.get("default_privacy") not in ("public", "unlisted", "private"):
-        raise HTTPException(400, "Chế độ hiển thị mặc định không hợp lệ (public / unlisted / private).")
-
-    updates: Dict[str, Any] = {}
-    for k in text_fields:
-        if k in data:
-            v = data.get(k)
-            if k == "proxy" and "***" in str(v or ""):
-                # GET intentionally masks proxy passwords. A masked value means keep the stored proxy.
-                continue
-            if k == "oauth_token_json" and not str(v or "").strip():
-                # Ô token để trống = giữ nguyên token đã lưu (API không trả lại secret).
-                continue
-            updates[k] = "" if v is None else str(v).strip()
-    for k in bool_fields:
-        if k in data:
-            updates[k] = 1 if data.get(k) else 0
+    try:
+        updates = validate_config(data, 'channel')
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if 'proxy' in updates and '***' in updates['proxy']:
+        del updates['proxy']  # Masked GET value means keep the stored password.
+    if 'oauth_token_json' in updates and not updates['oauth_token_json']:
+        del updates['oauth_token_json']  # An empty editor never erases stored OAuth.
 
     if not updates:
         return {"ok": False, "message": "Không có trường hợp lệ để cập nhật."}
 
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM youtube_channels WHERE id = ?", (channel_id,)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "Không tìm thấy kênh YouTube này.")
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute("SELECT * FROM youtube_channels WHERE id = ?", (channel_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Không tìm thấy kênh YouTube này.")
+        final = {**dict(row), **updates}
+        if final['upload_mode'] == 'youtube_api' and {'upload_mode','oauth_token_json'} & updates.keys():
+            _validate_channel_oauth(final)
 
-    if updates.get("upload_mode") == "youtube_api":
-        oauth = get_oauth_token_local_status({**dict(row), **updates})
-        if not oauth["configured"] or oauth["error"]:
-            conn.close()
-            raise HTTPException(400, oauth["error"] or "Kênh chưa có OAuth hợp lệ.")
-
-    group_names = None
-    if "group_names" in data or "group_name" in data:
-        group_names = _validated_group_names(
-            conn,
-            data.get("group_names") if "group_names" in data else data.get("group_name"),
-            legacy=row["group_name"] or "",
-            default="Mặc định",
-        )
-        updates["group_name"] = group_names[0]
-
-    # Đổi Profile: tự đồng bộ profile_path từ bảng chrome_profiles nếu người dùng không nhập đường dẫn mới
-    if "profile_name" in updates and not updates.get("profile_path"):
-        prof_name = updates["profile_name"]
-        if not prof_name:
-            conn.close()
-            raise HTTPException(400, "Tên Profile Chrome không được để trống.")
-        prof_row = conn.execute("SELECT path FROM chrome_profiles WHERE name = ?", (prof_name,)).fetchone()
-        if prof_row and prof_row["path"]:
-            updates["profile_path"] = prof_row["path"]
-
-    # Kênh gắn Profile Antidetect: path là định danh do Antidetect quản lý, proxy/mobile do Antidetect quyết định.
-    final_prof_name = updates.get("profile_name", row["profile_name"] or "")
-    prof_binding = conn.execute(
-        "SELECT * FROM chrome_profiles WHERE name = ?", (final_prof_name,)
-    ).fetchone() if final_prof_name else None
-    if prof_binding and (
-        str(prof_binding["source"] or "") == "Antidetect"
-        or str(prof_binding["antidetect_profile_id"] or "").strip()
-    ):
-        ad_binding_id = str(prof_binding["antidetect_profile_id"] or "").strip()
-        if not ad_binding_id:
-            conn.close()
-            raise HTTPException(
-                400,
-                "Profile Antidetect này thiếu ID liên kết. Hãy bấm 'Đồng Bộ Antidetect' rồi thử lại.",
+        group_names = None
+        if 'group_names' in updates or 'group_name' in updates:
+            raw_groups = updates.pop('group_names', updates.get('group_name'))
+            group_names = _validated_group_names(
+                conn, raw_groups, legacy=updates.get('group_name', row['group_name']) or '', default='Mặc định',
             )
-        updates["profile_path"] = prof_binding["path"] or f"antidetect://{ad_binding_id}"
-        updates["proxy"] = ""
-        updates["emulate_mobile"] = 0
+            updates['group_name'] = group_names[0]
 
-    cols = ", ".join(f"{k} = ?" for k in updates.keys())
-    conn.execute(f"UPDATE youtube_channels SET {cols} WHERE id = ?", list(updates.values()) + [channel_id])
-    if group_names is not None:
-        set_channel_group_memberships(conn, channel_id, group_names)
-    conn.commit()
-    conn.close()
+        # Đổi Profile: lấy path của binding khi không nhập đường dẫn mới.
+        if 'profile_name' in updates and not updates.get('profile_path'):
+            if not updates['profile_name']:
+                raise HTTPException(400, 'Tên Profile Chrome không được để trống.')
+            prof_row = conn.execute('SELECT path FROM chrome_profiles WHERE name=?', (updates['profile_name'],)).fetchone()
+            if prof_row and prof_row['path']:
+                updates['profile_path'] = prof_row['path']
+
+        final_prof_name = updates.get('profile_name', row['profile_name'] or '')
+        prof_binding = conn.execute('SELECT * FROM chrome_profiles WHERE name=?', (final_prof_name,)).fetchone() if final_prof_name else None
+        if prof_binding and (str(prof_binding['source'] or '') == 'Antidetect' or str(prof_binding['antidetect_profile_id'] or '').strip()):
+            ad_binding_id = str(prof_binding['antidetect_profile_id'] or '').strip()
+            if not ad_binding_id:
+                raise HTTPException(400, "Profile Antidetect này thiếu ID liên kết. Hãy bấm 'Đồng Bộ Antidetect' rồi thử lại.")
+            updates.update(profile_path=prof_binding['path'] or f'antidetect://{ad_binding_id}', proxy='', emulate_mobile=0)
+
+        cols = ', '.join(f'{key} = ?' for key in updates)
+        conn.execute(f'UPDATE youtube_channels SET {cols} WHERE id = ?', [*updates.values(), channel_id])
+        if group_names is not None:
+            set_channel_group_memberships(conn, channel_id, group_names)
     add_log("Channel", f"Đã cập nhật thông tin kênh YouTube #{channel_id}.", "INFO")
     return {"ok": True}
 
@@ -4357,74 +4310,41 @@ def api_list_options():
 
 @app.post("/api/options")
 def api_create_option(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Tên bộ tùy chọn không được để trống.")
-    conn = get_conn()
-    cur = conn.execute(
-        """
-        INSERT INTO upload_option_groups (
-            name, affiliate_enabled, affiliate_url, affiliate_CTA,
-            pin_comment_enabled, pin_comment_text, append_hashtags,
-            default_tags, category_id, language, made_for_kids, ai_label,
-            disable_shorts_remix
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            name,
-            1 if data.get("affiliate_enabled") else 0,
-            data.get("affiliate_url") or "",
-            data.get("affiliate_CTA") or "👉 Mua ngay sản phẩm chính hãng tại đây:",
-            1 if data.get("pin_comment_enabled") else 0,
-            data.get("pin_comment_text") or "",
-            data.get("append_hashtags") or "#shorts #trending #viral",
-            data.get("default_tags") or "",
-            data.get("category_id") or "22",
-            data.get("language") or "vi",
-            1 if data.get("made_for_kids") else 0,
-            1 if data.get("ai_label") else 0,
-            1 if data.get("disable_shorts_remix") else 0,
-        ),
-    )
-    new_id = cur.lastrowid
-    conn.commit()
-    conn.close()
+    try:
+        data = validate_config(data, 'option', create=True)
+        validate_option_state(data)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    with closing(get_conn()) as conn, conn:
+        columns = ', '.join(data)
+        placeholders = ', '.join('?' for _ in data)
+        cur = conn.execute(f'INSERT INTO upload_option_groups ({columns}) VALUES ({placeholders})', list(data.values()))
+        new_id = cur.lastrowid
     return {"ok": True, "id": new_id}
 
 
 @app.put("/api/options/{opt_id}")
 def api_update_option(opt_id: int, data: Dict[str, Any] = Body(...)):
     """Sửa đầy đủ một bộ tùy chọn đăng (affiliate, pin comment, hashtags, tags, danh mục...)."""
-    if "name" in data and not (data.get("name") or "").strip():
-        raise HTTPException(400, "Tên bộ tùy chọn không được để trống.")
-
-    text_fields = (
-        "name", "affiliate_url", "affiliate_CTA", "pin_comment_text",
-        "append_hashtags", "default_tags", "category_id", "language",
-    )
-    bool_fields = ("affiliate_enabled", "pin_comment_enabled", "made_for_kids", "ai_label", "disable_shorts_remix")
-
-    updates: Dict[str, Any] = {}
-    for k in text_fields:
-        if k in data:
-            v = data.get(k)
-            updates[k] = ("" if v is None else str(v)).strip()
-    for k in bool_fields:
-        if k in data:
-            updates[k] = 1 if data.get(k) else 0
+    try:
+        updates = validate_config(data, 'option')
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     if not updates:
         return {"ok": False, "message": "Không có trường hợp lệ để cập nhật."}
 
-    conn = get_conn()
-    row = conn.execute("SELECT id FROM upload_option_groups WHERE id = ?", (opt_id,)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "Không tìm thấy bộ tùy chọn đăng này.")
-    cols = ", ".join(f"{k} = ?" for k in updates.keys())
-    conn.execute(f"UPDATE upload_option_groups SET {cols} WHERE id = ?", list(updates.values()) + [opt_id])
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM upload_option_groups WHERE id=?', (opt_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, 'Không tìm thấy bộ tùy chọn đăng này.')
+        try:
+            validate_option_state({**dict(row), **updates})
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        cols = ', '.join(f'{key} = ?' for key in updates)
+        conn.execute(f'UPDATE upload_option_groups SET {cols} WHERE id=?', [*updates.values(), opt_id])
     add_log("Options", f"Đã cập nhật bộ tùy chọn đăng #{opt_id}.", "INFO")
     return {"ok": True}
 

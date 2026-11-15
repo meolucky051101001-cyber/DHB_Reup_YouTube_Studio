@@ -5,6 +5,78 @@ from pathlib import Path
 
 
 @unittest.skipUnless(os.environ.get('DHB_BROWSER_TESTS') == '1', 'Run in the browser CI job')
+class ConfigBrowserTests(unittest.TestCase):
+    def test_channel_and_option_forms_keep_boolean_and_empty_text_values(self):
+        import re
+        from contextlib import closing
+        from urllib.parse import urlsplit
+        from playwright.sync_api import sync_playwright
+        import database
+        from test_review_regressions import ReviewRegressions
+        fixture = ReviewRegressions()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        root = Path(__file__).resolve().parents[1]
+        html = re.sub(r'<script\b[^>]*>.*?</script>', '', (root/'static/index.html').read_text(encoding='utf-8'), flags=re.S)
+        def dispatch(route):
+            request = route.request
+            parsed = urlsplit(request.url)
+            if parsed.netloc != '127.0.0.1:8686':
+                route.abort()
+                return
+            if parsed.path == '/':
+                route.fulfill(status=200, content_type='text/html', body=html)
+                return
+            if not parsed.path.startswith(('/api/auth','/api/channels','/api/groups','/api/options','/api/profiles','/api/overview','/static/')):
+                route.abort()
+                return
+            response = fixture.client.request(request.method, parsed.path + ('?'+parsed.query if parsed.query else ''),
+                                              headers=dict(request.headers), content=request.post_data_buffer)
+            route.fulfill(status=response.status_code, headers=dict(response.headers), body=response.content)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.route('**/*', dispatch)
+            dialogs = []
+            page.on('dialog', lambda dialog: (dialogs.append(dialog.message), dialog.accept()))
+            page.goto('http://127.0.0.1:8686/')
+            page.add_script_tag(content=(root/'static/app.js').read_text(encoding='utf-8'))
+            page.add_style_tag(content='.tab-pane,.subtab-pane {display:block!important}')
+            page.evaluate('async () => { await loadGroups(); await loadChannels(); await loadOptions(); }')
+            page.fill('#ch-name','Kênh Việt G10')
+            page.locator('[onclick="addChannel()"]').click(force=True)
+            page.wait_for_function("gChannels.some(c => c.name === 'Kênh Việt G10')")
+            channel_id = page.evaluate("gChannels.find(c => c.name === 'Kênh Việt G10').id")
+            page.evaluate('id => openChannelEdit(id)', channel_id)
+            page.select_option('#ec-privacy','private')
+            page.select_option('#ec-made-for-kids','0')
+            page.select_option('#ec-altered-content','1')
+            page.locator('[onclick="saveChannelEdit()"]').click()
+            page.wait_for_function("gChannels.some(c => c.name === 'Kênh Việt G10' && c.altered_content === 1)")
+            with closing(database.get_conn()) as conn:
+                row = conn.execute('SELECT default_privacy,made_for_kids,altered_content FROM youtube_channels WHERE id=?',(channel_id,)).fetchone()
+            self.assertEqual(tuple(row),('private',0,1))
+            page.fill('#opt-name','Tùy chọn Việt G10')
+            page.fill('#opt-hashtags','')
+            page.fill('#opt-affiliate-cta','')
+            page.check('#opt-ai-label')
+            page.locator('[onclick="saveOptionGroup()"]').click(force=True)
+            page.wait_for_function("gOptions.some(o => o.name === 'Tùy chọn Việt G10')")
+            option_id = page.evaluate("gOptions.find(o => o.name === 'Tùy chọn Việt G10').id")
+            page.evaluate('id => editOptionGroup(id)', option_id)
+            self.assertEqual(page.input_value('#opt-hashtags'),'')
+            self.assertEqual(page.input_value('#opt-affiliate-cta'),'')
+            page.uncheck('#opt-ai-label')
+            page.locator('[onclick="saveOptionGroup()"]').click(force=True)
+            page.wait_for_function("gOptions.some(o => o.name === 'Tùy chọn Việt G10' && o.ai_label === 0)")
+            with closing(database.get_conn()) as conn:
+                row = conn.execute('SELECT append_hashtags,affiliate_CTA,made_for_kids,ai_label FROM upload_option_groups WHERE id=?',(option_id,)).fetchone()
+            self.assertEqual(tuple(row),('','',0,0))
+            self.assertEqual(dialogs,[])
+            browser.close()
+
+
+@unittest.skipUnless(os.environ.get('DHB_BROWSER_TESTS') == '1', 'Run in the browser CI job')
 class ProfileDomTests(unittest.TestCase):
     def test_profile_handlers_treat_names_as_data_after_rerender(self):
         from playwright.sync_api import sync_playwright

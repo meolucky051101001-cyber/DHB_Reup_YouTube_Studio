@@ -1217,7 +1217,7 @@ function editOptionGroup(id) {
   const aff = document.getElementById('opt-affiliate-enabled');
   if (aff) aff.checked = !!o.affiliate_enabled;
   set('opt-affiliate-url', o.affiliate_url || '');
-  set('opt-affiliate-cta', o.affiliate_CTA || '👉 Mua ngay sản phẩm chính hãng tại đây:');
+  set('opt-affiliate-cta', o.affiliate_CTA ?? '👉 Mua ngay sản phẩm chính hãng tại đây:');
   const pin = document.getElementById('opt-pin-enabled');
   if (pin) pin.checked = !!o.pin_comment_enabled;
   set('opt-pin-text', o.pin_comment_text || '');
