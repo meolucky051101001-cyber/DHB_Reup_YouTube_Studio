@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, field_validator
 
 from phase4_rules import normalize_group_names
+from metadata_intent import encode_intent, parse_channel_mode
 
 
 def _text(value):
@@ -89,6 +90,7 @@ class ChannelInput(ConfigInput):
     proxy: Text = ''
     oauth_token_json: Text = ''
     default_category_id: Category = '22'
+    studio_category_mode: Annotated[str, BeforeValidator(parse_channel_mode)] = 'legacy_unconfirmed'
     default_privacy: Annotated[Literal['public', 'unlisted', 'private'], BeforeValidator(_text)] = 'public'
     note: Text = ''
     status: Text = 'Ready'
@@ -123,6 +125,7 @@ class OptionInput(ConfigInput):
     made_for_kids: Flag = 0
     ai_label: Flag = 0
     disable_shorts_remix: Flag = 0
+    metadata_intent_json: Annotated[str, BeforeValidator(encode_intent)] = '{}'
 
     @field_validator('language')
     @classmethod

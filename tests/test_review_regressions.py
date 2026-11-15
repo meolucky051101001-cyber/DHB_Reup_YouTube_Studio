@@ -44,7 +44,7 @@ class ReviewRegressions(unittest.TestCase):
         with closing(database.get_conn()) as conn, conn:
             conn.execute("INSERT INTO projects(name) VALUES ('review')")
             for i in (901, 902):
-                conn.execute('INSERT INTO youtube_channels(id,name,channel_id) VALUES(?,?,?)',
+                conn.execute("INSERT INTO youtube_channels(id,name,channel_id,studio_category_mode) VALUES(?,?,?,'keep')",
                              (i, f'Channel {i}', 'UC' + ('a' if i == 901 else 'b') * 22))
                 conn.execute("INSERT INTO video_queue(id,project_name,title,target_type,target_channel_id,source_type,platform,input_video_path) VALUES(?,?,'Title','CHANNEL',?,'File','LocalFile',?)",
                              (i, 'review' if i == 901 else 'other', i, str(self.source)))

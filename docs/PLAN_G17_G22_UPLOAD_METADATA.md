@@ -1,6 +1,6 @@
 # Kế hoạch G17–G22: metadata đăng video và nghiệm thu offline
 
-Ngày lập: 15/11/2026. Trạng thái: **G17 đã triển khai và nghiệm thu offline trong nhánh phát triển; G18–G22 chưa triển khai**. Xem [biên bản G17](G17_UPLOAD_CAPABILITIES.md). Tiếp nối G13–G16 đã hoàn tất CRUD Dự án, Profile và Render Preset; runtime chưa đổi.
+Ngày lập: 15/11/2026. Trạng thái: **G17–G18 đã triển khai và nghiệm thu offline trong nhánh phát triển; G19–G22 chưa triển khai**. Xem [biên bản G17](G17_UPLOAD_CAPABILITIES.md) và [hợp đồng G18](G18_METADATA_INTENT.md). Tiếp nối G13–G16 đã hoàn tất CRUD Dự án, Profile và Render Preset; runtime chưa đổi.
 
 ## 1. Mục tiêu và phạm vi
 

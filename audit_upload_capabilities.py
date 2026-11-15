@@ -18,6 +18,8 @@ import subprocess
 import sys
 
 from group_distribution import choose_target_channel, resolve_target_candidates
+from metadata_intent import parse_intent
+from metadata_resolution import resolve_metadata
 from upload_capabilities import (UploadCapabilityError, capability_issues,
                                  legacy_option_requests, normalize_mode)
 
@@ -62,11 +64,8 @@ def _language_bucket(value):
 
 
 def _unconfirmed(option):
-    raw = option.get('metadata_intent_json')
-    if raw is None or raw == '':
-        return True
     try:
-        return json.loads(raw) == {} if isinstance(raw, str) else raw == {}
+        return parse_intent(option.get('metadata_intent_json', '{}')) == {}
     except (ValueError, TypeError):
         return False
 
@@ -97,11 +96,16 @@ def _schema(conn):
 def _options(conn):
     rows = {row['id']: dict(row) for row in conn.execute('SELECT * FROM upload_option_groups')}
     stats = {'total': len(rows), 'unconfirmed_intent': 0, 'restrictive_remix': 0,
+             'canonical_intent': 0, 'invalid_intent': 0,
              'remix_zero_unconfirmed': 0, 'pin_requested': 0,
              'invalid_flags': Counter(), 'language': Counter(), 'category': Counter()}
     for option in rows.values():
         legacy = _unconfirmed(option)
         stats['unconfirmed_intent'] += legacy
+        try:
+            stats['canonical_intent'] += bool(parse_intent(option.get('metadata_intent_json', '{}')))
+        except (ValueError, TypeError):
+            stats['invalid_intent'] += 1
         stats['restrictive_remix'] += _flag(option.get('disable_shorts_remix'))
         stats['remix_zero_unconfirmed'] += legacy and option.get('disable_shorts_remix') in (0, '0', False)
         stats['pin_requested'] += _flag(option.get('pin_comment_enabled'))
@@ -137,7 +141,9 @@ def _impact(conn, table, options):
               'unresolved_destination': 0, 'guard_affected': 0,
               'new_g17_guard_affected': 0, 'new_g17_guard_affected_nonterminal': 0,
               'guard_affected_by_code': Counter(), 'backend': Counter(),
-              'effective_category': Counter()}
+              'effective_category': Counter(), 'category_mode': Counter(),
+              'video_language_mode': Counter(), 'remix_mode': Counter(),
+              'with_effective_remix_disable': 0, 'metadata_unresolved': 0}
     if monitor:
         counts.update({'running': 0, 'mixed_backends': 0, 'candidate_evaluations': 0})
     else:
@@ -168,7 +174,7 @@ def _impact(conn, table, options):
         except (ValueError, TypeError, KeyError):
             counts['unresolved_destination'] += 1
             continue
-        modes, issues_seen, new_issue = set(), set(), False
+        modes, issues_seen, new_issue, effective_remix_disable = set(), set(), False, False
         for channel in candidates:
             mode = _mode(channel.get('upload_mode'))
             modes.add(mode)
@@ -178,12 +184,27 @@ def _impact(conn, table, options):
                 counts['candidate_evaluations'] += 1
             if mode == 'invalid':
                 issues_seen.add('UPLOAD_BACKEND_UNSUPPORTED')
+                counts['metadata_unresolved'] += 1
                 continue
             try:
-                metadata = {**item, **legacy_option_requests(option)}
-                issues = capability_issues(mode, metadata)
+                resolved = resolve_metadata(channel, option)
+                counts['category_mode'][resolved['category']['mode']] += 1
+                counts['video_language_mode'][resolved['video_language']['mode']] += 1
+                counts['remix_mode'][resolved['remix']['mode']] += 1
+                effective_remix_disable |= resolved['remix']['mode'] == 'disable'
             except UploadCapabilityError as exc:
+                counts['metadata_unresolved'] += 1
                 issues = exc.issues
+            else:
+                try:
+                    metadata = {**item, **legacy_option_requests(option),
+                                'studio_category_mode': resolved['category']['mode'],
+                                'video_language': resolved['video_language']['value']
+                                if resolved['video_language']['mode'] == 'apply' else None,
+                                'disable_shorts_remix': resolved['remix']['mode'] == 'disable'}
+                    issues = capability_issues(mode, metadata)
+                except UploadCapabilityError as exc:
+                    issues = exc.issues
             for issue in issues:
                 issues_seen.add(issue['code'])
                 new_issue |= _new_g17_issue(mode, issue)
@@ -195,6 +216,7 @@ def _impact(conn, table, options):
         for code in issues_seen:
             counts['guard_affected_by_code'][code] += 1
         counts['guard_affected'] += bool(issues_seen)
+        counts['with_effective_remix_disable'] += effective_remix_disable
         counts['new_g17_guard_affected'] += new_issue
         counts['new_g17_guard_affected_nonterminal'] += new_issue and (monitor or item['status'] not in TERMINAL)
     return counts
@@ -223,7 +245,7 @@ def audit(db):
             channels['total'] += 1
             channels['backend'][_mode(row['upload_mode'])] += 1
             channels['category'][_category_bucket(row['default_category_id'])] += 1
-        return {'report_version': 1, 'read_only': True, 'quick_check': 'ok', 'schema': schema,
+        return {'report_version': 2, 'read_only': True, 'quick_check': 'ok', 'schema': schema,
                 'options': option_stats, 'channels': channels,
                 'queue': _impact(conn, 'video_queue', options),
                 'monitors': _impact(conn, 'monitors', options),
@@ -232,6 +254,8 @@ def audit(db):
                     'Queue uses the current deterministic/assigned destination; Monitor checks every candidate.',
                     'Counts include historical rows; nonterminal excludes Completed and NeedsReview.',
                     'G17 new guard impact covers restrictive remix, Studio premiere and earlier Studio age rejection.',
+                    'guard_affected includes current G18 confirmation/canonical guards; new_g17 metrics exclude G18-only issues.',
+                    'Stored legacy remix counts and effective canonical remix counts are separate; mode counts are per candidate.',
                     'Legacy language values are unconfirmed, never treated as opt-in.',
                 ]}
     except sqlite3.Error:

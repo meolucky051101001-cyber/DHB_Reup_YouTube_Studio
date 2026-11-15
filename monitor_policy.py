@@ -4,6 +4,7 @@ import json
 
 from group_distribution import resolve_target_candidates
 from upload_capabilities import UploadCapabilityError, capability_issues, legacy_option_requests
+from metadata_resolution import resolve_metadata
 
 FIELDS = ('visibility', 'made_for_kids', 'altered_content')
 DEFAULT_POLICY = {'version': 1, 'visibility': 'inherit', 'made_for_kids': 'inherit', 'altered_content': 'inherit'}
@@ -48,9 +49,20 @@ def configuration(conn, target):
     bindings = []
     for channel in channels:
         binding = {key: value for key, value in channel.items() if key not in ('status', 'note', 'created_at', 'name', 'email', 'handle')}
+        # Additive migration must not change old API Monitor envelopes solely
+        # because an unconfirmed sentinel column now exists.
+        if binding.get('studio_category_mode') == 'legacy_unconfirmed':
+            binding.pop('studio_category_mode')
         profile = conn.execute('SELECT * FROM chrome_profiles WHERE name=?', (channel.get('profile_name') or '',)).fetchone()
         bindings.append({'channel': binding, 'profile': dict(profile) if profile else None})
-    revision = hashlib.sha256(encode({'target': target, 'groups': groups, 'bindings': bindings, 'options': options}).encode()).hexdigest()
+    revision_options = dict(options) if options else options
+    if revision_options and revision_options.get('metadata_intent_json') == '{}':
+        revision_options.pop('metadata_intent_json')
+    revision_data = {'target': target, 'groups': groups, 'bindings': bindings, 'options': revision_options}
+    if any(channel.get('studio_category_mode', 'legacy_unconfirmed') != 'legacy_unconfirmed' for channel in channels) or (
+            options and options.get('metadata_intent_json', '{}') != '{}'):
+        revision_data['metadata_effective'] = [resolve_metadata(channel, options) for channel in channels]
+    revision = hashlib.sha256(encode(revision_data).encode()).hexdigest()
     return channels, options, revision
 
 
@@ -87,10 +99,17 @@ def preview(conn, mon, raw_policy=None):
     for channel in channels:
         values, sources = effective(choices, channel, options)
         try:
-            issues = capability_issues(channel.get('upload_mode'), {**values, **legacy_option_requests(options)})
+            resolved = resolve_metadata(channel, options)
+            requests = {**values, **legacy_option_requests(options),
+                        'studio_category_mode': resolved['category']['mode'],
+                        'video_language': resolved['video_language']['value'] if resolved['video_language']['mode'] == 'apply' else None,
+                        'disable_shorts_remix': resolved['remix']['mode'] == 'disable'}
+            issues = capability_issues(channel.get('upload_mode'), requests)
         except UploadCapabilityError as exc:
             issues = exc.issues
+            resolved = None
         rows.append({'channel_id': channel['id'], 'channel_name': channel['name'], **values, 'sources': sources,
+                     'metadata_effective': resolved,
                      'blocked': bool(issues), 'reasons': [issue['message'] for issue in issues],
                      'reason_codes': [issue['code'] for issue in issues], 'capability_issues': issues})
     envelope = {'version': 1, 'choices': choices, 'context': target, 'revision': revision}

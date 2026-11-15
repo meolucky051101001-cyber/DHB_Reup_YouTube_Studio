@@ -111,7 +111,8 @@ class UploadCapabilityAuditTests(unittest.TestCase):
         report = audit_tool.audit(self.db)['queue']
         # Both backends block age; only Studio rejection has moved earlier in G17.
         self.assertEqual(report['new_g17_guard_affected'], 4)
-        self.assertEqual(report['guard_affected'], 5)
+        # G18 also blocks optionless legacy Studio job 5 until category is confirmed.
+        self.assertEqual(report['guard_affected'], 6)
         self.assertEqual(report['unresolved_destination'], 2)
 
     def test_studio_premiere_is_new_guard_but_api_premiere_is_existing(self):
@@ -137,6 +138,55 @@ class UploadCapabilityAuditTests(unittest.TestCase):
         self.assertIn('UPLOAD_METADATA_FLAG_INVALID', report['queue']['guard_affected_by_code'])
         self.assertIn('UPLOAD_BACKEND_UNSUPPORTED', report['queue']['guard_affected_by_code'])
         self.assertEqual(report['queue']['by_status']['Other'], 1)
+        self.assertNotIn(self.secret, json.dumps(report))
+
+    def test_canonical_keep_overrides_stored_flag_and_channel_choice_controls_optionless_jobs(self):
+        canonical = {'version': 1, 'studio_category_mode': 'keep',
+                     'video_language': {'mode': 'keep'}, 'remix': 'keep'}
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("ALTER TABLE upload_option_groups ADD COLUMN metadata_intent_json TEXT NOT NULL DEFAULT '{}'")
+            conn.execute("ALTER TABLE youtube_channels ADD COLUMN studio_category_mode TEXT NOT NULL DEFAULT 'legacy_unconfirmed'")
+            conn.execute('UPDATE upload_option_groups SET metadata_intent_json=? WHERE id=2', (json.dumps(canonical),))
+        report = audit_tool.audit(self.db)
+        self.assertEqual(report['report_version'], 2)
+        self.assertEqual(report['options']['restrictive_remix'], 1)  # Stored legacy evidence retained.
+        self.assertEqual(report['options']['canonical_intent'], 1)
+        self.assertEqual(report['queue']['with_restrictive_remix'], 2)
+        self.assertEqual(report['queue']['with_effective_remix_disable'], 0)
+        self.assertNotIn('UPLOAD_REMIX_UNSUPPORTED', report['queue']['guard_affected_by_code'])
+        self.assertEqual(report['queue']['guard_affected_by_code']['UPLOAD_CATEGORY_CONFIRMATION_REQUIRED'], 2)
+        self.assertEqual(report['queue']['new_g17_guard_affected'], 1)  # Age only; G18 confirmation excluded.
+        self.assertEqual(report['monitors']['guard_affected'], 0)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE youtube_channels SET studio_category_mode='keep' WHERE id=1")
+        report = audit_tool.audit(self.db)
+        self.assertNotIn('UPLOAD_CATEGORY_CONFIRMATION_REQUIRED', report['queue']['guard_affected_by_code'])
+        self.assertEqual(report['queue']['guard_affected'], 1)
+
+    def test_canonical_language_and_category_apply_are_counted_without_exposing_values(self):
+        canonical = {'version': 1, 'studio_category_mode': 'apply',
+                     'video_language': {'mode': 'apply', 'value': 'en-US'}, 'remix': 'disable'}
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("ALTER TABLE upload_option_groups ADD COLUMN metadata_intent_json TEXT NOT NULL DEFAULT '{}'")
+            conn.execute('UPDATE upload_option_groups SET metadata_intent_json=? WHERE id=1', (json.dumps(canonical),))
+        report = audit_tool.audit(self.db)
+        self.assertEqual(report['queue']['guard_affected_by_code']['UPLOAD_VIDEO_LANGUAGE_UNSUPPORTED'], 2)
+        self.assertEqual(report['queue']['guard_affected_by_code']['UPLOAD_CATEGORY_UNSUPPORTED'], 1)
+        self.assertEqual(report['queue']['with_legacy_vi'], 2)  # The canonical rows are no longer legacy.
+        self.assertEqual(report['queue']['with_effective_remix_disable'], 4)
+        self.assertEqual(report['queue']['video_language_mode']['apply'], 2)
+        self.assertNotIn(self.secret, json.dumps(report))
+        self.assertNotIn('en-US', json.dumps(report))
+
+    def test_malformed_canonical_intent_counts_failure_without_echoing_json(self):
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("ALTER TABLE upload_option_groups ADD COLUMN metadata_intent_json TEXT NOT NULL DEFAULT '{}'")
+            conn.execute('UPDATE upload_option_groups SET metadata_intent_json=? WHERE id=1',
+                         (json.dumps({'private': self.secret}),))
+        report = audit_tool.audit(self.db)
+        self.assertEqual(report['options']['invalid_intent'], 1)
+        self.assertEqual(report['queue']['guard_affected_by_code']['UPLOAD_METADATA_INTENT_INVALID'], 2)
+        self.assertEqual(report['queue']['metadata_unresolved'], 2)
         self.assertNotIn(self.secret, json.dumps(report))
 
     def test_missing_database_is_not_created(self):

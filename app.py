@@ -88,6 +88,7 @@ from app_instance_lock import AppInstanceAlreadyRunning, acquire_app_instance_lo
 from render_engine import normalize_render_speed
 from runtime_identity import capture_runtime, runtime_status
 from config_validation import parse_config_input, validate_config, validate_option_state
+from metadata_intent import MetadataIntentConflict, metadata_revision, prepare_channel_update, prepare_option_update
 from profile_crud import ProfileCreate, ProfileUpdate, binding_references
 from render_preset_validation import PresetCreate, PresetUpdate, validate_render_config, public_preset, preset_revision
 from monitor_validation import validate_monitor_create
@@ -4070,6 +4071,7 @@ def api_list_channels(profile: Optional[str] = None):
     channels = []
     for row in rows:
         channel = public_channel(row)
+        channel['metadata_revision'] = metadata_revision(row, 'channel')
         channel["group_names"] = group_map.get(int(row["id"])) or [str(row["group_name"] or "Mặc định")]
         channels.append(channel)
     conn.close()
@@ -4079,7 +4081,9 @@ def api_list_channels(profile: Optional[str] = None):
 @app.post("/api/channels")
 def api_create_channel(data: Dict[str, Any] = Body(...)):
     try:
+        supplied_fields = set(data)
         data = validate_config(data, 'channel', create=True)
+        data = prepare_channel_update({}, data, supplied_fields)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     name = data['name']
@@ -4157,6 +4161,15 @@ def api_update_channel(channel_id: int, data: Dict[str, Any] = Body(...)):
         row = conn.execute("SELECT * FROM youtube_channels WHERE id = ?", (channel_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Không tìm thấy kênh YouTube này.")
+        if ('expected_metadata_revision' in data
+                and data['expected_metadata_revision'] != metadata_revision(row, 'channel')):
+            raise HTTPException(409, 'Metadata của kênh đã đổi. Tải lại trước khi lưu để không ghi đè lựa chọn mới.')
+        try:
+            updates = prepare_channel_update(dict(row), updates, set(data))
+        except MetadataIntentConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         final = {**dict(row), **updates}
         if final['upload_mode'] == 'youtube_api' and {'upload_mode','oauth_token_json'} & updates.keys():
             _validate_channel_oauth(final)
@@ -4388,13 +4401,15 @@ def api_list_options():
     conn = get_conn()
     rows = conn.execute("SELECT * FROM upload_option_groups ORDER BY id ASC").fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [{**dict(row), 'metadata_revision': metadata_revision(row, 'option')} for row in rows]
 
 
 @app.post("/api/options")
 def api_create_option(data: Dict[str, Any] = Body(...)):
     try:
+        supplied_fields = set(data)
         data = validate_config(data, 'option', create=True)
+        data = prepare_option_update({}, data, supplied_fields)
         validate_option_state(data)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -4422,8 +4437,14 @@ def api_update_option(opt_id: int, data: Dict[str, Any] = Body(...)):
         row = conn.execute('SELECT * FROM upload_option_groups WHERE id=?', (opt_id,)).fetchone()
         if not row:
             raise HTTPException(404, 'Không tìm thấy bộ tùy chọn đăng này.')
+        if ('expected_metadata_revision' in data
+                and data['expected_metadata_revision'] != metadata_revision(row, 'option')):
+            raise HTTPException(409, 'Metadata của bộ tùy chọn đã đổi. Tải lại trước khi lưu để không ghi đè lựa chọn mới.')
         try:
+            updates = prepare_option_update(dict(row), updates, set(data))
             validate_option_state({**dict(row), **updates})
+        except MetadataIntentConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         cols = ', '.join(f'{key} = ?' for key in updates)
@@ -4434,10 +4455,14 @@ def api_update_option(opt_id: int, data: Dict[str, Any] = Body(...)):
 
 @app.delete("/api/options/{opt_id}")
 def api_delete_option(opt_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM upload_option_groups WHERE id = ?", (opt_id,))
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if not conn.execute('SELECT 1 FROM upload_option_groups WHERE id=?', (opt_id,)).fetchone():
+            raise HTTPException(404, 'Không tìm thấy bộ tùy chọn đăng.')
+        if (conn.execute('SELECT 1 FROM video_queue WHERE option_group_id=? LIMIT 1', (opt_id,)).fetchone()
+                or conn.execute('SELECT 1 FROM monitors WHERE option_group_id=? LIMIT 1', (opt_id,)).fetchone()):
+            raise HTTPException(409, 'Bộ tùy chọn đang được video hoặc Monitor sử dụng. Chọn lại cấu hình và xem trước các mục liên quan trước khi xóa để không mất yêu cầu metadata.')
+        conn.execute('DELETE FROM upload_option_groups WHERE id=?', (opt_id,))
     return {"ok": True}
 
 

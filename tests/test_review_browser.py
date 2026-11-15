@@ -6,6 +6,150 @@ from pathlib import Path
 
 @unittest.skipUnless(os.environ.get('DHB_BROWSER_TESTS') == '1', 'Run in the browser CI job')
 class ConfigBrowserTests(unittest.TestCase):
+    def test_metadata_choices_require_confirmation_and_preview_actual_values(self):
+        import json
+        import re
+        from contextlib import closing
+        from urllib.parse import urlsplit
+        from playwright.sync_api import sync_playwright
+        import database
+        import monitor_policy
+        from test_review_regressions import ReviewRegressions
+        fixture = ReviewRegressions()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        with closing(database.get_conn()) as conn, conn:
+            conn.execute("INSERT INTO chrome_profiles(name,path) VALUES('Offline metadata fixture','')")
+            option_id = conn.execute("INSERT INTO upload_option_groups(name,category_id,language,disable_shorts_remix) VALUES('Legacy metadata','27','en-US',1)").lastrowid
+            conn.execute('UPDATE video_queue SET option_group_id=? WHERE id=901', (option_id,))
+            conn.execute("UPDATE youtube_channels SET studio_category_mode='legacy_unconfirmed',profile_name='Offline metadata fixture' WHERE id=901")
+            monitor_id = conn.execute('INSERT INTO monitors(name,source_urls,target_channel_id,option_group_id,metadata_policy_json) VALUES(?,?,?,?,?)',
+                ('Metadata monitor', 'https://example.test/source', 901, option_id, monitor_policy.encode(monitor_policy.DEFAULT_POLICY))).lastrowid
+        def saved_option():
+            with closing(database.get_conn()) as conn:
+                return dict(conn.execute('SELECT * FROM upload_option_groups WHERE id=?', (option_id,)).fetchone())
+        root = Path(__file__).resolve().parents[1]
+        html = re.sub(r'<script\b[^>]*>.*?</script>', '', (root/'static/index.html').read_text(encoding='utf-8'), flags=re.S)
+        requests = []
+        def dispatch(route):
+            request = route.request
+            parsed = urlsplit(request.url)
+            if parsed.netloc != '127.0.0.1:8686':
+                route.abort()
+                return
+            if parsed.path == '/':
+                route.fulfill(status=200, content_type='text/html', body=html)
+                return
+            allowed = ('/api/auth', '/api/channels', '/api/groups', '/api/options', '/api/upload-capabilities', '/api/queue/preview-distribution', '/api/monitors', '/api/overview', '/static/')
+            if not parsed.path.startswith(allowed) or any(suffix in parsed.path for suffix in ('open-browser', 'check-oauth', '/toggle', 'metadata-confirm')):
+                route.abort()
+                return
+            requests.append((request.method, parsed.path, request.post_data))
+            response = fixture.client.request(request.method, parsed.path,
+                headers=dict(request.headers), content=request.post_data_buffer)
+            route.fulfill(status=response.status_code, headers=dict(response.headers), body=response.content)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.route('**/*', dispatch)
+                dialogs = []
+                page.on('dialog', lambda dialog: (dialogs.append(dialog.message), dialog.accept()))
+                page.goto('http://127.0.0.1:8686/')
+                page.add_script_tag(content=(root/'static/app.js').read_text(encoding='utf-8'))
+                page.add_style_tag(content='.tab-pane {display:block!important}')
+                page.evaluate('async () => { await loadGroups(); await loadChannels(); await loadOptions(); }')
+                page.evaluate('editOptionGroup', option_id)
+                self.assertFalse(page.is_checked('#opt-metadata-confirm'))
+                self.assertTrue(page.locator('#opt-remix').is_disabled())
+                self.assertEqual(page.input_value('#opt-category'), '27')
+                page.fill('#opt-name', 'Legacy renamed')
+                page.evaluate('saveOptionGroup()')
+                original = saved_option()
+                self.assertEqual((original['metadata_intent_json'], original['language'], original['disable_shorts_remix']), ('{}', 'en-US', 1))
+                mutation = [json.loads(body) for method, path, body in requests if method == 'PUT' and path == f'/api/options/{option_id}'][-1]
+                self.assertNotIn('metadata_intent_json', mutation)
+                page.evaluate('toggleMonitor', monitor_id)
+                self.assertTrue(any('Chưa thể bật Monitor' in message and 'UPLOAD_REMIX_UNSUPPORTED' in message for message in dialogs), dialogs)
+                self.assertFalse(any('metadata-confirm' in path for _, path, _ in requests))
+                page.evaluate('editOptionGroup', option_id)
+                page.check('#opt-metadata-confirm')
+                page.select_option('#opt-studio-category', 'inherit')
+                page.select_option('#opt-video-language-mode', 'keep')
+                page.select_option('#opt-remix', 'keep')
+                page.evaluate('saveOptionGroup()')
+                confirmed = saved_option()
+                self.assertEqual(json.loads(confirmed['metadata_intent_json']), {'version': 1, 'studio_category_mode': 'inherit', 'video_language': {'mode': 'keep'}, 'remix': 'keep'})
+                self.assertEqual(confirmed['language'], 'en-US')
+                self.assertEqual(confirmed['disable_shorts_remix'], 0)
+                page.evaluate('editOptionGroup', option_id)
+                page.fill('#opt-name', 'Confirmed renamed')
+                page.evaluate('saveOptionGroup()')
+                self.assertEqual(saved_option()['metadata_intent_json'], confirmed['metadata_intent_json'])
+                page.evaluate('openChannelEdit(901)')
+                self.assertEqual(page.input_value('#ec-studio-category'), 'legacy_unconfirmed')
+                page.select_option('#ec-studio-category', 'keep')
+                page.evaluate('saveChannelEdit()')
+                page.evaluate("async () => { const p = await apiFetch('/api/queue/preview-distribution', {method:'POST',body:JSON.stringify({ids:[901],do_download:false,do_render:false,do_upload:true})}); window.metadataPreview=p; void showDistributionDialog(p,'Kiểm tra metadata',true); }")
+                self.assertFalse(page.evaluate('metadataPreview.items[0].blocked'), {'preview': page.evaluate('metadataPreview'), 'dialogs': dialogs})
+                preview_text = page.locator('.upload-preview-dialog').inner_text()
+                self.assertIn('Danh mục: Giữ thiết lập bên YouTube · 27', preview_text)
+                self.assertIn('giá trị từ bộ tùy chọn; lựa chọn từ kênh', preview_text)
+                self.assertIn('Ngôn ngữ video: Giữ thiết lập bên YouTube', preview_text)
+                page.get_by_role('button', name='Đóng', exact=True).click()
+                page.evaluate('editOptionGroup', option_id)
+                page.check('#opt-metadata-confirm')
+                page.select_option('#opt-video-language-mode', 'apply')
+                page.fill('#opt-video-language', 'vi')
+                page.evaluate('saveOptionGroup()')
+                self.assertEqual(saved_option()['language'], 'vi')
+                page.evaluate("async () => { const p = await apiFetch('/api/queue/preview-distribution', {method:'POST',body:JSON.stringify({ids:[901],do_download:false,do_render:false,do_upload:true})}); window.metadataPreview=p; void showDistributionDialog(p,'Metadata chưa hỗ trợ',true); }")
+                self.assertTrue(page.evaluate('metadataPreview.items[0].blocked'))
+                self.assertIn('Ngôn ngữ video: Yêu cầu áp dụng · vi', page.locator('.upload-preview-dialog').inner_text())
+                self.assertEqual(page.locator('.upload-preview-dialog button[value="start"]').count(), 0)
+                page.get_by_role('button', name='Đóng', exact=True).click()
+                self.assertFalse(any('Lỗi lưu' in message for message in dialogs), dialogs)
+                page.evaluate('openChannelEdit(901)')
+                self.assertEqual(page.input_value('#ec-studio-category'), 'keep')
+                response = fixture.client.put('/api/channels/901', headers=fixture.headers, json={'studio_category_mode': 'apply'})
+                self.assertEqual(response.status_code, 200, response.text)
+                page.fill('#ec-note', 'Unrelated stale note')
+                page.evaluate('saveChannelEdit()')
+                with closing(database.get_conn()) as conn:
+                    channel_mode = conn.execute('SELECT studio_category_mode FROM youtube_channels WHERE id=901').fetchone()[0]
+                self.assertEqual(channel_mode, 'apply')
+                self.assertTrue(any('Lỗi lưu' in message for message in dialogs), dialogs)
+                channel_mutation = [json.loads(body) for method, path, body in requests if method == 'PUT' and path == '/api/channels/901'][-1]
+                self.assertTrue(channel_mutation['expected_metadata_revision'])
+                self.assertNotIn('studio_category_mode', channel_mutation)
+                page.evaluate('closeChannelEdit()')
+                page.evaluate('editOptionGroup', option_id)
+                loaded_revision = page.locator('#opt-id').get_attribute('data-metadata-revision')
+                restrictive = {'version': 1, 'studio_category_mode': 'inherit', 'video_language': {'mode': 'keep'}, 'remix': 'disable'}
+                response = fixture.client.put(f'/api/options/{option_id}', headers=fixture.headers, json={'metadata_intent_json': restrictive})
+                self.assertEqual(response.status_code, 200, response.text)
+                page.evaluate('loadOptions()')  # Refresh list must not update the open form's revision.
+                self.assertEqual(page.locator('#opt-id').get_attribute('data-metadata-revision'), loaded_revision)
+                page.check('#opt-metadata-confirm')
+                page.select_option('#opt-video-language-mode', 'keep')
+                page.select_option('#opt-remix', 'keep')
+                page.evaluate('saveOptionGroup()')
+                self.assertEqual(json.loads(saved_option()['metadata_intent_json']), restrictive)
+                self.assertIn('Lỗi lưu', dialogs[-1])
+                self.assertEqual(page.input_value('#ch-studio-category'), 'legacy_unconfirmed')
+                with closing(database.get_conn()) as conn, conn:
+                    conn.execute("UPDATE upload_option_groups SET metadata_intent_json='null' WHERE id=?", (option_id,))
+                page.evaluate('loadOptions()')
+                page.evaluate('editOptionGroup', option_id)
+                self.assertTrue(page.locator('#opt-metadata-confirm').is_disabled())
+                self.assertIn('Metadata đã lưu không hợp lệ', page.locator('#opt-metadata-state').inner_text())
+                calls_before = len([r for r in requests if r[0] == 'PUT'])
+                page.evaluate('saveOptionGroup()')
+                self.assertEqual(len([r for r in requests if r[0] == 'PUT']), calls_before)
+                self.assertEqual(saved_option()['metadata_intent_json'], 'null')
+            finally:
+                browser.close()
+
     def test_upload_capabilities_show_limits_and_clear_stale_support_on_failure(self):
         import copy
         import json

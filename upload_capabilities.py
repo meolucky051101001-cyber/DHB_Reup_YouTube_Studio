@@ -67,7 +67,7 @@ def capability_matrix():
                 ['youtube_uploader.py:upload_via_playwright_studio'],
                 can_set=api, offline_verified=api, enabled=api),
             'video_language': _feature('Ngôn ngữ video',
-                'Ngôn ngữ cũ chỉ được lưu, chưa xác nhận ý định áp dụng; chưa bật đặt ngôn ngữ video.',
+                'Có thể lưu lựa chọn ngôn ngữ video rõ ràng, nhưng thao tác đặt và đọc lại chưa bật. Giá trị cũ không tự trở thành yêu cầu áp dụng.',
                 ['config_validation.py:validate_config', 'youtube_uploader.py:build_final_metadata']),
             'remix': _feature('Quyền remix',
                 'Chưa hỗ trợ đặt và đọc lại quyền remix. Yêu cầu cấm remix sẽ chặn đăng; chỉ bỏ yêu cầu khi bạn chủ động chấp nhận.',
@@ -111,12 +111,23 @@ def capability_issues(mode, metadata):
             'remix': normalize_flag(metadata.get('disable_shorts_remix'), 'remix'),
             # This explicit adapter field is distinct from an unconfirmed legacy language.
             'video_language': bool(metadata.get('video_language')),
+            'category': mode == 'youtube_api',
         }
     except UploadCapabilityError as exc:
         return exc.issues
     features = capability_matrix()[mode]['features']
-    return [dict(code=f'UPLOAD_{key.upper()}_UNSUPPORTED', feature=key, message=features[key]['reason'])
-            for key, requested in requests.items() if requested and not features[key]['enabled']]
+    issues = [dict(code=f'UPLOAD_{key.upper()}_UNSUPPORTED', feature=key, message=features[key]['reason'])
+              for key, requested in requests.items() if requested and not features[key]['enabled']]
+    if mode == 'playwright':
+        category_mode = metadata.get('studio_category_mode', 'legacy_unconfirmed')
+        if category_mode == 'legacy_unconfirmed':
+            issues.append(dict(code='UPLOAD_CATEGORY_CONFIRMATION_REQUIRED', feature='category',
+                               message='Danh mục Studio chưa được xác nhận. Chọn giữ thiết lập YouTube hoặc yêu cầu áp danh mục trong kênh/bộ tùy chọn, rồi xem trước lại.'))
+        elif category_mode == 'apply' and not features['category']['enabled']:
+            issues.append(dict(code='UPLOAD_CATEGORY_UNSUPPORTED', feature='category', message=features['category']['reason']))
+        elif category_mode not in ('keep', 'apply'):
+            issues.append(dict(code='UPLOAD_CATEGORY_MODE_INVALID', feature='category', message='Ý định danh mục Studio không hợp lệ; cần xác nhận lại cấu hình.'))
+    return issues
 
 
 def require_capabilities(mode, metadata):

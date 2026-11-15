@@ -24,6 +24,7 @@ from youtube_uploader import (
     UploadNotSent, upload_video_to_youtube, validate_upload_preflight, normalize_published_video_url,
 )
 from upload_capabilities import UploadCapabilityError
+from metadata_resolution import resolve_metadata
 from content_identity import normalize_source_url, sha256_file, source_dedupe_key
 from group_distribution import choose_target_channel, target_group_names
 from upload_approval import PreviewStale, approval_item, asset_stamps, encode, upload_source_path
@@ -1200,6 +1201,8 @@ class PipelineManager:
                     entry["upload_mode"] = channel.get("upload_mode") or "playwright"
                     option_id = item.get("option_group_id")
                     option = conn.execute("SELECT * FROM upload_option_groups WHERE id = ?", (option_id,)).fetchone() if option_id else None
+                    entry['metadata_effective'] = resolve_metadata(channel, dict(option) if option else None)
+                    entry['warnings'].extend(entry['metadata_effective']['warnings'])
                     if options[2]:
                         metadata = validate_upload_preflight(item, channel, dict(option) if option else None)
                         entry["title"] = metadata["title"]
@@ -1625,6 +1628,8 @@ class PipelineManager:
                         c_opt.close()
                     if og_row:
                         option_group = dict(og_row)
+                    else:
+                        raise PreviewStale('Bộ tùy chọn của video không còn tồn tại; cần chọn lại trước khi đăng.')
                 validate_upload_preflight(item, channel, option_group)
 
             input_path = item.get("input_video_path") or ""

@@ -165,7 +165,7 @@ class UrlAndChecksTests(unittest.TestCase):
         page = mock.Mock(url="https://studio.youtube.com/")
         page.locator.return_value.first.count.return_value = 0
         session = mock.Mock(page=page)
-        metadata = {"title": "Pilot", "upload_to": "Video"}
+        metadata = {"title": "Pilot", "upload_to": "Video", "studio_category_mode": "keep"}
         with mock.patch.object(yu, "get_settings", return_value={}), \
                 mock.patch.object(yu, "_channel_antidetect_id", return_value="test-profile"), \
                 mock.patch.object(yu, "_StudioBrowserSession") as browser, \

@@ -1164,6 +1164,7 @@ async function addChannel() {
     profile_path: document.getElementById('ch-prof-path').value,
     proxy: document.getElementById('ch-proxy').value,
     default_category_id: document.getElementById('ch-cat').value,
+    studio_category_mode: document.getElementById('ch-studio-category').value,
     oauth_token_json: document.getElementById('ch-oauth').value,
     use_hidden_desktop: document.getElementById('ch-hidden').checked,
   };
@@ -1306,6 +1307,48 @@ function resetOptionForm() {
   set('opt-made-for-kids', '0');
   const ai = document.getElementById('opt-ai-label');
   if (ai) ai.checked = false;
+  loadOptionMetadataIntent({});
+}
+
+function toggleOptionMetadataIntent() {
+  document.getElementById('opt-metadata-fields').disabled = !document.getElementById('opt-metadata-confirm').checked;
+}
+
+function loadOptionMetadataIntent(option) {
+  document.getElementById('opt-id').dataset.metadataRevision = option.metadata_revision || '';
+  let intent = {};
+  let valid = true;
+  try {
+    intent = JSON.parse(option.metadata_intent_json ?? '{}');
+    valid = intent !== null && typeof intent === 'object' && !Array.isArray(intent);
+    if (valid && Object.keys(intent).length) {
+      const language = intent.video_language;
+      valid = intent.version === 1 && Object.keys(intent).sort().join(',') === 'remix,studio_category_mode,version,video_language' &&
+        ['inherit', 'keep', 'apply'].includes(intent.studio_category_mode) && ['keep', 'disable'].includes(intent.remix) &&
+        language && typeof language === 'object' && !Array.isArray(language) &&
+        ((language.mode === 'keep' && Object.keys(language).join(',') === 'mode') ||
+          (language.mode === 'apply' && Object.keys(language).sort().join(',') === 'mode,value' &&
+            typeof language.value === 'string' && /^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/.test(language.value) && language.value.length <= 64));
+    }
+  } catch (_) { valid = false; }
+  const confirm = document.getElementById('opt-metadata-confirm');
+  confirm.disabled = !valid;
+  confirm.checked = false;
+  document.getElementById('opt-metadata-fields').disabled = true;
+  if (!valid) {
+    document.getElementById('opt-metadata-state').textContent = 'Metadata đã lưu không hợp lệ. Không thể suy ra lựa chọn hoặc lưu lại bản ghi này; cần kiểm tra dữ liệu trước khi tiếp tục.';
+    for (const id of ['opt-studio-category', 'opt-video-language-mode', 'opt-video-language', 'opt-remix']) document.getElementById(id).value = '';
+    return;
+  }
+  const confirmed = intent.version === 1;
+  toggleOptionMetadataIntent();
+  document.getElementById('opt-studio-category').value = intent.studio_category_mode || 'inherit';
+  document.getElementById('opt-video-language-mode').value = intent.video_language?.mode || 'keep';
+  document.getElementById('opt-video-language').value = intent.video_language?.value || option.language || '';
+  document.getElementById('opt-remix').value = intent.remix || (option.disable_shorts_remix ? 'disable' : 'keep');
+  document.getElementById('opt-metadata-state').textContent = confirmed
+    ? 'Đã có lựa chọn metadata được xác nhận. Sửa tên giữ nguyên lựa chọn; tích xác nhận để cập nhật metadata.'
+    : `Metadata chưa xác nhận. Ngôn ngữ cũ: ${option.language || 'chưa có'}; yêu cầu cấm remix cũ: ${option.disable_shorts_remix ? 'Có (sẽ chặn đăng)' : 'Không'}. Sửa tên giữ nguyên dữ liệu cũ.`;
 }
 
 function editOptionGroup(id) {
@@ -1323,15 +1366,28 @@ function editOptionGroup(id) {
   set('opt-pin-text', o.pin_comment_text || '');
   set('opt-hashtags', o.append_hashtags || '');
   set('opt-default-tags', o.default_tags || '');
-  set('opt-category', o.category_id || '22');
+  const categorySelect = document.getElementById('opt-category');
+  const category = String(o.category_id || '22');
+  if (!Array.from(categorySelect.options).some(option => option.value === category)) {
+    const option = document.createElement('option');
+    option.value = category;
+    option.textContent = `${category} - (hiện tại)`;
+    categorySelect.appendChild(option);
+  }
+  set('opt-category', category);
   set('opt-made-for-kids', o.made_for_kids ? '1' : '0');
   const ai = document.getElementById('opt-ai-label');
   if (ai) ai.checked = !!o.ai_label;
+  loadOptionMetadataIntent(o);
   const nameEl = document.getElementById('opt-name');
   if (nameEl) nameEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 async function saveOptionGroup() {
+  if (document.getElementById('opt-metadata-confirm').disabled) {
+    alert('Metadata đã lưu không hợp lệ; cần kiểm tra dữ liệu trước khi lưu.');
+    return;
+  }
   const idRaw = document.getElementById('opt-id').value;
   const name = document.getElementById('opt-name').value.trim();
   if (!name) {
@@ -1351,9 +1407,20 @@ async function saveOptionGroup() {
     made_for_kids: document.getElementById('opt-made-for-kids').value === '1',
     ai_label: document.getElementById('opt-ai-label').checked,
   };
+  const metadataRevision = document.getElementById('opt-id').dataset.metadataRevision;
+  if (idRaw && metadataRevision) payload.expected_metadata_revision = metadataRevision;
   if (payload.affiliate_enabled && !payload.affiliate_url) {
     alert('Đã bật Affiliate nhưng chưa nhập link Shopee.');
     return;
+  }
+  if (document.getElementById('opt-metadata-confirm').checked) {
+    const languageMode = document.getElementById('opt-video-language-mode').value;
+    const videoLanguage = languageMode === 'apply'
+      ? { mode: 'apply', value: document.getElementById('opt-video-language').value.trim() }
+      : { mode: 'keep' };
+    payload.metadata_intent_json = JSON.stringify({ version: 1,
+      studio_category_mode: document.getElementById('opt-studio-category').value,
+      video_language: videoLanguage, remix: document.getElementById('opt-remix').value });
   }
   try {
     if (idRaw) {
@@ -1371,7 +1438,7 @@ async function saveOptionGroup() {
 
 async function deleteOptionGroup(id) {
   const o = gOptions.find(x => x.id === id);
-  if (!confirm(`Xóa bộ tùy chọn "${o ? o.name : '#' + id}"? Các video đang gán bộ này sẽ dùng cấu hình mặc định của kênh.`)) return;
+  if (!confirm(`Xóa bộ tùy chọn "${o ? o.name : '#' + id}"? Bộ đang được video hoặc Monitor sử dụng sẽ bị chặn xóa. Hãy xem lại cấu hình và gỡ liên kết trước.`)) return;
   try {
     await apiFetch(`/api/options/${id}`, { method: 'DELETE' });
     if (document.getElementById('opt-id').value === String(id)) resetOptionForm();
@@ -1395,11 +1462,16 @@ async function openChannelEdit(id) {
 
   document.getElementById('ec-id').textContent = c.id;
   set('ec-id-val', c.id);
+  document.getElementById('ec-id-val').dataset.metadataRevision = c.metadata_revision || '';
   set('ec-name', c.name || '');
   set('ec-handle', c.handle || '');
   set('ec-channel-id', c.channel_id || '');
   set('ec-email', c.email || '');
   set('ec-mode', c.upload_mode || 'playwright');
+  set('ec-studio-category', c.studio_category_mode || 'legacy_unconfirmed');
+  document.getElementById('ec-studio-category').dataset.originalValue = c.studio_category_mode || 'legacy_unconfirmed';
+  document.getElementById('ec-studio-category').dataset.originalCategory = String(c.default_category_id || '22');
+  document.querySelector('#ec-studio-category option[value="legacy_unconfirmed"]').disabled = Boolean(c.studio_category_mode && c.studio_category_mode !== 'legacy_unconfirmed');
   set('ec-profile-name', c.profile_name || '');
   set('ec-profile-path', c.profile_path || '');
   set('ec-proxy', c.proxy || '');
@@ -1521,6 +1593,12 @@ async function saveChannelEdit() {
     emulate_mobile: document.getElementById('ec-emulate-mobile').checked,
     use_hidden_desktop: document.getElementById('ec-hidden').checked,
   };
+  const categoryMode = document.getElementById('ec-studio-category');
+  const metadataRevision = document.getElementById('ec-id-val').dataset.metadataRevision;
+  if (metadataRevision) payload.expected_metadata_revision = metadataRevision;
+  if (categoryMode.value !== categoryMode.dataset.originalValue || payload.default_category_id !== categoryMode.dataset.originalCategory) {
+    payload.studio_category_mode = categoryMode.value;
+  }
   const oauthVal = document.getElementById('ec-oauth').value.trim();
   if (oauthVal) payload.oauth_token_json = oauthVal;
   if (!payload.profile_name) {
@@ -2866,6 +2944,21 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
   }
 }
 
+function effectiveMetadataLines(metadata) {
+  if (!metadata) return ['Chưa xác định metadata hiệu lực.'];
+  const sources = { option: 'bộ tùy chọn', channel: 'kênh', fallback: 'mặc định', legacy_option: 'dữ liệu cũ', api_default: 'hành vi API hiện có' };
+  const modes = { keep: 'Giữ thiết lập bên YouTube', apply: 'Yêu cầu áp dụng', disable: 'Yêu cầu không cho remix', legacy_unconfirmed: 'Chưa xác nhận', inherit: 'Kế thừa' };
+  return ['category', 'video_language', 'remix'].map(key => {
+    const item = metadata[key];
+    if (!item) return `${key}: chưa xác định`;
+    const name = { category: 'Danh mục', video_language: 'Ngôn ngữ video', remix: 'Remix' }[key];
+    const value = item.value == null || key === 'remix' ? '' : ` · ${String(item.value)}`;
+    const origin = sources[item.source] || 'chưa xác định';
+    const intent = item.intent_source ? `; lựa chọn từ ${sources[item.intent_source] || 'chưa xác định'}` : '';
+    return `${name}: ${modes[item.mode] || 'Chưa xác định'}${value} (giá trị từ ${origin}${intent})`;
+  });
+}
+
 function showDistributionDialog(preview, operation, allowStart = false) {
   if (document.querySelector('.upload-preview-dialog[open]')) return Promise.resolve(false);
 
@@ -2905,6 +2998,7 @@ function showDistributionDialog(preview, operation, allowStart = false) {
           ${detail('Profile', item.profile_name || 'Chưa xác định', item.antidetect_profile_id)}
           ${file ? detail('File', file) : ''}
           ${group}
+          ${item.metadata_effective ? `<div><dt>Metadata hiệu lực</dt><dd style="white-space:pre-line">${escapeHtml(effectiveMetadataLines(item.metadata_effective).join('\n'))}</dd></div>` : ''}
         </dl>
         ${notes.length ? `<ul class="upload-preview-notes">${notes.join('')}</ul>` : ''}
       </li>`;
@@ -3512,7 +3606,11 @@ async function toggleMonitor(id) {
     if (current && !current.is_running) {
       const preview = await apiFetch(`/api/monitors/${id}/metadata-preview`);
       const sourceLabel = { monitor: 'monitor', option: 'bộ tùy chọn', channel: 'kênh' };
-      const lines = preview.channels.map(c => `${c.channel_name}: ${c.visibility} (${sourceLabel[c.sources.visibility]}), Trẻ em: ${c.made_for_kids ? 'Có' : 'Không'} (${sourceLabel[c.sources.made_for_kids]}), AI: ${c.altered_content ? 'Có' : 'Không'} (${sourceLabel[c.sources.altered_content]})`);
+      const lines = preview.channels.map(c => `${c.channel_name}: ${c.visibility} (${sourceLabel[c.sources.visibility]}), Trẻ em: ${c.made_for_kids ? 'Có' : 'Không'} (${sourceLabel[c.sources.made_for_kids]}), AI: ${c.altered_content ? 'Có' : 'Không'} (${sourceLabel[c.sources.altered_content]})\n${effectiveMetadataLines(c.metadata_effective).join('\n')}\n${(c.reasons || []).map((reason, i) => `Bị chặn [${c.reason_codes?.[i] || 'UPLOAD_BLOCKED'}]: ${reason}`).join('\n')}`);
+      if (preview.blocked || preview.channels.some(c => c.blocked)) {
+        alert(`Chưa thể bật Monitor. Sửa cấu hình các kênh rồi xem trước lại:\n\n${lines.join('\n\n')}`);
+        return;
+      }
       if (!confirm(`Xác nhận metadata trước khi bật monitor:\n\n${lines.join('\n')}\n\nThay đổi cấu hình sau xác nhận sẽ chặn các lượt đăng tiếp theo.`)) return;
       await apiFetch(`/api/monitors/${id}/metadata-confirm`, { method: 'POST', body: JSON.stringify({ policy: preview.policy, revision: preview.revision }) });
     }

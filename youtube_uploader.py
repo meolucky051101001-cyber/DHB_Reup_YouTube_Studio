@@ -16,6 +16,7 @@ from config import APP_PROFILES_DIR
 from database import add_log, get_settings
 from scanner_downloader import probe_video_info
 from upload_approval import upload_source_path
+from metadata_resolution import resolve_metadata
 from upload_capabilities import (
     capability_matrix, legacy_option_requests, normalize_flag, normalize_mode, require_capabilities,
 )
@@ -219,6 +220,7 @@ def build_final_metadata(
         else (option_group.get("made_for_kids") if option_group is not None else channel.get("made_for_kids", 0))
     )
     option_requests = legacy_option_requests(option_group)
+    resolved = resolve_metadata(channel, option_group)
     age_restriction = normalize_flag(video_item.get("age_restriction", 0), 'age_restriction')
     if made_for_kids and age_restriction:
         raise ValueError(
@@ -234,9 +236,7 @@ def build_final_metadata(
         "description": desc,
         "upload_to": upload_to,
         "tags": tags_list[:25],
-        "category_id": (option_group.get("category_id") if option_group else None)
-        or channel.get("default_category_id")
-        or "22",
+        "category_id": resolved['category']['value'],
         "made_for_kids": made_for_kids,
         "age_restriction": age_restriction,
         "altered_content": bool(
@@ -260,6 +260,11 @@ def build_final_metadata(
         "resolution": str(video_item.get("resolution") or "1080p"),
         "channel_name": channel.get("name", ""),
         **option_requests,
+        "language_intent": resolved['video_language']['mode'],
+        "metadata_effective": resolved,
+        "studio_category_mode": resolved['category']['mode'],
+        "video_language": resolved['video_language']['value'] if resolved['video_language']['mode'] == 'apply' else None,
+        "disable_shorts_remix": resolved['remix']['mode'] == 'disable',
     }
 
 

@@ -24,7 +24,7 @@ class CapabilityGuardTests(unittest.TestCase):
                 with self.subTest(mode=mode, language=value):
                     metadata = yu.build_final_metadata(
                         {'title': 'Fixture', 'visibility': 'private'},
-                        {'channel_id': CHANNEL_ID, 'upload_mode': mode},
+                        {'channel_id': CHANNEL_ID, 'upload_mode': mode, 'studio_category_mode': 'keep'},
                         {'language': value, 'disable_shorts_remix': 0},
                     )
                     self.assertEqual(metadata['language_intent'], 'legacy_unconfirmed')
@@ -37,6 +37,7 @@ class CapabilityGuardTests(unittest.TestCase):
         for value in (None, '', False, 0, '0', 'false'):
             with self.subTest(value=value):
                 metadata = capabilities.legacy_option_requests({'disable_shorts_remix': value})
+                metadata['studio_category_mode'] = 'keep'
                 self.assertFalse(metadata['disable_shorts_remix'])
                 self.assertEqual(capabilities.capability_issues('playwright', metadata), [])
 
@@ -49,8 +50,8 @@ class CapabilityGuardTests(unittest.TestCase):
                     option = {'pin_comment_enabled': value, 'pin_comment_text': 'Retained comment',
                               'disable_shorts_remix': value}
                     original_option = dict(option)
-                    channel = {'channel_id': CHANNEL_ID, 'upload_mode': mode}
-                    raw = {**item, **capabilities.legacy_option_requests(option)}
+                    channel = {'channel_id': CHANNEL_ID, 'upload_mode': mode, 'studio_category_mode': 'keep'}
+                    raw = {**item, **capabilities.legacy_option_requests(option), 'studio_category_mode': 'keep'}
                     metadata = yu.build_final_metadata(item, channel, option)
                     self.assertEqual(capabilities.capability_issues(mode, raw), [])
                     self.assertEqual(capabilities.capability_issues(mode, metadata), [])
@@ -77,8 +78,8 @@ class CapabilityGuardTests(unittest.TestCase):
                         item = {'title': 'Fixture', 'visibility': 'private'}
                         option = {}
                         (item if origin == 'video' else option)[field] = value
-                        channel = {'channel_id': CHANNEL_ID, 'upload_mode': mode}
-                        raw = {metadata_field: value}
+                        channel = {'channel_id': CHANNEL_ID, 'upload_mode': mode, 'studio_category_mode': 'keep'}
+                        raw = {metadata_field: value, 'studio_category_mode': 'keep'}
                         expected = capabilities.capability_issues(mode, raw)[0]
                         self.assertEqual(expected['code'], 'UPLOAD_METADATA_FLAG_INVALID')
                         with mock.patch.object(yu, 'get_oauth_token_local_status') as oauth, \
@@ -119,7 +120,7 @@ class CapabilityGuardTests(unittest.TestCase):
         for mode, requested, option in cases:
             with self.subTest(mode=mode, requested=requested, option=option):
                 item = {'title': 'Fixture', 'visibility': 'private', **requested}
-                channel = {'channel_id': CHANNEL_ID, 'upload_mode': mode}
+                channel = {'channel_id': CHANNEL_ID, 'upload_mode': mode, 'studio_category_mode': 'keep'}
                 metadata = yu.build_final_metadata(item, channel, option)
                 issue = capabilities.capability_issues(mode, metadata)[0]
                 with mock.patch.object(yu, 'get_oauth_token_local_status') as oauth, \

@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from content_identity import normalize_source_url
 from phase4_rules import GROUP_SCHEMA_VERSION, normalize_group_names, serialize_group_names
 from upload_approval import init_approval_schema
+from metadata_intent_schema import preflight_metadata_intent_schema, migrate_metadata_intent_schema
 
 from config import (
     APP_DATA_DIR,
@@ -129,6 +130,11 @@ def _fix_video_queue_emulate_default(conn, cur) -> bool:
 
 def init_db():
     conn = get_conn()
+    try:
+        preflight_metadata_intent_schema(conn)
+    except Exception:
+        conn.close()
+        raise
     cur = conn.cursor()
 
     # 1. Bảng Nhóm Kênh (Channel Groups)
@@ -487,6 +493,12 @@ def init_db():
 
     # Sửa default legacy 1 -> 0 (Monitor và mọi INSERT thiếu cột phải chạy Desktop)
     emulate_default_fixed = _fix_video_queue_emulate_default(conn, cur)
+    try:
+        migrate_metadata_intent_schema(conn)
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
     init_approval_schema(conn)
     conn.execute("INSERT OR IGNORE INTO app_schema_versions (schema_key, version) VALUES ('upload_hardening', 1)")
 

@@ -27,7 +27,7 @@ class UploadHardeningTests(unittest.TestCase):
         self.video = Path(temp.name) / "fixture.mp4"
         self.video.write_bytes(b"mock uploader fixture")
         with closing(database.get_conn()) as conn, conn:
-            conn.execute("INSERT INTO youtube_channels (id, name, channel_id) VALUES (901, 'First', ?)", ("UC" + "a" * 22,))
+            conn.execute("INSERT INTO youtube_channels (id, name, channel_id,studio_category_mode) VALUES (901, 'First', ?,'keep')", ("UC" + "a" * 22,))
             conn.execute(
                 "INSERT INTO video_queue (id, project_name, title, target_type, target_channel_id, source_type, input_video_path) "
                 "VALUES (901, 'test', 'Video', 'CHANNEL', 901, 'file', ?)", (str(self.video),),

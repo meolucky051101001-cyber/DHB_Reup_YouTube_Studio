@@ -944,6 +944,14 @@
             </div>
           </div>
           <div class="form-group">
+            <label for="ch-studio-category">Danh mục khi đăng qua Studio:</label>
+            <select id="ch-studio-category">
+              <option value="legacy_unconfirmed">Chưa xác nhận — cần xem lại trước khi đăng Studio</option>
+              <option value="keep">Giữ danh mục hiện có bên YouTube</option>
+              <option value="apply">Yêu cầu áp dụng danh mục — hiện chặn đăng do chưa hỗ trợ</option>
+            </select>
+          </div>
+          <div class="form-group">
             <label>OAuth2 Token JSON / Access Token (Chỉ cần nếu chọn chế độ YouTube Data API v3):</label>
             <textarea id="ch-oauth" rows="2" placeholder='{"client_id":"...","client_secret":"...","refresh_token":"..."}'></textarea>
           </div>
@@ -1064,6 +1072,32 @@
                 <input type="checkbox" id="opt-ai-label" />
                 🤖 Gắn nhãn nội dung AI mặc định
               </label>
+            </div>
+            <div class="form-group">
+              <p id="opt-metadata-state" role="status">Metadata chưa xác nhận; lưu tên không tự áp dụng lựa chọn mới.</p>
+              <label><input type="checkbox" id="opt-metadata-confirm" onchange="toggleOptionMetadataIntent()" /> Xác nhận lưu các lựa chọn metadata bên dưới</label>
+              <fieldset id="opt-metadata-fields" disabled style="border:1px solid var(--border); padding:10px;">
+                <legend>Ý định áp dụng khi đăng</legend>
+                <label for="opt-studio-category">Danh mục Studio:</label>
+                <select id="opt-studio-category">
+                  <option value="inherit">Kế thừa lựa chọn danh mục Studio của kênh</option>
+                  <option value="keep">Giữ danh mục hiện có bên YouTube</option>
+                  <option value="apply">Yêu cầu áp dụng danh mục — chưa hỗ trợ, sẽ chặn đăng</option>
+                </select>
+                <label for="opt-video-language-mode">Ngôn ngữ nói trong video:</label>
+                <select id="opt-video-language-mode">
+                  <option value="keep">Giữ thiết lập hiện có bên YouTube</option>
+                  <option value="apply">Yêu cầu đặt ngôn ngữ — chưa bật, sẽ chặn đăng</option>
+                </select>
+                <label for="opt-video-language">Mã ngôn ngữ khi yêu cầu đặt:</label>
+                <input id="opt-video-language" type="text" placeholder="vi, en hoặc en-US" maxlength="64" />
+                <label for="opt-remix">Quyền remix:</label>
+                <select id="opt-remix">
+                  <option value="keep">Giữ thiết lập hiện có bên YouTube</option>
+                  <option value="disable">Yêu cầu không cho remix — chưa hỗ trợ, sẽ chặn đăng</option>
+                </select>
+                <p style="font-size:11.5px; color:var(--text-muted)">Giữ nguyên remix không có nghĩa cho phép remix. Nếu bỏ yêu cầu cấm đã lưu, bạn cần chủ động chọn giữ nguyên và xác nhận lại. Danh mục qua API vẫn áp dụng giá trị ở trên.</p>
+              </fieldset>
             </div>
             <button class="btn btn-success" style="width:100%" onclick="saveOptionGroup()">💾 Lưu Bộ Tùy Chọn</button>
           </div>
@@ -1805,6 +1839,16 @@
               <option value="20">20 - Gaming</option>
               <option value="1">1 - Film &amp; Animation</option>
               <option value="10">10 - Music</option>
+            </select>
+          </div>
+        </div>
+        <div class="row-inline form-group">
+          <div>
+            <label for="ec-studio-category">Danh mục khi đăng qua Studio:</label>
+            <select id="ec-studio-category">
+              <option value="legacy_unconfirmed">Chưa xác nhận — cần xem lại trước khi đăng Studio</option>
+              <option value="keep">Giữ danh mục hiện có bên YouTube</option>
+              <option value="apply">Yêu cầu áp dụng danh mục — hiện chặn đăng do chưa hỗ trợ</option>
             </select>
           </div>
         </div>
