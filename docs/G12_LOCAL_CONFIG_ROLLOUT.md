@@ -1,6 +1,6 @@
 # G12 — Triển khai local G10–G11
 
-Đã triển khai commit `10f236e626bd0deb0ecb30bdbf6de9107c4793ee`, build `2026.11.15-monitor-validation`, lên nhánh local `codex/local-config-validation-20261115`. Dashboard: `http://127.0.0.1:8686`. Giữ nhánh local trước để rollback. Các PR được xếp chồng, không tự merge; toàn bộ nghiệm thu offline, không gửi video/bình luận thật.
+Đã triển khai commit cuối `6cedb16407f6d075c81f4ab61f96f4249925c361`, build `2026.11.15-monitor-validation.1`, lên nhánh local `codex/local-config-validation-cleanup-20261115`. Dashboard: `http://127.0.0.1:8686`. Giữ nhánh local trước để rollback. Các PR được xếp chồng, không tự merge; toàn bộ nghiệm thu offline, không gửi video/bình luận thật.
 
 ## Kết quả
 
@@ -9,9 +9,9 @@
 - Kiểm tra dữ liệu cũ chỉ đọc: 16 kênh và 3 bộ tùy chọn hợp lệ với schema mới. Không suy ra ý định gốc để tự sửa cờ đã lưu từ trước.
 - Xác minh PID/cwd/port của app cũ, checkout sạch, không có queue claim/monitor/slot upload hoạt động; giữ app lock khi backup và chuyển code. Backup nhất quán và rehearsal migration/restore đạt.
 - Sau restart, tất cả trường của 9 bảng giữ nguyên: 34 queue, 19 history, 32 attempts, 1 reservation, 16 channels, 0 monitors, 3 options, 10 memberships, 16 profiles. `quick_check=ok`; video #212 giữ `NeedsReview`.
-- Health/diagnostics xác nhận đúng revision/root, fingerprint local `4da9294ec84043abc95e6d579f558072624cf2ab3779dafff3be368a2003678f`, `restart_required=false`. Queue/monitor không tự chạy. Hai checkout cùng nội dung sau chuẩn hóa LF/CRLF và sạch theo Git.
+- Health/diagnostics của bản cuối xác nhận đúng revision/root, fingerprint local `4b7a5621fcc43e2191cb1a2b85ddc1ef397604a57c43abd1d653d3da01386754`, `restart_required=false`. Queue/monitor không tự chạy. Hai checkout cùng nội dung sau chuẩn hóa LF/CRLF và sạch theo Git.
 - Chromium mở cả 6 tab trên server local: không lỗi JavaScript/HTTP; đọc đủ 16 kênh và 3 bộ tùy chọn, giới hạn input Monitor mới. Chặn mọi request ghi trong lượt kiểm tra giao diện này; không gửi request ghi nào.
-- Backup riêng SHA-256: `3c9be6d10b83fb01d9c9a8d5898c74c06f8265103443b9573a4339114badbee8`. DB, log và báo cáo chi tiết nằm ngoài Git.
+- Backup trước lượt đầu SHA-256: `3c9be6d10b83fb01d9c9a8d5898c74c06f8265103443b9573a4339114badbee8`. Backup trước bản bổ sung: `fe360d48f15ccf3c46ed1ec3f8374a002d68718d7125091b2bd3f3526d78cdb1`. Cả hai lượt rehearsal và đối chiếu 9 bảng đều đạt. DB, log và báo cáo chi tiết nằm ngoài Git.
 
 ## Phạm vi còn lại
 
