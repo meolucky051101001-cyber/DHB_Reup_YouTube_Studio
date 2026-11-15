@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "synthetic": true,
+  "live_verified": false,
+  "locales": [
+    "en",
+    "vi"
+  ],
+  "selector_provenance": "authored synthetic fixture; not observed YouTube Studio DOM",
+  "semantic_values": {
+    "22": "people-blogs",
+    "24": "entertainment"
+  },
+  "sha256": {
+    "category_en.html": "cda19af8e490d72ba8e083e8cf71cb9f5c02efc648405478fcbe9b747b8453d7",
+    "category_vi.html": "ab0b875d23706ae882d8b98b4abc3bc7a3b1eedc77089185205178266ea74efe"
+  },
+  "hash_normalization": "UTF-8 bytes with LF line endings"
+}

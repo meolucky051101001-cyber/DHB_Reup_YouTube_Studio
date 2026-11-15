@@ -61,10 +61,12 @@ def capability_matrix():
         features = {
             'category': _feature('Danh mục',
                 'API kiểm tra categoryId assignable trước phiên upload và đọc lại categoryId theo video ID.' if api else
-                'Studio hiện chỉ lưu cấu hình danh mục; chưa có thao tác đặt và đọc lại được hỗ trợ.',
+                'Chưa có cách đặt và đọc lại danh mục Studio được xác minh. Yêu cầu áp danh mục vẫn bị chặn; '
+                'chỉ tiếp tục khi bạn chủ động chọn giữ thiết lập bên YouTube.',
                 ['youtube_uploader.py:_upload_via_youtube_api_with_session',
                  'youtube_uploader.py:_verify_api_video'] if api else
-                ['youtube_uploader.py:upload_via_playwright_studio'],
+                ['docs/G20_STUDIO_CATEGORY.md', 'tests/test_studio_metadata_gates.py',
+                 'studio_metadata_contract.py:StudioCategoryContract'],
                 can_set=api, readback='response' if api else 'none', offline_verified=api, enabled=api),
             'video_language': _feature('Ngôn ngữ video',
                 'YouTube videos.insert chưa có hợp đồng ghi defaultAudioLanguage được tài liệu hóa. '

@@ -6,6 +6,123 @@ from pathlib import Path
 
 @unittest.skipUnless(os.environ.get('DHB_BROWSER_TESTS') == '1', 'Run in the browser CI job')
 class ConfigBrowserTests(unittest.TestCase):
+    def test_studio_category_synthetic_contract_scopes_rechecks_and_exact_id_readback(self):
+        from playwright.sync_api import sync_playwright
+        from studio_metadata_contract import StudioMetadataError
+        from test_studio_metadata_contract import FIXTURE_ROOT, SyntheticCategoryBrowserAdapter, contract
+        video_id = 'dQw4w9WgXcQ'
+        events, requests, unexpected, receipt_before_readback = [], [], [], []
+        saved = {'locale': 'en', 'video_id': video_id, 'value': 'entertainment', 'abort': False}
+
+        def dispatch(route):
+            url = route.request.url
+            if url != f'http://127.0.0.1:8687/video/{video_id}':
+                unexpected.append(url)
+                route.abort()
+                return
+            requests.append(url)
+            receipt_before_readback.append(bool(events and events[0]['verification_state'] == 'received'))
+            if saved['abort']:
+                route.abort()
+                return
+            route.fulfill(status=200, content_type='text/html', body=(
+                f'<html lang="{saved["locale"]}"><article data-video-id="{saved["video_id"]}">'
+                f'<output data-category-value="{saved["value"]}"></output></article></html>'))
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(service_workers='block')
+                context.route('**/*', dispatch)
+                page = context.new_page()
+
+                def reset(locale='en'):
+                    page.set_content((FIXTURE_ROOT / f'category_{locale}.html').read_text(encoding='utf-8'))
+                    self.assertFalse(page.locator('[data-details]').is_visible())
+                    events.clear()
+                    saved.update(locale=locale, video_id=video_id, value='entertainment', abort=False)
+                    return contract(SyntheticCategoryBrowserAdapter(page))
+
+                for locale in ('vi', 'en'):
+                    with self.subTest(locale=locale):
+                        c = reset(locale)
+                        page.locator('[data-semantic="unrelated"] option').evaluate('(option) => option.value="audience-only"')
+                        prepared = c.prepare('24')
+                        self.assertTrue(page.locator('[data-details]').is_visible())
+                        self.assertEqual(page.input_value('#category'), 'entertainment')
+                        # The unrelated section has the same label and must remain untouched.
+                        self.assertEqual(page.input_value('[data-semantic="unrelated"]'), 'audience-only')
+                        guards = []
+                        c.recheck(prepared, verify_binding=lambda: guards.append('binding'),
+                                  verify_approval=lambda: guards.append('approval'))
+                        self.assertEqual(guards, ['binding', 'approval'])
+                        result = c.verify_saved(prepared, video_id, evidence_sink=events.append)
+                        self.assertEqual(result.video_id, video_id)
+                        self.assertEqual([event['verification_state'] for event in events], ['received', 'verified'])
+                        self.assertEqual(events[-1]['observed'], {'category_id': '24'})
+
+                c = reset()
+                page.locator('#category option').evaluate_all('(options) => options.forEach(option => option.textContent="Same label")')
+                self.assertEqual(c.prepare('24').value, 'entertainment')
+                self.assertEqual(page.input_value('#category'), 'entertainment')
+
+                prepare_failures = (
+                    ('duplicate section', '(section) => section.after(section.cloneNode(true))', 'section[data-studio-section="category"]', 'SCOPE_AMBIGUOUS'),
+                    ('duplicate control', '(control) => control.after(control.cloneNode(true))', '#category', 'SCOPE_AMBIGUOUS'),
+                    ('missing section', '(section) => section.remove()', 'section[data-studio-section="category"]', 'SCOPE_AMBIGUOUS'),
+                    ('wrong section', '(section) => section.dataset.studioSection="audience"', 'section[data-studio-section="category"]', 'SCOPE_AMBIGUOUS'),
+                    ('disabled control', '(control) => control.disabled=true', '#category', 'CONTROL_DISABLED'),
+                    ('disabled option', '(option) => option.disabled=true', '#category option[value="entertainment"]', 'OPTION_DISABLED'),
+                    ('duplicate value', '(option) => option.after(option.cloneNode(true))', '#category option[value="entertainment"]', 'OPTION_AMBIGUOUS'),
+                    ('no change', '(control) => control.dataset.noChange="1"', '#category', 'SET_MISMATCH'),
+                    ('unknown locale', '(html) => html.lang="fr"', 'html', 'LOCALE_UNSUPPORTED'),
+                    ('missing reveal', '(button) => button.remove()', '[data-action="show-more"]', 'REVEAL_FAILED'),
+                )
+                for label, script, selector, code in prepare_failures:
+                    with self.subTest(case=label):
+                        c = reset()
+                        page.locator(selector).evaluate(script)
+                        with self.assertRaisesRegex(StudioMetadataError, code) as raised:
+                            c.prepare('24')
+                        self.assertFalse(raised.exception.after_send)
+                        self.assertEqual(events, [])
+
+                for action, code in (
+                    ('(control) => control.value="people-blogs"', 'CHANGED_BEFORE_PUBLISH'),
+                    ('(control) => control.remove()', 'SCOPE_AMBIGUOUS'),
+                ):
+                    with self.subTest(recheck=code):
+                        c = reset(); prepared = c.prepare('24')
+                        page.locator('#category').evaluate(action)
+                        with self.assertRaisesRegex(StudioMetadataError, code):
+                            c.recheck(prepared, verify_binding=lambda: None, verify_approval=lambda: None)
+
+                for binding, approval, code in ((False, True, 'BINDING_CHANGED'), (True, False, 'APPROVAL_STALE')):
+                    with self.subTest(guard=code):
+                        c = reset(); prepared = c.prepare('24')
+                        with self.assertRaisesRegex(StudioMetadataError, code):
+                            c.recheck(prepared, verify_binding=lambda: binding, verify_approval=lambda: approval)
+
+                for changed, code, state in (
+                    ({'value': 'people-blogs'}, 'READBACK_MISMATCH', 'mismatch'),
+                    ({'video_id': 'otherID1234'}, 'READBACK_ID_MISMATCH', 'unknown'),
+                    ({'locale': 'vi'}, 'READBACK_LOCALE_CHANGED', 'unknown'),
+                    ({'value': 'unmapped'}, 'READBACK_UNMAPPED', 'unknown'),
+                    ({'abort': True}, 'READBACK_FAILED', 'unknown'),
+                ):
+                    with self.subTest(readback=code):
+                        c = reset(); prepared = c.prepare('24'); saved.update(changed)
+                        with self.assertRaisesRegex(StudioMetadataError, code) as raised:
+                            c.verify_saved(prepared, video_id, evidence_sink=events.append)
+                        self.assertTrue(raised.exception.after_send)
+                        self.assertEqual([event['verification_state'] for event in events], ['received', state])
+                        self.assertEqual(events[0]['video_id'], video_id)
+                self.assertEqual(len(requests), 7)
+                self.assertTrue(all(receipt_before_readback))
+                self.assertEqual(unexpected, [])
+            finally:
+                browser.close()
+
     def test_metadata_choices_require_confirmation_and_preview_actual_values(self):
         import json
         import re
