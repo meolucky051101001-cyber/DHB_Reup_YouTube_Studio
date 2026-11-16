@@ -1356,8 +1356,9 @@ def migrate_phase4_group_schema(conn, cur=None) -> Dict[str, int]:
 
     cur.execute(
         "INSERT INTO app_schema_versions (schema_key, version, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
-        "ON CONFLICT(schema_key) DO UPDATE SET version = excluded.version, updated_at = CURRENT_TIMESTAMP",
-        ("channel_group_memberships", GROUP_SCHEMA_VERSION),
+        "ON CONFLICT(schema_key) DO UPDATE SET version = excluded.version, updated_at = CURRENT_TIMESTAMP "
+        "WHERE app_schema_versions.version IS NOT excluded.version OR ?",
+        ("channel_group_memberships", GROUP_SCHEMA_VERSION, any(stats.values())),
     )
     return stats
 
