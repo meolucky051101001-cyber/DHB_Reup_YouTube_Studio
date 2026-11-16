@@ -3238,9 +3238,69 @@ async def api_import_excel(
 # ==========================================================
 # AI DỊCH THUẬT, VIẾT LẠI SEO & BIÊN TẬP HÀNG LOẠT
 # ==========================================================
+_AI_EDIT_QUEUE_FIELDS = (
+    "id", "created_at", "project_name", "source_type", "platform", "source_url", "post_id",
+    "target_type", "target_channel_id", "target_profile_name", "target_group_name",
+    "target_group_names_json", "group_schema_version", "assigned_channel_id", "assigned_group_names_json",
+    "title", "description", "tags", "upload_to", "visibility", "schedule_time", "option_group_id",
+    "made_for_kids", "altered_content", "age_restriction", "is_premiere", "render_mode", "render_config_json",
+    "cut_start", "cut_end", "resolution", "emulate_mobile", "manual_reupload_authorized",
+    "manual_reupload_reason", "monitor_metadata_policy_json", "input_video_path", "output_video_path",
+    "thumbnail_path", "content_key", "status", "claim_token", "published_url", "last_attempt_id", "error_message",
+)
+
+
+def _ai_edit_snapshot(conn, item):
+    """Compare semantic state, including reused attempts; this is not a lifecycle epoch."""
+    attempt = conn.execute(
+        "SELECT * FROM upload_attempts WHERE queue_id=? ORDER BY attempt_no DESC,id DESC LIMIT 1",
+        (item["id"],),
+    ).fetchone()
+    return ({field: item[field] for field in _AI_EDIT_QUEUE_FIELDS}, dict(attempt) if attempt else None)
+
+
+def _ai_edit_failure(item_id, code, message):
+    return {"id": int(item_id), "code": code, "error": message}
+
+
+def _commit_ai_edit(item, snapshot, metadata, fields):
+    """Check ownership and compare the original read in the same short write transaction."""
+    with closing(get_conn()) as conn:
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM video_queue WHERE id=?", (item["id"],)).fetchone()
+            if row is None:
+                return _ai_edit_failure(item["id"], "item_missing", "Video không còn trong hàng đợi.")
+            try:
+                _ensure_queue_items_idle(conn, [item["id"]], "biên tập AI")
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
+                return _ai_edit_failure(item["id"], "item_guarded", "Video đang xử lý hoặc cần đối soát; kết quả lần này không được ghi.")
+            if _ai_edit_snapshot(conn, row) != snapshot:
+                return _ai_edit_failure(item["id"], "stale_snapshot", "Dữ liệu video đã thay đổi; hãy tải lại trước khi biên tập tiếp.")
+            # fields comes only from the fixed title/description/tags allowlist below.
+            assignments = ", ".join(f"{field}=?" for field in fields)
+            cur = conn.execute(f"UPDATE video_queue SET {assignments} WHERE id=?",
+                               (*[metadata[field] for field in fields], item["id"]))
+            if cur.rowcount != 1:
+                raise RuntimeError("AI edit lost its locked queue row.")
+            conn.commit()
+            return None
+        except sqlite3.OperationalError as exc:
+            # Do not hide disk/schema/corruption errors as ordinary item conflicts.
+            if str(exc).lower() not in {"database is locked", "database table is locked", "database is busy"}:
+                raise
+            return _ai_edit_failure(item["id"], "db_write_failed", "Cơ sở dữ liệu đang bận; kết quả lần này không được ghi.")
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
+
+
 @app.post("/api/queue/ai-process")
 def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
-    ids = data.get("ids") or []
+    ids = data.get("ids", [])
     mode = data.get("mode") or "rewrite_seo"  # 'translate' | 'rewrite_seo' | 'batch_edit'
     provider = data.get("provider") or "gemini"
     target_lang = data.get("target_lang") or "Tiếng Việt"
@@ -3255,6 +3315,7 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
         raise HTTPException(400, "Prompt tùy chỉnh không được vượt quá 4000 ký tự.")
     if not isinstance(ids, list) or len(ids) > 5000 or any(type(item_id) is not int or item_id <= 0 for item_id in ids):
         raise HTTPException(400, "Danh sách video phải là mảng ID nguyên dương, tối đa 5000 mục.")
+    ids = list(dict.fromkeys(ids))
 
     # Tham số cho batch_edit
     edit_field = data.get("edit_field") or "title"
@@ -3273,63 +3334,67 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
     fallback_count = 0
     links_preserved = 0
     failed_items = []
-    conn = get_conn()
-    try:
+    # Fetch rows and attempt snapshots in one consistent read, then release it before provider work.
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
         if ids:
             placeholders = ",".join("?" for _ in ids)
-            rows = conn.execute(f"SELECT * FROM video_queue WHERE id IN ({placeholders})", ids).fetchall()
+            rows = conn.execute(f"SELECT * FROM video_queue WHERE id IN ({placeholders}) ORDER BY id", ids).fetchall()
         else:
             project_name = data.get("project_name") or "Default"
-            rows = conn.execute("SELECT * FROM video_queue WHERE project_name = ?", (project_name,)).fetchall()
-
+            if not isinstance(project_name, str) or len(project_name) > 200 or "\x00" in project_name:
+                raise HTTPException(400, "Tên dự án phải là văn bản tối đa 200 ký tự và không chứa NUL.")
+            rows = conn.execute("SELECT * FROM video_queue WHERE project_name = ? ORDER BY id", (project_name,)).fetchall()
         _ensure_queue_items_idle(conn, [int(r["id"]) for r in rows], "biên tập AI")
+        items = [(dict(row), _ai_edit_snapshot(conn, row)) for row in rows]
+    found = {item["id"] for item, _ in items}
+    failed_items.extend(_ai_edit_failure(item_id, "item_missing", "Video không còn trong hàng đợi.")
+                        for item_id in ids if item_id not in found)
 
-        for r in rows:
-            item = dict(r)
-            if mode == "batch_edit":
-                old_val = item.get(edit_field) or ""
-                new_val = apply_batch_text_edit(old_val, edit_op, find_str, replace_str)
-                cur = conn.execute(
-                    f"UPDATE video_queue SET {edit_field} = ? WHERE id = ? AND COALESCE(claim_token, '') = ''",
-                    (new_val, item["id"]),
+    for item, snapshot in items:
+        fields = (edit_field,) if mode == "batch_edit" else ("title", "description", "tags")
+        if mode == "batch_edit":
+            res = {field: item[field] or "" for field in ("title", "description", "tags")}
+            res[edit_field] = apply_batch_text_edit(res[edit_field], edit_op, find_str, replace_str)
+        else:
+            try:
+                res = ai_optimize_youtube_metadata(
+                    title=item.get("title") or "", description=item.get("description") or "",
+                    action=mode, provider=provider, target_lang=target_lang, custom_prompt=custom_prompt,
                 )
-                if cur.rowcount != 1:
-                    failed_items.append({"id": int(item["id"]), "error": "Video đã được worker giữ trong lúc xử lý; bỏ qua."})
-                    continue
-                updated += 1
-            else:
-                try:
-                    res = ai_optimize_youtube_metadata(
-                        title=item.get("title") or "",
-                        description=item.get("description") or "",
-                        action=mode,
-                        provider=provider,
-                        target_lang=target_lang,
-                        custom_prompt=custom_prompt,
-                    )
-                except SourceLinksTooLongError as exc:
-                    failed_items.append({"id": int(item["id"]), "error": str(exc)})
-                    continue
-                cur = conn.execute(
-                    "UPDATE video_queue SET title = ?, description = ?, tags = ? "
-                    "WHERE id = ? AND COALESCE(claim_token, '') = ''",
-                    (res["title"], res["description"], res["tags"], item["id"]),
-                )
-                if cur.rowcount != 1:
-                    failed_items.append({"id": int(item["id"]), "error": "Video đã được worker giữ trong lúc xử lý; bỏ qua."})
-                    continue
-                actual_provider = str(res.get("provider_used") or provider)
-                provider_counts[actual_provider] = provider_counts.get(actual_provider, 0) + 1
-                fallback_count += int(bool(res.get("fallback")))
-                links_preserved += int(res.get("links_preserved") or 0)
-                updated += 1
-
-        conn.commit()
-    finally:
-        conn.close()
+            except SourceLinksTooLongError:
+                failed_items.append(_ai_edit_failure(item["id"], "source_links_too_long", "Không thể giữ đủ link nguồn trong giới hạn mô tả."))
+                continue
+            except (sqlite3.Error, AssertionError):
+                raise
+            except Exception:
+                # Provider errors can contain URLs/credentials; keep them out of API responses and logs.
+                failed_items.append(_ai_edit_failure(item["id"], "provider_failed", "Nhà cung cấp không xử lý được video; kết quả lần này không được ghi."))
+                continue
+        try:
+            if not isinstance(res, dict) or any(not isinstance(res.get(field), str) for field in ("title", "description", "tags")):
+                raise ValueError("Kết quả phải có tiêu đề, mô tả và tags dạng văn bản.")
+            metadata = validate_metadata_fields(res)
+        except ValueError as exc:
+            failed_items.append(_ai_edit_failure(item["id"], "invalid_metadata", str(exc)))
+            continue
+        failure = _commit_ai_edit(item, snapshot, metadata, fields)
+        if failure:
+            failed_items.append(failure)
+            continue
+        updated += 1
+        if mode != "batch_edit":
+            actual_provider = res.get("provider_used")
+            if actual_provider not in ("gemini", "openai", "deepseek", "google_translate"):
+                actual_provider = provider
+            provider_counts[actual_provider] = provider_counts.get(actual_provider, 0) + 1
+            fallback_count += int(bool(res.get("fallback")))
+            count = res.get("links_preserved")
+            links_preserved += count if type(count) is int and count >= 0 else 0
     if mode == "batch_edit":
-        add_log("AI", f"Đã biên tập thủ công {updated} video.", "SUCCESS")
-        return {"ok": True, "updated": updated}
+        add_log("AI", f"Đã biên tập thủ công {updated} video; không cập nhật {len(failed_items)} video.",
+                "WARNING" if failed_items else "SUCCESS")
+        return {"ok": not failed_items, "updated": updated, "failed": failed_items}
     summary = ", ".join(f"{name}: {count}" for name, count in sorted(provider_counts.items())) or "không có video"
     add_log(
         "AI",

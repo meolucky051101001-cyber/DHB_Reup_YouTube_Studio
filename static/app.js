@@ -3151,7 +3151,9 @@ async function reviewUploadSlot() {
   }
 }
 
+let gAIProcessRunning = false;
 async function runAIProcess(type) {
+  if (gAIProcessRunning) return;
   const ids = getTargetIdsOrAlert();
   const payload = {
     ids,
@@ -3165,25 +3167,33 @@ async function runAIProcess(type) {
     find_str: document.getElementById('ed-find').value,
     replace_str: document.getElementById('ed-replace').value,
   };
+  const buttons = Array.from(document.querySelectorAll('button[onclick^="runAIProcess"]'));
+  const disabled = buttons.map(button => button.disabled);
+  gAIProcessRunning = true;
+  buttons.forEach(button => { button.disabled = true; });
   try {
     const res = await apiFetch('/api/queue/ai-process', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
+    const failed = res.failed || [];
+    const failureDetails = failed.slice(0, 20).map(item => `#${item.id} [${item.code || 'failed'}]: ${item.error || 'Không cập nhật được.'}`).join('\n');
+    const failureMessage = failed.length
+      ? `\nKhông cập nhật được ${failed.length} video; kết quả lần này không được ghi, dữ liệu hiện tại được giữ.\n${failureDetails}${failed.length > 20 ? `\n… và ${failed.length - 20} video khác.` : ''}`
+      : '';
     if (payload.mode === 'batch_edit') {
-      alert(`Đã biên tập ${res.updated} video.`);
+      alert(`Đã biên tập ${res.updated} video.${failureMessage}`);
     } else {
       const actual = Object.entries(res.provider_counts || {}).map(([name, count]) => `${name}: ${count}`).join(', ') || 'không có video';
       const fallback = Number(res.fallback_count || 0);
-      const failed = res.failed || [];
-      const failureMessage = failed.length
-        ? `\nKhông cập nhật được ${failed.length} video (ID: ${failed.map(item => item.id).join(', ')}); metadata gốc được giữ.`
-        : '';
       alert(`Đã cập nhật ${res.updated} video.\nYêu cầu: ${res.provider_requested || payload.provider}\nThực tế: ${actual}${fallback ? `\n${fallback} video chuyển sang Google Translate.` : ''}${res.links_preserved ? `\nĐã giữ ${res.links_preserved} link từ mô tả gốc.` : ''}${failureMessage}`);
     }
     await loadQueue(true);
   } catch (e) {
     alert('Lỗi xử lý AI/Biên tập: ' + e.message);
+  } finally {
+    gAIProcessRunning = false;
+    buttons.forEach((button, index) => { button.disabled = disabled[index]; });
   }
 }
 
