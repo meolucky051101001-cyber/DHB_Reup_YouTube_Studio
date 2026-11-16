@@ -1,5 +1,4 @@
 """Rollback must preserve the interpreter that owns a Windows runtime."""
-import importlib.util
 import os
 import subprocess
 import tempfile
@@ -9,13 +8,10 @@ from pathlib import Path
 from unittest import mock
 
 
-HAS_PSUTIL = importlib.util.find_spec('psutil') is not None
-if HAS_PSUTIL:
-    import psutil
-    from rollout_review_release import server_interpreter
+import psutil
+from rollout_review_release import server_interpreter
 
 
-@unittest.skipUnless(HAS_PSUTIL, 'Release tooling needs optional psutil')
 class RollbackInterpreterTests(unittest.TestCase):
     def test_verified_virtualenv_parent_is_preserved(self):
         with tempfile.TemporaryDirectory() as folder:
