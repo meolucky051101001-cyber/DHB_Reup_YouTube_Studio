@@ -18,6 +18,35 @@ class ReleaseValidationTests(unittest.TestCase):
     row=fixtures.ReviewRegressions.row
     reserve_review=fixtures.ReviewRegressions.reserve_review
 
+    def test_housekeeping_runs_after_each_six_hour_boundary(self):
+        calls = []
+
+        def sleep(seconds):
+            calls.append(seconds)
+            if len(calls) == 3:
+                raise StopIteration
+
+        with mock.patch('time.sleep', side_effect=sleep), mock.patch.object(self.app, 'run_housekeeping') as housekeeping:
+            with self.assertRaises(StopIteration):
+                self.app._housekeeping_worker()
+        self.assertEqual(calls, [21600, 21600, 21600])
+        self.assertEqual(housekeeping.call_count, 2)
+
+    def test_monitor_heartbeat_observes_the_thirty_second_boundary(self):
+        with closing(database.get_conn()) as conn, conn:
+            monitor_id = conn.execute(
+                "INSERT INTO monitors(name,source_urls,is_running) VALUES('heartbeat fixture','[]',1)"
+            ).lastrowid
+        clock = mock.Mock()
+        clock.wait.side_effect = [False, True]
+        self.manager._monitor_heartbeat_loop(monitor_id, clock)
+        self.assertEqual(clock.wait.call_args_list, [mock.call(30), mock.call(30)])
+        with closing(database.get_conn()) as conn:
+            heartbeat = conn.execute('SELECT last_heartbeat_at,is_running FROM monitors WHERE id=?',
+                                     (monitor_id,)).fetchone()
+        self.assertTrue(heartbeat['last_heartbeat_at'])
+        self.assertEqual(heartbeat['is_running'], 1)
+
     def test_migration_and_restore_preserve_review_evidence(self):
         self.reserve_review('Rendered')
         # Seed rows through the existing group normalization before this release's

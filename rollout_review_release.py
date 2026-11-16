@@ -8,11 +8,13 @@ import subprocess
 import time
 from contextlib import closing
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import psutil
 import requests
 
 from app_instance_lock import acquire_app_instance_lock
+from audit_upload_capabilities import environment_manifest
 from runtime_identity import APPLICATION_ID, source_fingerprint
 from validate_review_release import backup, rehearse, sha256_file, snapshot, verify_transition
 
@@ -120,6 +122,17 @@ def verify_acceptance(path, revision):
     require(result.get('revision') == revision and all(result.get(check) is True for check in
             ('full_suite', 'chromium', 'clean_start', 'deterministic', 'wall_clock_soak')),
             'Offline acceptance is incomplete for this revision.')
+    soak_report = path.parent / result['soak_report']
+    events = [json.loads(line) for line in soak_report.read_text(encoding='utf-8-sig').splitlines()]
+    require(events and events[-1].get('event') == 'complete', 'Soak report did not reach completion.')
+    soak = events[-1]
+    rounds = [event for event in events if event.get('event') == 'round']
+    require(soak.get('pilot') is False and soak.get('revision') == revision
+            and soak.get('seconds', 0) >= 3600 and soak.get('jobs') == 1000
+            and soak['uploads']['gap_seconds'] >= 1800 and len(rounds) == 10
+            and {item['workers'] for item in rounds} == {1, 4, 8}
+            and all(item['jobs'] == 100 for item in rounds),
+            'Soak did not cover the release duration, load matrix and real cooldown.')
     repo, run = result.get('repo', ''), str(result.get('ci_run_id', ''))
     require(re.fullmatch(r'[\w.-]+/[\w.-]+', repo) and run.isdecimal(), 'Invalid CI run reference.')
     ci = json.loads(subprocess.check_output(
@@ -128,7 +141,50 @@ def verify_acceptance(path, revision):
     require(ci['headSha'] == revision and ci['conclusion'] == 'success'
             and {'unittest', 'media'} <= {job['name'] for job in ci['jobs'] if job['conclusion'] == 'success'},
             'Release CI is incomplete for this revision.')
-    return {'offline_report_sha256': sha256_file(path), 'ci': ci['url']}
+    return {'offline_report_sha256': sha256_file(path), 'soak_report_sha256': sha256_file(soak_report), 'ci': ci['url']}
+
+
+def verify_readonly_ui(base):
+    from playwright.sync_api import sync_playwright
+
+    def route_request(route):
+        request = route.request
+        target = urlsplit(request.url)
+        if f'{target.scheme}://{target.netloc}' != base:
+            external.append(target.netloc)
+            route.abort()
+        elif request.method not in ('GET', 'HEAD'):
+            writes.append(target.path)
+            route.abort()
+        elif target.path == '/api/antidetect/status':
+            route.fulfill(json={'connected': False, 'error': 'Offline acceptance'})
+        else:
+            route.continue_()
+
+    external, writes, errors = [], [], []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(service_workers='block')
+            page = context.new_page()
+            context.route('**/*', route_request)
+            page.on('pageerror', lambda error: errors.append(type(error).__name__))
+            page.on('response', lambda response: errors.append(response.status) if response.status >= 400 else None)
+            page.goto(base + '/', wait_until='networkidle')
+            tabs = page.locator('.nav-tab').evaluate_all('(elements) => elements.map(el => el.dataset.tab)')
+            require(len(tabs) == 6 and len(set(tabs)) == 6, 'Unexpected dashboard tabs.')
+            for tab in tabs:
+                page.locator(f'.nav-tab[data-tab="{tab}"]').click()
+                require(page.locator('#' + tab).is_visible(), 'Dashboard tab did not open.')
+            response = page.evaluate("async () => (await apiFetch('/api/upload-capabilities')).json()")
+            for backend in ('playwright', 'youtube_api'):
+                features = response[backend]['features']
+                require(all(not features[name]['enabled'] for name in ('video_language', 'remix')),
+                        'Capability gate differs from the verified release.')
+        finally:
+            browser.close()
+    require(not writes and not errors, 'Read-only Chromium reported write attempts or errors.')
+    return {'tabs': tabs, 'external_requests_blocked': len(external), 'writes': 0, 'errors': 0}
 
 
 def interpreter_versions(python, root):
@@ -176,6 +232,8 @@ def rollout(args):
 
         require(args.acceptance is not None, 'A completed acceptance report is required.')
         acceptance = verify_acceptance(args.acceptance, revision)
+        expected_build = environment_manifest(source)['build']
+        require(expected_build, 'Release build is missing from the source.')
         versions = interpreter_versions(python, source)
         git(root, 'fetch', str(source), revision)
         git(root, 'merge-base', '--is-ancestor', previous, revision)
@@ -214,13 +272,17 @@ def rollout(args):
                 lock.release()
             launched = launch(root, python, args.port, runtime_log)
             diag = wait_for_start(session, base, root, revision, launched)
+            require(diag['version'] == expected_build, 'Live build differs from the pinned release build.')
             verify_idle_db(db)
+            before_browser = snapshot(db)
+            browser = verify_readonly_ui(base)
+            require(snapshot(db) == before_browser, 'Runtime DB changed during read-only Chromium.')
             changes = verify_transition(before, snapshot(db), startup=True)
             report = {'mode': 'applied', 'previous_revision': previous, 'previous_branch': branch,
                       'runtime_branch': args.branch, 'runtime': diag['runtime'], 'build': diag['version'],
                       'tools': [{'name': tool.get('name'), 'version': tool.get('version')} for tool in diag['tools']],
                       'schemas': diag['database']['schemas'], 'backup_sha256': sha256_file(backup_path),
-                      'rehearsal': rehearsal, 'changes': changes, **versions, **acceptance}
+                      'rehearsal': rehearsal, 'changes': changes, 'chromium_smoke': browser, **versions, **acceptance}
             with manifest.open('x', encoding='utf-8') as handle:
                 json.dump(report, handle, indent=2)
             return report
