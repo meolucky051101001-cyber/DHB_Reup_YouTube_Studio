@@ -259,6 +259,15 @@ class AiEditConcurrencyTests(unittest.TestCase):
         self.assertEqual(result['updated'], 1)
         self.assertEqual(self.row()['title'], 'DEFAULT SELECTION')
 
+    def test_falsey_nontext_project_cannot_select_default(self):
+        self.update("UPDATE video_queue SET project_name='Default' WHERE id=901")
+        before = self.row()
+        for project in (False, 0, [], {}):
+            with self.subTest(project=project), self.assertRaises(HTTPException) as caught:
+                self.edit([], mode='batch_edit', project_name=project, edit_op='uppercase')
+            self.assertEqual(caught.exception.status_code, 400)
+            self.assertEqual(self.row(), before)
+
 
 class AiEditFrontendTests(unittest.TestCase):
     def test_partial_results_refresh_both_modes_and_duplicate_click_is_ignored(self):

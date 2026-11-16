@@ -3341,7 +3341,9 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
             placeholders = ",".join("?" for _ in ids)
             rows = conn.execute(f"SELECT * FROM video_queue WHERE id IN ({placeholders}) ORDER BY id", ids).fetchall()
         else:
-            project_name = data.get("project_name") or "Default"
+            project_name = data.get("project_name", "Default")
+            if project_name is None or project_name == "":
+                project_name = "Default"
             if not isinstance(project_name, str) or len(project_name) > 200 or "\x00" in project_name:
                 raise HTTPException(400, "Tên dự án phải là văn bản tối đa 200 ký tự và không chứa NUL.")
             rows = conn.execute("SELECT * FROM video_queue WHERE project_name = ? ORDER BY id", (project_name,)).fetchall()
