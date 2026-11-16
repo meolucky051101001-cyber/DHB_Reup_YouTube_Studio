@@ -176,7 +176,7 @@ def verify_readonly_ui(base):
             for tab in tabs:
                 page.locator(f'.nav-tab[data-tab="{tab}"]').click()
                 require(page.locator('#' + tab).is_visible(), 'Dashboard tab did not open.')
-            response = page.evaluate("async () => (await apiFetch('/api/upload-capabilities')).json()")
+            response = page.evaluate("async () => await apiFetch('/api/upload-capabilities')")
             for backend in ('playwright', 'youtube_api'):
                 features = response[backend]['features']
                 require(all(not features[name]['enabled'] for name in ('video_language', 'remix')),

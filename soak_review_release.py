@@ -317,6 +317,11 @@ def run(args, log, root):
     try:
         with (mock.patch.object(soak.pm, 'upload_video_to_youtube', side_effect=soak.fake_upload),
               mock.patch.object(soak.pm, 'render_video', side_effect=soak.render)):
+            soak.pm.render_queue.configure(8)
+            ready = threading.Barrier(8)
+            pool_workers = [soak.pm.render_queue.submit(ready.wait, 15) for _ in range(8)]
+            for worker in pool_workers:
+                worker.result(timeout=20)
             soak.render_round('Warmup', WARMUP_JOBS, 8)
             baseline = soak.sample()
             require(not baseline['children'], 'A warmup child process survived drain.')
