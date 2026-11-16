@@ -71,6 +71,23 @@ def verified_server(root, port):
     return process
 
 
+def server_interpreter(process):
+    """Preserve a Windows virtualenv launcher for a verified listening process."""
+    executable = Path(process.exe())
+    parent = process.parent()
+    if parent is None:
+        return executable
+    launcher = Path(parent.exe())
+    if (launcher.name.lower() in ('python.exe', 'pythonw.exe')
+            and launcher.parent.name.lower() == 'scripts'
+            and (launcher.parent.parent / 'pyvenv.cfg').is_file()
+            and Path(parent.cwd()) == Path(process.cwd())
+            and parent.cmdline()[1:] == process.cmdline()[1:]):
+        require(launcher.is_file(), 'The previous virtualenv launcher is missing.')
+        return launcher
+    return executable
+
+
 def verify_idle_db(path):
     with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=2)) as conn:
         for query in (
@@ -248,7 +265,7 @@ def rollout(args):
         require(current == process, 'Runtime listener changed during preflight.')
         if process is not None:
             http_state(session, base, root, previous)
-        previous_python = Path(process.exe()) if process is not None else python
+        previous_python = server_interpreter(process) if process is not None else python
         verify_idle_db(db)
         stopped, switched, launched = False, False, None
         try:

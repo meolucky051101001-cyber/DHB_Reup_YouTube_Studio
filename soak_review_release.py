@@ -1,6 +1,5 @@
 """Run bounded offline queue/render and simulated-upload acceptance on isolated SQLite."""
 import argparse
-import ipaddress
 import json
 import os
 import shutil
@@ -46,17 +45,10 @@ def restrict_boundaries():
                 raise PermissionError('Only local FFmpeg and FFprobe may launch during soak.')
             return
         if event not in ('socket.connect', 'socket.getaddrinfo', 'socket.gethostbyname',
-                         'socket.gethostbyaddr', 'socket.sendto'):
+                         'socket.gethostbyaddr', 'socket.getnameinfo', 'socket.sendto', 'socket.sendmsg'):
             return
-        address = args[-1] if event in ('socket.connect', 'socket.sendto') else args[0]
-        host = address[0] if isinstance(address, tuple) else address
-        try:
-            if ipaddress.ip_address(host).is_loopback:
-                return
-        except ValueError:
-            pass
         attempts.append(event)
-        raise PermissionError('Network outside numeric loopback is forbidden during soak.')
+        raise PermissionError('Network access, including local provider services, is forbidden during soak.')
 
     sys.addaudithook(audit)
     return attempts
