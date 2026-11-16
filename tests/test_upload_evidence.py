@@ -55,6 +55,27 @@ class EvidenceTests(unittest.TestCase):
     def stored(self):
         return json.loads(self.conn.execute('SELECT evidence_json FROM upload_attempts WHERE id=10').fetchone()[0])
 
+    def test_language_only_expectation_does_not_invent_category_and_requires_readback(self):
+        expected = {'video_language': 'en-US'}
+        sink = evidence.make_evidence_sink(self.connect, 1, 'claim-a', 10, 7,
+                                           backend='playwright', expected=expected)
+        event = self.event(backend='playwright', expected=expected)
+        received = sink(event)
+        self.assertEqual(received['expected'], expected)
+        self.assertNotIn('category_id', received['expected'])
+        with self.assertRaisesRegex(evidence.EvidenceError, 'verified_metadata_mismatch'):
+            sink({**event, 'verification_state': 'verified', 'observed': {'video_language': 'en'}})
+        verified = sink({**event, 'verification_state': 'verified', 'observed': expected})
+        self.assertEqual(verified['verification_state'], 'verified')
+        self.assertEqual(evidence.read_evidence(json.dumps(verified), 1, 10, 7), verified)
+
+    def test_empty_or_null_expectation_cannot_claim_metadata_verification(self):
+        for expected in ({}, {'category_id': None}, {'video_language': None},
+                         {'category_id': '22', 'video_language': None}):
+            with self.subTest(expected=expected), self.assertRaisesRegex(evidence.EvidenceError, 'sink_context_invalid'):
+                evidence.make_evidence_sink(self.connect, 1, 'claim-a', 10, 7,
+                                            backend='playwright', expected=expected)
+
     def test_received_persists_before_readback_and_is_idempotent(self):
         first = self.sink()(self.event())
         self.assertEqual(first['video_url'], 'https://youtu.be/abc123XYZ_0')

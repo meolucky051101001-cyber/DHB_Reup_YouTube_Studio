@@ -1090,7 +1090,8 @@
                   <option value="apply">Yêu cầu đặt ngôn ngữ — chưa bật, sẽ chặn đăng</option>
                 </select>
                 <label for="opt-video-language">Mã ngôn ngữ khi yêu cầu đặt:</label>
-                <input id="opt-video-language" type="text" placeholder="vi, en hoặc en-US" maxlength="64" />
+                <input id="opt-video-language" type="text" placeholder="vi, en hoặc en-US" maxlength="64" aria-describedby="opt-video-language-help" />
+                <p id="opt-video-language-help" style="font-size:11.5px; color:var(--text-muted)">Áp dụng cho ngôn ngữ nói trong video. Ngôn ngữ tiêu đề/mô tả và chứng nhận phụ đề là các thiết lập riêng. Mã có vùng như en-US được giữ nguyên.</p>
                 <label for="opt-remix">Quyền remix:</label>
                 <select id="opt-remix">
                   <option value="keep">Giữ thiết lập hiện có bên YouTube</option>

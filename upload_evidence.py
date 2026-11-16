@@ -30,16 +30,17 @@ def _expected(value):
     if not isinstance(value, dict):
         _error('expected_invalid')
     allowed = {'category_id', 'video_language'}
-    if set(value) - allowed or 'category_id' not in value:
+    if not value or set(value) - allowed:
         _error('expected_invalid')
-    category = value['category_id']
-    if not isinstance(category, str) or not re.fullmatch(r'[1-9][0-9]{0,2}', category):
+    category = value.get('category_id')
+    if 'category_id' in value and (not isinstance(category, str) or not re.fullmatch(r'[1-9][0-9]{0,2}', category)):
         _error('expected_invalid')
     language = value.get('video_language')
-    if language is not None and (not isinstance(language, str) or len(language) > 64
+    if 'video_language' in value and (not isinstance(language, str) or len(language) > 64
                                  or not re.fullmatch(r'[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*', language)):
         _error('expected_invalid')
-    return {'category_id': category, **({'video_language': language} if language is not None else {})}
+    return {**({'category_id': category} if 'category_id' in value else {}),
+            **({'video_language': language} if 'video_language' in value else {})}
 
 
 def _observed(value):

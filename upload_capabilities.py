@@ -68,11 +68,13 @@ def capability_matrix():
                 ['docs/G20_STUDIO_CATEGORY.md', 'tests/test_studio_metadata_gates.py',
                  'studio_metadata_contract.py:StudioCategoryContract'],
                 can_set=api, readback='response' if api else 'none', offline_verified=api, enabled=api),
-            'video_language': _feature('Ngôn ngữ video',
+            'video_language': _feature('Ngôn ngữ nói trong video',
                 'YouTube videos.insert chưa có hợp đồng ghi defaultAudioLanguage được tài liệu hóa. '
                 'Không dùng defaultLanguage (ngôn ngữ tiêu đề/mô tả) thay thế; yêu cầu đặt ngôn ngữ video hiện bị chặn.' if api else
-                'Có thể lưu lựa chọn ngôn ngữ video rõ ràng, nhưng thao tác đặt và đọc lại chưa bật. Giá trị cũ không tự trở thành yêu cầu áp dụng.',
-                ['config_validation.py:validate_config', 'youtube_uploader.py:build_final_metadata']),
+                'Chưa xác minh được thao tác đặt và đọc lại ngôn ngữ nói trong video trên Studio. '
+                'Yêu cầu áp dụng vẫn bị chặn; không dùng ngôn ngữ tiêu đề hoặc thiết lập phụ đề thay thế.',
+                ['docs/G19_API_METADATA.md'] if api else
+                ['docs/G21A_STUDIO_LANGUAGE.md', 'studio_metadata_contract.py:StudioLanguageContract']),
             'remix': _feature('Quyền remix',
                 'Chưa hỗ trợ đặt và đọc lại quyền remix. Yêu cầu cấm remix sẽ chặn đăng; chỉ bỏ yêu cầu khi bạn chủ động chấp nhận.',
                 ['upload_capabilities.py:capability_issues']),

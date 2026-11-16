@@ -6,6 +6,122 @@ from pathlib import Path
 
 @unittest.skipUnless(os.environ.get('DHB_BROWSER_TESTS') == '1', 'Run in the browser CI job')
 class ConfigBrowserTests(unittest.TestCase):
+    def test_studio_spoken_language_synthetic_contract_and_aggregate_evidence(self):
+        from playwright.sync_api import sync_playwright
+        from studio_metadata_contract import StudioMetadataError, verify_saved_metadata
+        from test_studio_metadata_contract import SyntheticCategoryBrowserAdapter, contract as category_contract
+        from test_studio_language_contract import (
+            FIXTURE_ROOT, LANGUAGE_MAP, VIDEO_ID, SyntheticLanguageBrowserAdapter, language_contract,
+        )
+        from upload_evidence import _normalize_event
+        events, requests, unexpected, receipts = [], [], [], []
+        saved = {'locale': 'en', 'video_id': VIDEO_ID, 'language': 'spoken-en-us', 'category': 'entertainment', 'abort': False}
+
+        def dispatch(route):
+            url = route.request.url
+            if url != f'http://127.0.0.1:8687/video/{VIDEO_ID}':
+                unexpected.append(url); route.abort(); return
+            requests.append(url)
+            receipts.append([event['verification_state'] for event in events] == ['received'])
+            if saved['abort']: route.abort(); return
+            route.fulfill(status=200, content_type='text/html', body=(
+                f'<html lang="{saved["locale"]}"><article data-video-id="{saved["video_id"]}">'
+                f'<output data-category-value="{saved["category"]}"></output>'
+                f'<output data-video-language-value="{saved["language"]}"></output></article></html>'))
+
+        def sink(event): events.append(_normalize_event(event))
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(service_workers='block')
+                context.route('**/*', dispatch)
+                page, category_page = context.new_page(), context.new_page()
+
+                def reset(locale='en'):
+                    page.set_content((FIXTURE_ROOT / f'language_{locale}.html').read_text(encoding='utf-8'))
+                    self.assertFalse(page.locator('[data-details]').is_visible())
+                    events.clear()
+                    saved.update(locale=locale, video_id=VIDEO_ID, language='spoken-en-us', category='entertainment', abort=False)
+                    return language_contract(SyntheticLanguageBrowserAdapter(page))
+
+                c = reset()
+                self.assertIsNone(c.prepare('invalid legacy', mode='keep'))
+                c.recheck(None)
+                self.assertIsNone(c.verify_saved(None, VIDEO_ID, evidence_sink=sink))
+                self.assertFalse(page.locator('[data-details]').is_visible())
+                self.assertEqual((events, requests), ([], []))
+
+                for locale in ('vi', 'en'):
+                    for tag, value in LANGUAGE_MAP[locale].items():
+                        with self.subTest(locale=locale, tag=tag):
+                            c = reset(locale); saved['language'] = value
+                            prepared = c.prepare(tag)
+                            self.assertTrue(page.locator('[data-details]').is_visible())
+                            self.assertEqual(page.input_value('#video-language'), value)
+                            self.assertEqual(page.input_value('[data-semantic="caption-certification"]'), 'not-applicable')
+                            self.assertEqual(page.input_value('[data-semantic="title-language"]'), 'title-language-en')
+                            c.recheck(prepared, verify_binding=lambda: True, verify_approval=lambda: True)
+                            c.verify_saved(prepared, VIDEO_ID, evidence_sink=sink)
+                            self.assertEqual([event['verification_state'] for event in events], ['received', 'verified'])
+                            self.assertEqual(events[-1]['expected'], {'video_language': tag})
+                            self.assertEqual(events[-1]['observed'], {'video_language': tag})
+
+                c = reset()
+                page.locator('#video-language option').evaluate_all('(options) => options.forEach(option => option.textContent="Same label")')
+                self.assertEqual(c.prepare('en-US').value, 'spoken-en-us')
+                for script, selector, code in (
+                    ('(node) => node.dataset.studioSection="caption_certification"', 'section[data-studio-section="video_language"]', 'SCOPE_AMBIGUOUS'),
+                    ('(node) => node.dataset.studioSection="title_language"', 'section[data-studio-section="video_language"]', 'SCOPE_AMBIGUOUS'),
+                    ('(node) => node.remove()', 'section[data-studio-section="video_language"]', 'SCOPE_AMBIGUOUS'),
+                    ('(node) => node.after(node.cloneNode(true))', 'section[data-studio-section="video_language"]', 'SCOPE_AMBIGUOUS'),
+                    ('(node) => node.after(node.cloneNode(true))', '#video-language', 'SCOPE_AMBIGUOUS'),
+                    ('(node) => node.disabled=true', '#video-language', 'CONTROL_DISABLED'),
+                    ('(node) => node.disabled=true', '#video-language option[value="spoken-en-us"]', 'OPTION_DISABLED'),
+                    ('(node) => node.after(node.cloneNode(true))', '#video-language option[value="spoken-en-us"]', 'OPTION_AMBIGUOUS'),
+                    ('(node) => node.dataset.noChange="1"', '#video-language', 'SET_MISMATCH'),
+                    ('(node) => node.lang="fr"', 'html', 'LOCALE_UNSUPPORTED'),
+                ):
+                    with self.subTest(prepare=code, selector=selector):
+                        c = reset(); page.locator(selector).evaluate(script)
+                        with self.assertRaisesRegex(StudioMetadataError, code): c.prepare('en-US')
+                        self.assertEqual(events, [])
+
+                for script, code in (('(node) => node.value="spoken-en"', 'CHANGED_BEFORE_PUBLISH'),
+                                     ('(node) => node.remove()', 'SCOPE_AMBIGUOUS')):
+                    c = reset(); prepared = c.prepare('en-US')
+                    page.locator('#video-language').evaluate(script)
+                    with self.assertRaisesRegex(StudioMetadataError, code):
+                        c.recheck(prepared, verify_binding=lambda: True, verify_approval=lambda: True)
+
+                for changed, expected_state, code in (
+                    ({}, 'verified', None),
+                    ({'language': 'spoken-en'}, 'mismatch', 'STUDIO_LANGUAGE_READBACK_MISMATCH'),
+                    ({'video_id': 'otherID1234'}, 'unknown', 'READBACK_ID_MISMATCH'),
+                    ({'language': 'unsupported'}, 'unknown', 'STUDIO_LANGUAGE_READBACK_UNMAPPED'),
+                    ({'abort': True}, 'unknown', 'READBACK_FAILED'),
+                ):
+                    with self.subTest(combined=expected_state, code=code):
+                        lang = reset(); pl = lang.prepare('en-US')
+                        category_page.set_content((FIXTURE_ROOT / 'category_en.html').read_text(encoding='utf-8'))
+                        cat = category_contract(SyntheticCategoryBrowserAdapter(category_page)); pc = cat.prepare('24')
+                        saved.update(changed)
+                        call = lambda: verify_saved_metadata(VIDEO_ID, category=(cat, pc), language=(lang, pl), evidence_sink=sink)
+                        if code:
+                            with self.assertRaisesRegex(StudioMetadataError, code) as raised: call()
+                            self.assertTrue(raised.exception.after_send)
+                        else:
+                            self.assertEqual(set(call()), {'category_id', 'video_language'})
+                        self.assertEqual([event['verification_state'] for event in events], ['received', expected_state])
+                        self.assertEqual(events[0]['expected'], {'category_id': '24', 'video_language': 'en-US'})
+                        if expected_state == 'mismatch':
+                            self.assertEqual(events[-1]['observed'], {'category_id': '24', 'video_language': 'en'})
+                self.assertEqual(len(requests), 16)
+                self.assertTrue(all(receipts))
+                self.assertEqual(unexpected, [])
+            finally:
+                browser.close()
+
     def test_studio_category_synthetic_contract_scopes_rechecks_and_exact_id_readback(self):
         from playwright.sync_api import sync_playwright
         from studio_metadata_contract import StudioMetadataError
