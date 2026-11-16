@@ -13,3 +13,5 @@
 6. Dùng **Kiểm tra OAuth** để kiểm tra quyền trên Google. Tạo Preview cho một clip thử **Riêng tư** và xem **Phương thức đăng** cùng Channel ID trước khi xác nhận chạy. Sau khi gửi, đối chiếu ID video và chế độ hiển thị trong Studio. Lượt nào chưa rõ kết quả vẫn cần đối soát trước khi quyết định gửi lại.
 
 Việc cấp OAuth không đăng video. Thử nghiệm công khai hoặc hẹn lịch là một lượt chạy riêng trong DHB. [Hướng dẫn chính thức cho ứng dụng desktop](https://developers.google.com/identity/protocols/oauth2/native-app) · [Hướng dẫn upload YouTube Data API](https://developers.google.com/youtube/data/guides/uploading_a_video)
+
+Upload qua API và nút Kiểm tra OAuth sử dụng proxy của kênh; kênh để trống proxy kết nối trực tiếp. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` và netrc trong môi trường không được thay tuyến kết nối hoặc OAuth bearer đã chọn. Nếu hệ thống dùng chứng chỉ CA riêng, `REQUESTS_CA_BUNDLE` được ưu tiên, sau đó `CURL_CA_BUNDLE`; xác minh TLS luôn bật.

@@ -1452,8 +1452,12 @@ def _proxy_url_from_channel(channel: Dict[str, Any]) -> str:
 
 def _http_session_for_channel(channel: Dict[str, Any]) -> requests.Session:
     """Session HTTP dùng đúng proxy của kênh cho toàn bộ upload qua YouTube Data API."""
-    session = requests.Session()
     proxy_url = _proxy_url_from_channel(channel)
+    session = requests.Session()
+    # Explicit channel routing and OAuth must not be replaced by proxy/netrc env.
+    session.trust_env = False
+    # Preserve deliberate custom CA configuration without inheriting proxy settings.
+    session.verify = os.environ.get('REQUESTS_CA_BUNDLE') or os.environ.get('CURL_CA_BUNDLE') or True
     if proxy_url:
         session.proxies.update({"http": proxy_url, "https": proxy_url})
     return session
@@ -1812,7 +1816,9 @@ def _upload_via_youtube_api_with_session(
     file_size = os.path.getsize(video_path)
     if file_size <= 0:
         raise RuntimeError("File video rỗng, không thể khởi tạo YouTube resumable upload.")
-    http = session or requests.Session()
+    if session is None:
+        raise ValueError('API upload requires a channel HTTP session from _http_session_for_channel.')
+    http = session
     oauth_data = _parse_oauth_payload(channel.get("oauth_token_json") or "")
     access_token = _refresh_google_access_token(oauth_data, session=http)
 
