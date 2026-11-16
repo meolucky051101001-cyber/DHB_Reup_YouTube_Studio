@@ -21,7 +21,7 @@ class RollbackInterpreterTests(unittest.TestCase):
             launcher = scripts / 'python.exe'
             launcher.touch()
             (root / 'pyvenv.cfg').write_text('home = base-python\n', encoding='utf-8')
-            command = ['-m', 'uvicorn', 'app:app', '--host', '127.0.0.1', '--port', '8686']
+            command = ['-m', 'uvicorn', 'app:app', '--host', '127.0.0.1', '--port', '8686', '--no-access-log']
             parent = mock.Mock()
             parent.exe.return_value = str(launcher)
             parent.cwd.return_value = str(root)

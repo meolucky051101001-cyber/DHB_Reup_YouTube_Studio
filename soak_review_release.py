@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 import psutil
+from runtime_identity import git_output
 
 MIB = 1 << 20
 WORKERS = (1, 4, 8, 1, 4, 8, 1, 4, 8, 8)
@@ -364,8 +365,9 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if not 60 <= args.minutes <= 120:
         parser.error('Choose 60 to 120 minutes for the acceptance soak.')
-    args.revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-    if not args.pilot and subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip():
+    source_root = Path(__file__).resolve().parent
+    args.revision = git_output(source_root, 'rev-parse', 'HEAD')
+    if not args.pilot and git_output(source_root, 'status', '--porcelain'):
         parser.error('Run acceptance on a clean, committed revision.')
     with (args.output.open('x', encoding='utf-8') as log,
           tempfile.TemporaryDirectory(prefix='dhb-offline-soak-') as folder):

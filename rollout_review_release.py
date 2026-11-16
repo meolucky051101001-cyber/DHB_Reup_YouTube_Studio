@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import tempfile
 import time
 from contextlib import closing
 from pathlib import Path
@@ -15,7 +16,7 @@ import requests
 
 from app_instance_lock import acquire_app_instance_lock
 from audit_upload_capabilities import environment_manifest
-from runtime_identity import APPLICATION_ID, source_fingerprint
+from runtime_identity import APPLICATION_ID, git_environment, git_output, source_fingerprint
 from validate_review_release import backup, rehearse, sha256_file, snapshot, verify_transition
 
 
@@ -25,8 +26,12 @@ def require(ok, message):
 
 
 def git(root, *args):
-    return subprocess.check_output(['git', '-c', f'safe.directory={root.as_posix()}', *args],
-                                   cwd=root, text=True, encoding='utf-8', timeout=45).strip()
+    return git_output(root, *args, timeout=45)
+
+
+def server_arguments(port, *, access_log=False):
+    args = ['-m', 'uvicorn', 'app:app', '--host', '127.0.0.1', '--port', str(port)]
+    return args if access_log else args + ['--no-access-log']
 
 
 def http_state(session, base, root, revision):
@@ -63,7 +68,7 @@ def verified_server(root, port):
     process = psutil.Process(bound[0].pid)
     command = process.cmdline()
     require(Path(process.cwd()) == root and command[1:] in (
-                ['app.py'], ['-m', 'uvicorn', 'app:app', '--host', '127.0.0.1', '--port', str(port)]),
+                ['app.py'], server_arguments(port, access_log=True), server_arguments(port)),
             'Cannot verify the listening process as the app.')
     console = Path(os.environ['SystemRoot']) / 'System32' / 'conhost.exe'
     require(all(Path(child.exe()) == console for child in process.children(recursive=True)),
@@ -101,11 +106,10 @@ def verify_idle_db(path):
 
 
 def launch(root, python, port, log_path):
-    env = os.environ.copy()
+    env = git_environment(root, trust_root=True)
     env.pop('DHB_DISABLE_BACKGROUND_TASKS', None)
     with log_path.open('xb') as log:
-        return subprocess.Popen([str(python), '-m', 'uvicorn', 'app:app', '--host', '127.0.0.1',
-                                 '--port', str(port)], cwd=root, env=env, stdin=subprocess.DEVNULL,
+        return subprocess.Popen([str(python), *server_arguments(port)], cwd=root, env=env, stdin=subprocess.DEVNULL,
                                 stdout=log, stderr=log, creationflags=subprocess.CREATE_NO_WINDOW)
 
 
@@ -221,6 +225,101 @@ print(json.dumps({'python': platform.python_version(), 'chromium': chromium,
     return json.loads(subprocess.check_output([str(python), '-c', probe], cwd=root, text=True, timeout=30))
 
 
+_RECOVERY_PROBE = r'''
+import json, os, subprocess, sys, threading
+from pathlib import Path
+root = Path.cwd().resolve()
+allowed = {
+    subprocess.list2cmdline(['git', 'rev-parse', 'HEAD']),
+    subprocess.list2cmdline(['git', '-c', 'safe.directory=' + root.as_posix(), '-C', str(root), 'rev-parse', 'HEAD']),
+}
+denied = []
+def audit(event, args):
+    if event == 'subprocess.Popen':
+        command = args[1]
+        command = command if isinstance(command, str) else subprocess.list2cmdline(command)
+        if command in allowed:
+            return
+    elif event not in ('socket.connect', 'socket.getaddrinfo', 'socket.gethostbyname',
+                       'socket.gethostbyaddr', 'socket.getnameinfo', 'socket.sendto', 'socket.sendmsg'):
+        return
+    denied.append(event)
+    raise PermissionError('External work is forbidden during recovery rehearsal.')
+sys.addaudithook(audit)
+try:
+    import app
+    if denied or threading.active_count() != 1:
+        raise RuntimeError('Recovery startup attempted background or external work.')
+except BaseException as exc:
+    Path(sys.argv[1]).write_text(json.dumps({'failure': type(exc).__name__,
+                                           'boundary_denied': bool(denied)}), encoding='utf-8')
+    raise SystemExit(1)
+Path(sys.argv[1]).write_text(json.dumps({'runtime': app.RUNTIME_IDENTITY,
+                                       'build': app.APP_BUILD_VERSION}), encoding='utf-8')
+'''
+
+
+def rehearse_recovery(root, revision, python, db):
+    """Run the previous code on an isolated DB before allowing automatic restart.
+
+    Return the in-memory source snapshot separately; never serialize its row data.
+    The cloned checkout contains tracked code only and cannot import live profiles.
+    """
+    with tempfile.TemporaryDirectory(prefix='dhb_recovery_clone_') as folder:
+        clone = Path(folder) / 'code'
+        git(root, 'clone', '--quiet', '--no-hardlinks', '--no-checkout', str(root), str(clone))
+        git(clone, 'checkout', '--quiet', '--detach', revision)
+        require(git(clone, 'rev-parse', 'HEAD') == revision, 'Recovery checkout revision differs.')
+        clone_db = clone / 'data' / 'dhb_youtube.sqlite'
+        clone_db.parent.mkdir(parents=True, exist_ok=True)
+        backup(db, clone_db)
+        before = snapshot(clone_db)
+        fingerprint = source_fingerprint(clone)
+        output = Path(folder) / 'startup.json'
+        env = git_environment(clone, trust_root=True)
+        env['DHB_DISABLE_BACKGROUND_TASKS'] = '1'
+        env['DHB_ROOT'] = str(Path(folder) / 'absent-legacy-tool')
+        process = subprocess.Popen([str(python), '-c', _RECOVERY_PROBE, str(output)], cwd=clone,
+                                   env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        try:
+            try:
+                result = process.wait(timeout=45)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError('Recovery startup rehearsal timed out.') from None
+            if result != 0 or not output.is_file():
+                reason = json.loads(output.read_text(encoding='utf-8')) if output.is_file() else {}
+                failure = reason.get('failure', '')
+                failure = failure if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,80}', failure) else 'StartupError'
+                raise RuntimeError(f'Recovery startup rehearsal failed ({failure}); runtime was not changed.')
+        finally:
+            stop_owned_launch(process)
+        identity = json.loads(output.read_text(encoding='utf-8'))['runtime']
+        require(identity['revision'] == revision and identity['startup_fingerprint'] == fingerprint,
+                'Recovery startup identity differs from its pinned checkout.')
+        changes = verify_transition(before, snapshot(clone_db), startup=True)
+        return {'revision': revision, 'startup_fingerprint': fingerprint,
+                'existing_evidence_preserved': True, 'changes': changes}, before
+
+
+def restore_previous(root, branch, previous, python, port, evidence, session, base, db, recovery_before):
+    """Restart only the reviewed old code against exactly the rehearsed DB state."""
+    require(recovery_before is not None and snapshot(db) == recovery_before,
+            'Recovery DB differs from its verified snapshot. Runtime remains stopped; DB retained.')
+    git(root, 'switch', branch)
+    require(git(root, 'rev-parse', 'HEAD') == previous and not git(root, 'status', '--porcelain'),
+            'Recovery checkout changed. Runtime remains stopped; DB retained.')
+    require(not listeners(port), 'Recovery port is occupied; no process was started.')
+    restored = launch(root, python, port, evidence / f'restored-{previous[:12]}.log')
+    try:
+        wait_for_start(session, base, root, previous, restored)
+        verify_transition(recovery_before, snapshot(db), startup=True)
+    except BaseException:
+        stop_owned_launch(restored)
+        raise
+
+
 def rollout(args):
     source = Path(__file__).resolve().parent
     root, evidence, python = (value.resolve() for value in (args.runtime, args.evidence, args.python))
@@ -243,9 +342,12 @@ def rollout(args):
             http_state(session, base, root, previous)
         verify_idle_db(db)
         rehearsal = rehearse(db)
+        previous_python = server_interpreter(process) if process is not None else python
+        recovery, recovery_before = rehearse_recovery(root, previous, previous_python, db)
         if not args.apply:
             return {'mode': 'dry-run', 'revision': revision, 'previous_revision': previous,
-                    'running_pid': process.pid if process is not None else None, 'rehearsal': rehearsal}
+                    'running_pid': process.pid if process is not None else None,
+                    'rehearsal': rehearsal, 'recovery': recovery}
 
         require(args.acceptance is not None, 'A completed acceptance report is required.')
         acceptance = verify_acceptance(args.acceptance, revision)
@@ -265,7 +367,6 @@ def rollout(args):
         require(current == process, 'Runtime listener changed during preflight.')
         if process is not None:
             http_state(session, base, root, previous)
-        previous_python = server_interpreter(process) if process is not None else python
         verify_idle_db(db)
         stopped, switched, launched = False, False, None
         try:
@@ -282,6 +383,9 @@ def rollout(args):
                 backup(db, backup_path)
                 before = snapshot(backup_path)
                 rehearsal = rehearse(backup_path)
+                # Mark the prior result unusable before testing the locked snapshot.
+                recovery_before = None
+                recovery, recovery_before = rehearse_recovery(root, previous, previous_python, backup_path)
                 require(snapshot(db) == before, 'Runtime DB changed following backup.')
                 git(root, 'switch', '-c', args.branch, revision)
                 switched = True
@@ -299,7 +403,8 @@ def rollout(args):
                       'runtime_branch': args.branch, 'runtime': diag['runtime'], 'build': diag['version'],
                       'tools': [{'name': tool.get('name'), 'version': tool.get('version')} for tool in diag['tools']],
                       'schemas': diag['database']['schemas'], 'backup_sha256': sha256_file(backup_path),
-                      'rehearsal': rehearsal, 'changes': changes, 'chromium_smoke': browser, **versions, **acceptance}
+                      'rehearsal': rehearsal, 'recovery': recovery, 'changes': changes,
+                      'chromium_smoke': browser, **versions, **acceptance}
             with manifest.open('x', encoding='utf-8') as handle:
                 json.dump(report, handle, indent=2)
             return report
@@ -307,12 +412,11 @@ def rollout(args):
             if launched is not None:
                 stop_owned_launch(launched)
                 raise RuntimeError('Post-start verification failed. Runtime stopped and current DB retained.') from None
-            if switched:
-                git(root, 'switch', branch)
             if stopped and not listeners(args.port):
-                restored = launch(root, previous_python, args.port,
-                                  evidence / f'restored-{previous[:12]}.log')
-                wait_for_start(session, base, root, previous, restored)
+                restore_previous(root, branch, previous, previous_python, args.port,
+                                 evidence, session, base, db, recovery_before)
+            elif switched:
+                git(root, 'switch', branch)
             raise
 
 

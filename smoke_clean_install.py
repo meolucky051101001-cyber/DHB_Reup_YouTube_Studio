@@ -12,10 +12,14 @@ from pathlib import Path
 import requests
 from config import FFMPEG_EXE
 from scanner_downloader import _terminate_download_process
+from runtime_identity import capture_runtime, source_fingerprint
+from audit_upload_capabilities import environment_manifest
 
 
 def smoke(python):
     source=Path(__file__).resolve().parent
+    source_identity=capture_runtime(source)
+    expected_build=environment_manifest(source)['build']
     with tempfile.TemporaryDirectory(prefix='dhb_clean_start_') as folder:
         root=Path(folder)
         for path in source.glob('*.py'):
@@ -32,7 +36,7 @@ def smoke(python):
         ffmpeg=shutil.which(FFMPEG_EXE) or FFMPEG_EXE
         env['PATH']=str(Path(ffmpeg).parent)+os.pathsep+env.get('PATH','')
         with (root/'server.log').open('w',encoding='utf-8') as log:
-            proc=subprocess.Popen([str(python),'-m','uvicorn','app:app','--host','127.0.0.1','--port',str(port)],
+            proc=subprocess.Popen([str(python),'-m','uvicorn','app:app','--host','127.0.0.1','--port',str(port),'--no-access-log'],
                                   cwd=root,env=env,stdout=log,stderr=log,
                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0,
                                   start_new_session=os.name!='nt')
@@ -58,10 +62,14 @@ def smoke(python):
                 overview=requests.get(base+'/api/overview',headers=headers,timeout=5).json()
                 assert health['source_root']==str(root)
                 assert not diag['runtime']['restart_required']
+                assert diag['runtime']['revision'] is None  # deliberately copied without .git
+                assert diag['version']==expected_build
+                assert diag['runtime']['startup_fingerprint']==source_fingerprint(root)==source_identity['startup_fingerprint']
                 assert overview['total_videos']==0 and not overview['pipeline_running'] and overview['monitors_running']==0
                 assert all(tool['available'] for tool in diag['tools'][:2]),diag['tools'][:2]
                 return {'startup':'ok','fresh_database':True,'auto_run':False,'correct_source_root':True,
                         'version':diag['version'],'fingerprint':diag['runtime']['startup_fingerprint'],
+                        'source_revision':source_identity['revision'],'runtime_revision':None,
                         'ffmpeg_path_fallback':True,'schemas':diag['database']['schemas']}
             finally:
                 # Windows venv python.exe may launch the actual server as a child.

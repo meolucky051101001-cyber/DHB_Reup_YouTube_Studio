@@ -570,11 +570,8 @@ def init_db():
     except Exception:
         pass
 
-    # Dọn nhật ký cũ: chỉ giữ 5000 dòng gần nhất để DB không phình to vô hạn
-    try:
-        cur.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 5000)")
-    except Exception:
-        pass
+    # Retention belongs to scheduled housekeeping, never schema initialization.
+    # Startup/rehearsal must preserve every existing log and upload evidence row.
 
     conn.commit()
     conn.close()
