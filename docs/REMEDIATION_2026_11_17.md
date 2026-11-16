@@ -1,5 +1,7 @@
 # Review remediation — 17 November 2026
 
+Completed: candidate `c03946a` passed new acceptance and was deployed locally. See the [rollout record](REMEDIATION_LOCAL_ROLLOUT_2026_11_17.md) for test, soak, data-preservation evidence and remaining limits. This documentation update does not change the pinned runtime revision.
+
 This release addresses the ten reproduced findings from the review of `80f595d`. The historical G22 acceptance remains documented separately in [G22_LOCAL_METADATA_ROLLOUT.md](G22_LOCAL_METADATA_ROLLOUT.md). The deployment record for this release must identify a clean candidate SHA and new evidence; the historical soak is not acceptance of these changes.
 
 | Finding | Resulting behavior | Regression coverage |
