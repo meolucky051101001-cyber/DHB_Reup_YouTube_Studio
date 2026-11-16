@@ -2860,92 +2860,34 @@ class PipelineManager:
         conn.close()
 
     @staticmethod
-    def _record_published_history_for_item(queue_id: int, channel: Dict[str, Any]) -> bool:
-        """Ghi published_history cho lượt đăng Completed có link thật.
-
-        Trước đây chỉ Auto Monitor ghi bảng này, nên video Completed từ link /
-        kéo-thả / đường dẫn local không được lưu lịch sử. Giữ source_post_id để
-        tương thích dữ liệu cũ và lưu content_key riêng cho file đã nhận diện.
-        """
+    def _monitor_upload_completed(queue_id: int) -> bool:
+        """Observe the owned completion; never repair history after claim release."""
         conn = get_conn()
         try:
+            conn.execute('BEGIN')
             row = conn.execute(
-                "SELECT status, published_url, post_id, source_url, content_key FROM video_queue WHERE id = ?",
+                "SELECT q.status,q.published_url,q.post_id,q.source_url,q.content_key,"
+                "a.channel_id,a.source_post_id,a.content_key AS attempt_content_key,"
+                "a.published_url AS attempt_url,a.phase,a.outcome "
+                "FROM video_queue q JOIN upload_attempts a ON a.id=q.last_attempt_id AND a.queue_id=q.id "
+                "WHERE q.id=? AND NOT EXISTS (SELECT 1 FROM upload_attempts newer WHERE newer.queue_id=q.id "
+                "AND (newer.attempt_no>a.attempt_no OR (newer.attempt_no=a.attempt_no AND newer.id>a.id)))",
                 (queue_id,),
             ).fetchone()
-            if not row:
+            if (not row or row['status'] != 'Completed' or row['outcome'] != 'Completed'
+                    or row['phase'] != 'Finished' or row['channel_id'] is None
+                    or not normalize_published_video_url(row['published_url'])
+                    or row['published_url'] != row['attempt_url']
+                    or row['content_key'] != row['attempt_content_key']
+                    or _history_source_post_id(dict(row), queue_id) != row['source_post_id']):
                 return False
-            if (row["status"] or "").strip() != "Completed" or not (row["published_url"] or "").strip():
-                return False
-            post_id = _history_source_post_id(dict(row), queue_id)
-            conn.execute(
-                "INSERT OR IGNORE INTO published_history "
-                "(source_post_id, source_url, channel_id, content_key, published_url) VALUES (?, ?, ?, ?, ?)",
-                (
-                    post_id,
-                    row["source_url"] or "",
-                    channel.get("id"),
-                    (row["content_key"] or "").strip(),
-                    (row["published_url"] or "").strip(),
-                ),
-            )
-            conn.execute(
-                "UPDATE published_history SET "
-                "source_url = CASE WHEN COALESCE(source_url, '') = '' THEN ? ELSE source_url END, "
-                "content_key = CASE WHEN COALESCE(content_key, '') = '' THEN ? ELSE content_key END, "
-                "published_url = CASE WHEN COALESCE(published_url, '') = '' THEN ? ELSE published_url END "
-                "WHERE source_post_id = ? AND channel_id = ?",
-                (
-                    row["source_url"] or "",
-                    (row["content_key"] or "").strip(),
-                    (row["published_url"] or "").strip(),
-                    post_id,
-                    channel.get("id"),
-                ),
-            )
-            conn.commit()
-            return True
-        finally:
-            conn.close()
-
-    def _record_monitor_published(self, queue_id: int, item_data: Dict[str, Any], mon: Dict[str, Any]) -> bool:
-        """Ghi published_history CHỈ khi video đã Completed và có link thật. Trả về True nếu đã ghi."""
-        conn = get_conn()
-        try:
-            row = conn.execute(
-                "SELECT status, published_url, content_key FROM video_queue WHERE id = ?", (queue_id,)
-            ).fetchone()
-            if not row:
-                return False
-            if (row["status"] or "").strip() != "Completed" or not (row["published_url"] or "").strip():
-                return False
-            conn.execute(
-                "INSERT OR IGNORE INTO published_history "
-                "(source_post_id, source_url, channel_id, content_key, published_url) VALUES (?, ?, ?, ?, ?)",
-                (
-                    item_data.get("post_id"),
-                    item_data.get("source_url"),
-                    mon.get("target_channel_id"),
-                    (row["content_key"] or "").strip(),
-                    (row["published_url"] or "").strip(),
-                ),
-            )
-            conn.execute(
-                "UPDATE published_history SET "
-                "source_url = CASE WHEN COALESCE(source_url, '') = '' THEN ? ELSE source_url END, "
-                "content_key = CASE WHEN COALESCE(content_key, '') = '' THEN ? ELSE content_key END, "
-                "published_url = CASE WHEN COALESCE(published_url, '') = '' THEN ? ELSE published_url END "
-                "WHERE source_post_id = ? AND channel_id = ?",
-                (
-                    item_data.get("source_url") or "",
-                    (row["content_key"] or "").strip(),
-                    (row["published_url"] or "").strip(),
-                    item_data.get("post_id"),
-                    mon.get("target_channel_id"),
-                ),
-            )
-            conn.commit()
-            return True
+            # A manual reupload may retain the first history URL; the latest URL
+            # belongs to the completed attempt, which is checked against the queue.
+            return conn.execute(
+                "SELECT 1 FROM published_history WHERE source_post_id=? AND channel_id=? "
+                "AND content_key=? AND COALESCE(published_url,'')<>'' LIMIT 1",
+                (row['source_post_id'], row['channel_id'], row['content_key']),
+            ).fetchone() is not None
         finally:
             conn.close()
 
@@ -3070,7 +3012,7 @@ class PipelineManager:
 
                         # S2: chỉ đánh dấu "đã xử lý" KHI video thực sự đăng thành công —
                         # video lỗi/dừng sẽ được quét lại ở chu kỳ sau thay vì bị bỏ vĩnh viễn.
-                        published_now = self._record_monitor_published(queue_id, item_data, mon)
+                        published_now = self._monitor_upload_completed(queue_id)
                         if not published_now:
                             add_log(
                                 "Monitor",

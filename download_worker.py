@@ -47,7 +47,6 @@ def main():
         "outtmpl": str(payload["out_template"]),
         "format": str(payload["format"]),
         "merge_output_format": "mp4",
-        "ffmpeg_location": str(payload["ffmpeg_location"]),
         "writethumbnail": True,
         "quiet": True,
         "no_warnings": True,
@@ -58,6 +57,8 @@ def main():
         "extractor_retries": 2,
         "file_access_retries": 2,
     }
+    if payload.get('ffmpeg_location'):
+        options['ffmpeg_location'] = str(payload['ffmpeg_location'])
     if payload.get("cookies_file"):
         options["cookiefile"] = str(payload["cookies_file"])
 

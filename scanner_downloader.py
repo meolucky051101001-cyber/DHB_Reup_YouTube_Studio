@@ -5,6 +5,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -477,6 +478,23 @@ def _run_yt_dlp_worker(payload: Dict[str, Any], progress_callback, stop_event, s
         reader.join(timeout=1.0)
 
 
+def _download_ffmpeg_location() -> Optional[str]:
+    """Leave normal PATH discovery to yt-dlp; validate explicit overrides once."""
+    configured = str(FFMPEG_EXE or '').strip()
+    if configured.casefold() in ('ffmpeg', 'ffmpeg.exe'):
+        return None
+    executable = Path(configured).expanduser()
+    if not executable.is_absolute() and not any(separator in configured for separator in ('/', '\\')):
+        found = shutil.which(configured) if configured else None
+        if found:
+            executable = Path(found)
+        else:
+            raise FileNotFoundError('Không tìm thấy executable FFmpeg đã cấu hình trong PATH.')
+    if not executable.is_file():
+        raise FileNotFoundError('Executable FFmpeg đã cấu hình không tồn tại.')
+    return str(executable.resolve())
+
+
 def download_video(
     source_url: str,
     post_id: str = "",
@@ -561,16 +579,20 @@ def download_video(
             raise FileNotFoundError("File cookies Netscape cấu hình cho yt-dlp không tồn tại.")
         cookies_file = str(cookie_path.resolve())
 
+    ffmpeg_location = _download_ffmpeg_location()
+    worker_payload = {
+        "source_url": source_url,
+        "out_template": out_template,
+        "format": f"bestvideo[height<={height_cap}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height_cap}][ext=mp4]/best",
+        "cookies_file": cookies_file,
+        "timeout_sec": DOWNLOAD_TIMEOUT_SEC,
+    }
+    if ffmpeg_location is not None:
+        worker_payload['ffmpeg_location'] = ffmpeg_location
+
     try:
         result = _run_yt_dlp_worker(
-            {
-                "source_url": source_url,
-                "out_template": out_template,
-                "format": f"bestvideo[height<={height_cap}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height_cap}][ext=mp4]/best",
-                "ffmpeg_location": str(Path(FFMPEG_EXE).parent),
-                "cookies_file": cookies_file,
-                "timeout_sec": DOWNLOAD_TIMEOUT_SEC,
-            },
+            worker_payload,
             progress_callback,
             stop_event,
             started_at,
@@ -617,8 +639,6 @@ def download_video(
         fallback_template = str(APP_TEMP_DIR / f"{job_prefix}.%(ext)s")
         cmd = [
             YTDL_EXE,
-            "--ffmpeg-location",
-            str(Path(FFMPEG_EXE).parent),
             "-f",
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "--merge-output-format",
@@ -635,6 +655,8 @@ def download_video(
             fallback_template,
             source_url,
         ]
+        if ffmpeg_location is not None:
+            cmd[1:1] = ['--ffmpeg-location', ffmpeg_location]
         if cookies_file:
             cmd[-1:-1] = ["--cookies", str(Path(cookies_file).expanduser().resolve())]
         if stop_event is not None and stop_event.is_set():
