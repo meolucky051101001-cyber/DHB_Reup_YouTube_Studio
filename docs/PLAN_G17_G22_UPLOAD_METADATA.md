@@ -1,6 +1,6 @@
 # Kế hoạch G17–G22: metadata đăng video và nghiệm thu offline
 
-Ngày lập: 15/11/2026. Trạng thái: **G17–G19 đã triển khai và nghiệm thu offline; G20 hoàn tất contract/fixture offline, production vẫn chặn do thiếu DOM có nguồn; G21–G22 chưa triển khai**. Xem [G17](G17_UPLOAD_CAPABILITIES.md), [G18](G18_METADATA_INTENT.md), [API G19](G19_API_METADATA.md)/[evidence G19](G19_UPLOAD_EVIDENCE.md) và [G20](G20_STUDIO_CATEGORY.md). G19 giữ API audio-language tắt do chưa có hợp đồng ghi `defaultAudioLanguage` trong `videos.insert`. Tiếp nối G13–G16 đã hoàn tất CRUD Dự án, Profile và Render Preset; runtime chưa đổi.
+Ngày lập: 15/11/2026. Cập nhật trạng thái: 17/11/2026. **G17–G19 đã nghiệm thu offline; G20–G21 hoàn tất contract/fixture và guard offline, các capability chưa có bằng chứng live vẫn tắt; G22 đã hoàn tất soak và triển khai local revision 80f595d ngày 16/11.** Xem [G17](G17_UPLOAD_CAPABILITIES.md), [G18](G18_METADATA_INTENT.md), [API G19](G19_API_METADATA.md)/[evidence G19](G19_UPLOAD_EVIDENCE.md), [G20](G20_STUDIO_CATEGORY.md), [G21A](G21A_STUDIO_LANGUAGE.md), [G21B](G21B_REMIX_CAPABILITY.md) và [biên bản G22](G22_LOCAL_METADATA_ROLLOUT.md). G19 giữ API audio-language tắt do chưa có hợp đồng ghi `defaultAudioLanguage` trong `videos.insert`. Baseline và các mục thiết kế bên dưới giữ bối cảnh lịch sử; review sau G22 phát hiện 10 lỗi cần một release sửa riêng, không dùng lại nghiệm thu 80f595d cho code mới.
 
 ## 1. Mục tiêu và phạm vi
 

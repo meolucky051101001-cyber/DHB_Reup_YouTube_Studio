@@ -20,7 +20,8 @@ def smoke(python):
     source=Path(__file__).resolve().parent
     source_identity=capture_runtime(source)
     expected_build=environment_manifest(source)['build']
-    with tempfile.TemporaryDirectory(prefix='dhb_clean_start_') as folder:
+    with requests.Session() as session, tempfile.TemporaryDirectory(prefix='dhb_clean_start_') as folder:
+        session.trust_env = False
         root=Path(folder)
         for path in source.glob('*.py'):
             shutil.copy2(path,root/path.name)
@@ -47,7 +48,7 @@ def smoke(python):
                     if proc.poll() is not None:
                         raise RuntimeError('Clean server exited before health was ready.')
                     try:
-                        response=requests.get(base+'/health/dhb',timeout=1)
+                        response=session.get(base+'/health/dhb',timeout=1)
                         if response.ok:
                             break
                     except requests.RequestException:
@@ -55,11 +56,11 @@ def smoke(python):
                     time.sleep(.2)
                 else:
                     raise RuntimeError('Clean server startup timed out.')
-                token=requests.get(base+'/api/auth/token',timeout=5).json()['token']
+                token=session.get(base+'/api/auth/token',timeout=5).json()['token']
                 headers={'X-DHB-Token':token,'Origin':base}
                 health=response.json()
-                diag=requests.get(base+'/api/diagnostics',headers=headers,timeout=30).json()
-                overview=requests.get(base+'/api/overview',headers=headers,timeout=5).json()
+                diag=session.get(base+'/api/diagnostics',headers=headers,timeout=30).json()
+                overview=session.get(base+'/api/overview',headers=headers,timeout=5).json()
                 assert health['source_root']==str(root)
                 assert not diag['runtime']['restart_required']
                 assert diag['runtime']['revision'] is None  # deliberately copied without .git
