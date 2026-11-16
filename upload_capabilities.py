@@ -76,8 +76,10 @@ def capability_matrix():
                 ['docs/G19_API_METADATA.md'] if api else
                 ['docs/G21A_STUDIO_LANGUAGE.md', 'studio_metadata_contract.py:StudioLanguageContract']),
             'remix': _feature('Quyền remix',
-                'Chưa hỗ trợ đặt và đọc lại quyền remix. Yêu cầu cấm remix sẽ chặn đăng; chỉ bỏ yêu cầu khi bạn chủ động chấp nhận.',
-                ['upload_capabilities.py:capability_issues']),
+                ('YouTube Data API chưa có trường được tài liệu hóa để đặt và đọc lại lệnh cấm remix âm thanh và hình ảnh.' if api else
+                 'Chưa xác minh được cách đặt và đọc lại lệnh cấm remix âm thanh và hình ảnh trên Studio.') +
+                ' Yêu cầu này chặn đăng. Để bỏ yêu cầu, chọn giữ thiết lập YouTube trong bộ tùy chọn, xác nhận rồi xem trước lại.',
+                ['docs/G21B_REMIX_CAPABILITY.md', 'tests/test_upload_capabilities.py']),
             'age_restriction': _feature('Giới hạn độ tuổi 18+',
                 'Chưa hỗ trợ thiết lập và xác minh giới hạn độ tuổi 18+ trên cả YouTube API và Studio. '
                 'Giữ video chờ tính năng được hỗ trợ, hoặc chủ động sửa yêu cầu giới hạn tuổi trước khi đăng.',

@@ -12,6 +12,7 @@ import test_p3_uploader as uploader_fixtures
 import test_review_regressions as fixtures
 import upload_capabilities as capabilities
 import youtube_uploader as yu
+from test_metadata_resolution import confirmed
 
 
 CHANNEL_ID = 'UC' + 'a' * 22
@@ -114,6 +115,8 @@ class CapabilityGuardTests(unittest.TestCase):
             ('playwright', {'is_premiere': True}, None),
             ('youtube_api', {}, {'disable_shorts_remix': 1}),
             ('playwright', {}, {'disable_shorts_remix': 1}),
+            *[(mode, {'upload_to': upload_to}, {'metadata_intent_json': confirmed(category='keep', remix='disable')})
+              for mode in ('youtube_api', 'playwright') for upload_to in ('Shorts', 'Video')],
             ('youtube_api', {}, {'pin_comment_enabled': 1, 'pin_comment_text': ''}),
             ('playwright', {}, {'pin_comment_enabled': 1, 'pin_comment_text': ''}),
         ]
@@ -213,6 +216,26 @@ class CapabilityIntegrationTests(unittest.TestCase):
         self.assertFalse(matrix['youtube_api']['features']['video_language']['enabled'])
         for feature in ('category', 'video_language', 'remix'):
             self.assertFalse(matrix['playwright']['features'][feature]['enabled'])
+        for mode in ('youtube_api', 'playwright'):
+            remix = matrix[mode]['features']['remix']
+            self.assertFalse(remix['enabled'])
+            self.assertFalse(remix['can_set'])
+            self.assertEqual(remix['readback'], 'none')
+            self.assertIn('âm thanh và hình ảnh', remix['reason'])
+            self.assertIn('xem trước lại', remix['reason'])
+
+    def test_saving_remix_requirement_is_local_and_preview_preserves_it(self):
+        option = self.seed_option(disable_shorts_remix=1)
+        with mock.patch.object(yu, '_StudioBrowserSession') as browser, \
+                mock.patch.object(yu, '_refresh_google_access_token') as oauth:
+            response = self.client.put(f"/api/options/{option['id']}", headers=self.headers,
+                                       json={'metadata_intent_json': confirmed(category='keep', remix='disable')})
+        self.assertEqual(response.status_code, 200, response.text)
+        browser.assert_not_called()
+        oauth.assert_not_called()
+        entry = self.manager.preview_distribution([901], [False, False, True])['items'][0]
+        self.assertEqual(entry['reason_codes'], ['UPLOAD_REMIX_UNSUPPORTED'])
+        self.assertEqual(entry['metadata_effective']['remix'], {'value': True, 'source': 'option', 'mode': 'disable'})
 
     def test_preview_blocks_restrictive_remix_without_mutating_configuration_or_queue(self):
         option = self.seed_option(language='vi', disable_shorts_remix=1)
