@@ -93,7 +93,7 @@
     if (hint) {
       const actions = hint.querySelector('div');
       hint.replaceChildren();
-      hint.append(document.createTextNode('Chọn video hoặc lọc hàng đợi, đặt các giá trị cần thay đổi rồi áp dụng. Xuất Excel dùng dòng đã chọn hoặc toàn bộ dự án; nhập Excel cập nhật các dòng khớp.'));
+      hint.append(document.createTextNode('Chọn video hoặc lọc hàng đợi, đặt các giá trị cần thay đổi rồi áp dụng. Thiết lập giả lập điện thoại luôn được áp dụng: bỏ tích = Desktop; hãy kiểm tra trước khi lưu. Xuất Excel dùng dòng đã chọn hoặc toàn bộ dự án; nhập Excel cập nhật các dòng khớp.'));
       if (actions) hint.append(actions);
     }
     const sourceCard = $('subtab-pane-scan')?.querySelector('.card');
@@ -296,6 +296,8 @@
     if (controls.delete) {controls.delete.disabled = !selected.length; controls.delete.textContent = selected.length ? `Xóa ${selected.length} dòng chọn` : 'Xóa dòng chọn';}
     if (controls.upload) {controls.upload.disabled = count === 0; controls.upload.textContent = count ? `Xem trước & đăng (${count})` : 'Xem trước & đăng';}
     if (controls.bulk) controls.bulk.disabled = count === 0;
+    const bulkApply = document.querySelector('[onclick="applyBulkConfig()"]');
+    if (bulkApply) bulkApply.textContent = `Áp dụng cho ${selected.length || visible.length} video ${selected.length ? 'đã chọn' : 'theo bộ lọc'}`;
     if (controls.excel) controls.excel.textContent = selected.length ? `Excel: xuất ${selected.length} dòng đã chọn` : 'Excel: xuất toàn bộ dự án';
     if (controls.importExcel) controls.importExcel.textContent = selected.length ? `Excel: cập nhật trong ${selected.length} dòng đã chọn` : 'Excel: cập nhật video trong dự án';
     document.querySelectorAll('[data-queue-scope]').forEach(node => {

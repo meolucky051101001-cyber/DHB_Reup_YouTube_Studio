@@ -94,7 +94,7 @@ class ShellBrowserTests(unittest.TestCase):
             page.keyboard.press('Tab')
             self.assertFalse(page.evaluate("document.querySelector('.app-sidebar').contains(document.activeElement)"))
         page.locator('#navigation-toggle').click()
-        self.assertTrue(page.locator('[data-tab="tab-ai"]').is_visible())
+        page.locator('[data-tab="tab-ai"]').wait_for(state='visible')
         page.keyboard.press('Escape')
         page.locator('[data-tab="tab-ai"]').wait_for(state='hidden')
         self.assertTrue(page.locator('#navigation-toggle').evaluate('node=>node===document.activeElement'))

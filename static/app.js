@@ -2176,7 +2176,7 @@ async function scanAndAddVideos() {
     alert('Lỗi khi quét nguồn: ' + e.message);
   } finally {
     btn.disabled = false;
-    btn.textContent = '🚀 Quét & Đưa Vào Bảng Dự Án';
+    btn.textContent = 'Quét nguồn & thêm vào hàng đợi';
   }
 }
 
