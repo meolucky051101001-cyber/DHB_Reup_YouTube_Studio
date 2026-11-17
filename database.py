@@ -42,7 +42,9 @@ def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(APP_DB_PATH), timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("PRAGMA journal_mode=WAL;")
+        journal_mode = conn.execute("PRAGMA journal_mode;").fetchone()
+        if not journal_mode or str(journal_mode[0]).casefold() != "wal":
+            conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
     except Exception:
         pass
