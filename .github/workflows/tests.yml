@@ -22,7 +22,7 @@ jobs:
           youtube_uploader.py database.py render_engine.py scanner_downloader.py
           ai_engine.py config.py check_status.py
       - name: Check frontend syntax
-        run: node --check static/app.js
+        run: Get-ChildItem static/*.js | ForEach-Object { node --check $_.FullName; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
       - name: Install browser for DOM regressions
@@ -30,7 +30,9 @@ jobs:
       - name: Run browser regressions
         env:
           DHB_BROWSER_TESTS: '1'
-        run: python -m unittest discover -s tests -p test_review_browser.py -v
+        run: |
+          python -m unittest discover -s tests -p '*browser.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   media:
     runs-on: windows-latest

@@ -635,7 +635,10 @@ class ConfigBrowserTests(unittest.TestCase):
             page.wait_for_function("document.getElementById('sel-project').value === 'Dự án Việt / thử'")
             page.locator('[onclick="renameCurrentProject()"]').click()
             page.wait_for_function("document.getElementById('sel-project').value === 'Đã đổi tên'")
-            page.locator('[onclick="createNewProject()"]').click()
+            # The option count already equals three before the duplicate request;
+            # wait for its server error instead of racing the alert handler.
+            with page.expect_event('dialog', predicate=lambda dialog: dialog.type == 'alert'):
+                page.locator('[onclick="createNewProject()"]').click()
             page.wait_for_function("document.getElementById('sel-project').options.length === 3")
             self.assertTrue(any('đã tồn tại' in message for message in dialogs))
             page.locator('[onclick="deleteCurrentProject()"]').click()

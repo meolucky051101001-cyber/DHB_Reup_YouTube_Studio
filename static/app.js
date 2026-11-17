@@ -7,7 +7,10 @@ function showToast(msg, type = 'info') {
     container.style.cssText = 'position:fixed; top:24px; right:24px; z-index:999999; display:flex; flex-direction:column; gap:8px; pointer-events:none;';
     document.body.appendChild(container);
   }
+  container.setAttribute('role', 'status');
+  container.setAttribute('aria-live', 'polite');
   const toast = document.createElement('div');
+  toast.className = `ui-toast-${type}`;
   const bg = type === 'warning' ? '#f59e0b' : (type === 'error' ? '#ef4444' : '#10b981');
   toast.style.cssText = `background:${bg}; color:#fff; font-weight:700; padding:12px 20px; border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,0.5); font-size:13.5px; pointer-events:auto; transition:all 0.25s ease; transform:translateX(20px); opacity:0; white-space:pre-line;`;
   toast.textContent = String(msg ?? '');
@@ -84,6 +87,7 @@ function switchTab(tabId, btnEl) {
   const target = document.getElementById(tabId);
   if (target) target.classList.add('active');
   if (btnEl) btnEl.classList.add('active');
+  window.StudioUI?.navigation(tabId, true);
 }
 
 function switchSubTab(subtab) {
@@ -115,6 +119,7 @@ function toggleAdvScan() {
 }
 
 function toggleSidebar() {
+  if (window.StudioQueue) return StudioQueue.toggleSource();
   const grid = document.querySelector('.workspace-grid');
   const btn = document.getElementById('btn-toggle-sidebar');
   if (!grid) return;
@@ -126,6 +131,7 @@ function toggleSidebar() {
 }
 
 function filterQueueTable(query) {
+  if (window.StudioQueue?.filter(query)) return;
   const q = (query || '').toLowerCase().trim();
   const rows = document.querySelectorAll('#queue-tbody tr');
   rows.forEach(r => {
@@ -351,11 +357,13 @@ async function browseNativeFolder() {
 
 // ===== KẾT NỐI THƯ MỤC MÁY TÍNH (EXPLORER TRONG TOOL) =====
 function openBrowseFolderModal() {
-  document.getElementById('modal-browse-folder').style.display = 'flex';
+  if (window.StudioUI) StudioUI.openModal('modal-browse-folder');
+  else document.getElementById('modal-browse-folder').style.display = 'flex';
   bfNavigate('');
 }
 
-function closeBrowseFolderModal() {
+function closeBrowseFolderModal(force = false) {
+  if (window.StudioUI && !StudioUI.closeModal('modal-browse-folder', {force})) return;
   document.getElementById('modal-browse-folder').style.display = 'none';
 }
 
@@ -582,7 +590,9 @@ async function refreshLivePanels() {
     const results = await Promise.allSettled([
       loadOverview(), loadQueue(true), loadMonitors(), loadLogs(),
     ]);
-    const failed = results.filter(result => result.status === 'rejected').length;
+    const failed = results.filter(result => result.status === 'rejected' || result.value?.refreshFailed).length;
+    const status = document.getElementById('studio-update-status');
+    if (status) status.textContent = failed ? `${failed} phần chưa cập nhật được. Dữ liệu có thể đã cũ.` : `Cập nhật lúc ${new Date().toLocaleTimeString('vi-VN')}`;
     if (failed) console.warn(`${failed} phần của bảng điều khiển chưa cập nhật được.`);
   } catch (e) {
     console.warn('Không cập nhật được bảng điều khiển:', e);
@@ -631,7 +641,14 @@ async function loadOverview() {
     document.getElementById('st-videos').textContent = data.total_videos;
     document.getElementById('st-completed').textContent = data.completed_videos;
     document.getElementById('st-monitors').textContent = data.monitors_running;
-  } catch (e) {}
+    document.querySelector('.top-header')?.classList.remove('connection-error');
+    window.StudioQueue?.updateRunning(data);
+  } catch (e) {
+    document.getElementById('st-dhb').textContent = 'Không đọc được trạng thái';
+    document.querySelector('.top-header')?.classList.add('connection-error');
+    window.StudioQueue?.onOverviewError(e);
+    throw e;
+  }
 }
 
 async function syncFromDHB() {
@@ -654,6 +671,7 @@ async function loadProjects() {
   if ([...sel.options].some(o => o.value === current)) {
     sel.value = current;
   }
+  window.StudioUI?.navigation(document.querySelector('.nav-tab.active')?.dataset.tab || 'tab-workspace');
 }
 
 async function createNewProject() {
@@ -1510,11 +1528,14 @@ async function openChannelEdit(id) {
     profList.innerHTML = (gProfiles || []).map(p => `<option value="${escapeHtml(p.name)}"></option>`).join('');
   }
 
-  document.getElementById('modal-edit-channel').style.display = 'flex';
+  window.StudioAdmin?.syncChannelMode('ec');
+  if (window.StudioUI) StudioUI.openModal('modal-edit-channel');
+  else document.getElementById('modal-edit-channel').style.display = 'flex';
   await loadChannelOauthStatus(id);
 }
 
-function closeChannelEdit() {
+function closeChannelEdit(force = false) {
+  if (window.StudioUI && !StudioUI.closeModal('modal-edit-channel', {force})) return;
   const m = document.getElementById('modal-edit-channel');
   if (m) m.style.display = 'none';
 }
@@ -1567,6 +1588,7 @@ async function checkChannelOauth(id) {
 }
 
 async function saveChannelEdit() {
+  if (document.getElementById('modal-edit-channel')?.getAttribute('aria-busy') === 'true') return;
   const id = parseInt(document.getElementById('ec-id-val').value, 10);
   if (!id) return;
   const name = document.getElementById('ec-name').value.trim();
@@ -1606,14 +1628,17 @@ async function saveChannelEdit() {
     return;
   }
   try {
+    window.StudioUI?.setBusy('modal-edit-channel', true);
     await apiFetch(`/api/channels/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
-    closeChannelEdit();
-    await loadChannels();
-    await loadProfiles();
-    showToast('💾 Đã lưu thông tin kênh YouTube.', 'success');
+    window.StudioUI?.setBusy('modal-edit-channel', false);
+    closeChannelEdit(true);
+    showToast('Đã lưu thông tin kênh YouTube.', 'success');
+    try { await Promise.all([loadChannels(), loadProfiles()]); }
+    catch (_) { showToast('Đã lưu kênh, nhưng chưa tải lại được danh sách. Hãy thử tải lại.', 'warning'); }
   } catch (e) {
-    alert('Lỗi lưu kênh: ' + e.message);
-  }
+    if (window.StudioUI) StudioUI.setError('modal-edit-channel', 'Không lưu được kênh: ' + e.message);
+    else alert('Lỗi lưu kênh: ' + e.message);
+  } finally { window.StudioUI?.setBusy('modal-edit-channel', false); }
 }
 
 async function addGroup() {
@@ -1695,7 +1720,7 @@ async function loadQueue(preserveSelection = false) {
   // Đang mở modal sửa/xem video: tạm bỏ qua re-render để không giật form người dùng đang thao tác
   const editModal = document.getElementById('modal-edit-video');
   const previewModal = document.getElementById('modal-preview-video');
-  if ((editModal && editModal.style.display === 'flex') || (previewModal && previewModal.style.display === 'flex')) {
+  if ((editModal && (editModal.open || editModal.style.display === 'flex')) || (previewModal && (previewModal.open || previewModal.style.display === 'flex'))) {
     return;
   }
 
@@ -1704,13 +1729,17 @@ async function loadQueue(preserveSelection = false) {
     gLastQueueProject = proj;
     gPendingBannerDismissed = false;
   }
-  const items = await apiFetch(`/api/queue?project=${encodeURIComponent(proj)}`);
+  let items;
+  try { items = await apiFetch(`/api/queue?project=${encodeURIComponent(proj)}`); }
+  catch (error) { window.StudioQueue?.onLoadError(error); throw error; }
   if ((document.getElementById('sel-project').value || 'Default') !== proj) return;
   gQueueItems = items || [];
   updatePendingQueueBanner(gQueueItems);
   if (!preserveSelection) {
     gSelectedIds.clear();
   }
+
+  if (window.StudioQueue?.render(items)) return;
 
   const chMap = {};
   gChannels.forEach(c => { chMap[c.id] = c; });
@@ -1946,6 +1975,8 @@ function updateQueueSelectionSummary() {
     selectAll.checked = visible.length > 0 && selectedVisible === visible.length;
     selectAll.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
   }
+  window.StudioQueue?.updateScope();
+  window.StudioContent?.updateScope();
 }
 
 function openQuickQueueEdit() {
@@ -2306,14 +2337,18 @@ async function openEditModal(id) {
     }
   }
 
-  document.getElementById('modal-edit-video').style.display = 'flex';
+  if (window.StudioUI) StudioUI.openModal('modal-edit-video');
+  else document.getElementById('modal-edit-video').style.display = 'flex';
 }
 
-function closeEditModal() {
+function closeEditModal(force = false) {
+  if (window.StudioUI && !StudioUI.closeModal('modal-edit-video', {force})) return;
   document.getElementById('modal-edit-video').style.display = 'none';
 }
 
 async function saveEditModal() {
+  const modal = document.getElementById('modal-edit-video');
+  if (modal?.getAttribute('aria-busy') === 'true') return;
   const id = parseInt(document.getElementById('ed-vid-id-val').value, 10);
   const chVal = document.getElementById('ed-vid-channel').value;
   const profVal = document.getElementById('ed-vid-profile').value;
@@ -2323,11 +2358,13 @@ async function saveEditModal() {
   const groupNames = selectedMultiValues(document.getElementById('ed-vid-groups'));
 
   if (isSchedule && !schedVal) {
-    alert('Bạn đã chọn "Lên lịch phát hành" nhưng chưa nhập thời gian.');
+    if (window.StudioUI) StudioUI.setError('modal-edit-video', 'Hãy nhập thời gian phát hành.');
+    else alert('Bạn đã chọn "Lên lịch phát hành" nhưng chưa nhập thời gian.');
     return;
   }
   if (isSchedule && new Date(schedVal) <= new Date()) {
-    alert('Thời gian đặt lịch phải ở TƯƠNG LAI.');
+    if (window.StudioUI) StudioUI.setError('modal-edit-video', 'Thời gian phát hành phải ở tương lai.');
+    else alert('Thời gian đặt lịch phải ở TƯƠNG LAI.');
     return;
   }
 
@@ -2360,15 +2397,20 @@ async function saveEditModal() {
   }
 
   try {
+    window.StudioUI?.setBusy('modal-edit-video', true);
     await apiFetch('/api/queue/edit-metadata', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
-    closeEditModal();
-    await loadQueue(true);
+    window.StudioUI?.setBusy('modal-edit-video', false);
+    closeEditModal(true);
+    showToast('Đã lưu thay đổi video.', 'success');
+    try { await loadQueue(true); }
+    catch (_) { showToast('Đã lưu video, nhưng chưa tải lại được hàng đợi. Dữ liệu đang xem có thể đã cũ.', 'warning'); }
   } catch (e) {
-    alert('Lỗi lưu thông tin video: ' + e.message);
-  }
+    if (window.StudioUI) StudioUI.setError('modal-edit-video', 'Không lưu được video: ' + e.message);
+    else alert('Lỗi lưu thông tin video: ' + e.message);
+  } finally { window.StudioUI?.setBusy('modal-edit-video', false); }
 }
 
 
@@ -2392,10 +2434,12 @@ async function openPreviewModal(id) {
   const pInfo = item.output_video_path ? `🎬 Video Render Thành Phẩm (${item.resolution || '1080p'})` : (item.input_video_path ? `⬇️ Video Gốc Đã Tải` : `Chưa tải xong`);
   infoEl.textContent = `${pInfo} | Thời lượng: ${item.duration || 'N/A'}`;
 
-  document.getElementById('modal-preview-video').style.display = 'flex';
+  if (window.StudioUI) StudioUI.openModal('modal-preview-video');
+  else document.getElementById('modal-preview-video').style.display = 'flex';
 }
 
-function closePreviewModal() {
+function closePreviewModal(force = false) {
+  if (window.StudioUI && !StudioUI.closeModal('modal-preview-video', {force})) return;
   const player = document.getElementById('pv-video-player');
   if (player) {
     player.pause();
@@ -2418,10 +2462,12 @@ function promptAutoSchedule() {
     startEl.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
   updateAutoScheduleSummary();
-  document.getElementById('modal-auto-schedule').style.display = 'flex';
+  if (window.StudioUI) StudioUI.openModal('modal-auto-schedule');
+  else document.getElementById('modal-auto-schedule').style.display = 'flex';
 }
 
-function closeAutoScheduleModal() {
+function closeAutoScheduleModal(force = false) {
+  if (window.StudioUI && !StudioUI.closeModal('modal-auto-schedule', {force})) return;
   document.getElementById('modal-auto-schedule').style.display = 'none';
 }
 
@@ -2445,10 +2491,11 @@ function updateAutoScheduleSummary() {
     `📺 <b>${n}</b> video sẽ được phát hành liên tiếp:<br>` +
     `⏰ Video đầu: <b>${fmt(start)}</b><br>` +
     `🏁 Video cuối: <b>${fmt(end)}</b> (kéo dài ~${spanDays} ngày)<br>` +
-    `⏳ Giãn cách <b>${interval}</b> phút/video — an toàn chống spam`;
+    `⏳ Giãn cách <b>${interval}</b> phút/video`;
 }
 
 async function applyAutoSchedule() {
+  if (document.getElementById('modal-auto-schedule')?.getAttribute('aria-busy') === 'true') return;
   const ids = getTargetIdsOrAlert();
   if (!ids.length) {
     alert('Hãy tích chọn các video cần lên lịch trước.');
@@ -2462,6 +2509,7 @@ async function applyAutoSchedule() {
     return;
   }
   try {
+    window.StudioUI?.setBusy('modal-auto-schedule', true);
     const res = await apiFetch('/api/queue/auto-schedule', {
       method: 'POST',
       body: JSON.stringify({
@@ -2471,17 +2519,15 @@ async function applyAutoSchedule() {
         is_premiere: document.getElementById('as-premiere').checked ? 1 : 0,
       }),
     });
-    closeAutoScheduleModal();
-    alert(
-      `📅 Đã lên lịch thành công cho ${res.scheduled} video!\n` +
-      `⏰ Video đầu: ${res.first_time.slice(0, 16).replace('T', ' ')}\n` +
-      `🏁 Video cuối: ${res.last_time.slice(0, 16).replace('T', ' ')}\n` +
-      `⏳ Giãn cách ${res.interval_minutes} phút/video (YouTube sẽ tự phát đúng giờ).`
-    );
-    await loadQueue(true);
+    window.StudioUI?.setBusy('modal-auto-schedule', false);
+    closeAutoScheduleModal(true);
+    showToast(`Đã lên lịch cho ${res.scheduled} video.`, 'success');
+    try { await loadQueue(true); }
+    catch (_) { showToast('Đã lưu lịch, nhưng chưa tải lại được hàng đợi. Hãy thử tải lại.', 'warning'); }
   } catch (e) {
-    alert('Lỗi lên lịch: ' + e.message);
-  }
+    if (window.StudioUI) StudioUI.setError('modal-auto-schedule', 'Không lưu được lịch: ' + e.message);
+    else alert('Lỗi lên lịch: ' + e.message);
+  } finally { window.StudioUI?.setBusy('modal-auto-schedule', false); }
 }
 
 async function deleteSelectedQueue() {
@@ -2586,7 +2632,18 @@ async function handleImportExcel(event) {
     showToast('⏳ Đang kiểm tra trước file Excel...', 'info');
     const preview = await sendImport(true);
     const summary = describePreview(preview);
-    if (!(preview.matched > 0) || !confirm(`${summary}\n\nÁp dụng các dòng hợp lệ?`)) return;
+    if (!(preview.matched > 0)) {
+      if (window.StudioUI) await StudioUI.result({title:'Không có dòng Excel hợp lệ', message:summary});
+      else alert(summary);
+      return;
+    }
+    const accepted = window.StudioUI ? await StudioUI.confirm({
+      title:'Excel: xem trước cập nhật video',
+      message:`Dự án: ${proj} · ${selected.length ? selected.length + ' video đã chọn' : 'Toàn bộ dự án'}\n${summary}`,
+      confirmLabel:`Cập nhật ${preview.matched} dòng hợp lệ`,
+      rows:(preview.rows || []).map(row => `Dòng ${row.line}: ${row.state} — ${(row.reasons || []).join('; ')}`),
+    }) : confirm(`${summary}\n\nÁp dụng các dòng hợp lệ?`);
+    if (!accepted) return;
 
     showToast('⏳ Đang nhập Excel...', 'info');
     const data = await sendImport(false);
@@ -2599,7 +2656,8 @@ async function handleImportExcel(event) {
       msg += '\n\n⚠️ Lưu ý:\n' + data.warnings.slice(0, 8).map(w => `• ${w}`).join('\n');
       if (data.warning_count > 8) msg += `\n… và ${data.warning_count - 8} cảnh báo khác (xem Nhật ký).`;
     }
-    alert(msg);
+    if (window.StudioUI) await StudioUI.result({title:'Kết quả nhập Excel', message:msg, rows:(data.rows || []).map(row => `Dòng ${row.line}: ${row.state} — ${(row.reasons || []).join('; ')}`)});
+    else alert(msg);
     await loadQueue(true);
   } catch (e) {
     alert('Lỗi nhập Excel: ' + e.message);
@@ -2654,12 +2712,14 @@ function openBulkDescriptionModal() {
   document.getElementById('bulk-desc-excel-file').value = '';
   document.getElementById('bulk-desc-shared').value = '';
   setBulkDescriptionMode('manual');
-  document.getElementById('modal-bulk-description').style.display = 'flex';
+  if (window.StudioUI) StudioUI.openModal('modal-bulk-description');
+  else document.getElementById('modal-bulk-description').style.display = 'flex';
   document.getElementById('bulk-desc-shared').focus();
 }
 
-function closeBulkDescriptionModal() {
+function closeBulkDescriptionModal(force = false) {
   if (gBulkDescriptionBusy) return;
+  if (window.StudioUI && !StudioUI.closeModal('modal-bulk-description', {force})) return;
   invalidateBulkDescriptionPreview();
   document.getElementById('modal-bulk-description').style.display = 'none';
 }
@@ -2810,6 +2870,7 @@ async function saveBulkDescriptions() {
     document.querySelectorAll('#bulk-desc-manual-rows textarea').forEach(input => {
       if (current.has(Number(input.dataset.id))) input.value = current.get(Number(input.dataset.id));
     });
+    window.StudioUI?.markClean('modal-bulk-description');
     showToast(`Đã cập nhật ${result.updated || 0} mô tả.`, 'success');
   } catch (e) {
     invalidateBulkDescriptionPreview();
@@ -2854,9 +2915,21 @@ async function handleImportCsv(event) {
       (preview.rows || []).filter(row => row.state !== 'valid').slice(0, 8).forEach(row => {
         lines.push(`Dòng ${row.line}: ${(row.reasons || []).join('; ')}`);
       });
-      if (!(preview.valid_count > 0) || !confirm(`${lines.join('\n')}\n\nNhập các dòng hợp lệ?`)) return;
+      if (!(preview.valid_count > 0)) {
+        if (window.StudioUI) await StudioUI.result({title:'CSV: không có video hợp lệ',message:lines.join('\n')});
+        else alert(lines.join('\n'));
+        return;
+      }
+      const accepted = window.StudioUI ? await StudioUI.confirm({
+        title:'CSV: xem trước thêm video', message:`Thêm video vào dự án ${proj}. Lựa chọn trong bảng không giới hạn nội dung file.\n${lines.join('\n')}`,
+        confirmLabel:`Thêm ${preview.valid_count} video hợp lệ`,
+        rows:(preview.rows || []).map(row => `Dòng ${row.line}: ${row.state} — ${(row.reasons || []).join('; ')}`),
+      }) : confirm(`${lines.join('\n')}\n\nNhập các dòng hợp lệ?`);
+      if (!accepted) return;
       const res = await sendImport(false);
-      alert(`Đã nhập ${res.added || 0} video, trùng ${res.duplicate_count || 0}, lỗi ${res.error_count || 0} dòng trong dự án [${proj}].`);
+      const summary = `Đã nhập ${res.added || 0} video, trùng ${res.duplicate_count || 0}, lỗi ${res.error_count || 0} dòng trong dự án [${proj}].`;
+      if (window.StudioUI) await StudioUI.result({title:'Kết quả nhập CSV',message:summary});
+      else alert(summary);
       await loadProjects();
       await loadQueue();
     } catch (err) {
@@ -3155,6 +3228,7 @@ let gAIProcessRunning = false;
 async function runAIProcess(type) {
   if (gAIProcessRunning) return;
   const ids = getTargetIdsOrAlert();
+  if (!ids.length) { showToast('Không có video trong phạm vi hiện tại.', 'warning'); return; }
   const payload = {
     ids,
     project_name: document.getElementById('sel-project').value || 'Default',
@@ -3170,6 +3244,7 @@ async function runAIProcess(type) {
   const buttons = Array.from(document.querySelectorAll('button[onclick^="runAIProcess"]'));
   const disabled = buttons.map(button => button.disabled);
   gAIProcessRunning = true;
+  globalThis.StudioContent?.setAIBusy(true, payload);
   buttons.forEach(button => { button.disabled = true; });
   try {
     const res = await apiFetch('/api/queue/ai-process', {
@@ -3181,7 +3256,9 @@ async function runAIProcess(type) {
     const failureMessage = failed.length
       ? `\nKhông cập nhật được ${failed.length} video; kết quả lần này không được ghi, dữ liệu hiện tại được giữ.\n${failureDetails}${failed.length > 20 ? `\n… và ${failed.length - 20} video khác.` : ''}`
       : '';
-    if (payload.mode === 'batch_edit') {
+    if (globalThis.StudioContent) {
+      StudioContent.showAIResult(res, payload);
+    } else if (payload.mode === 'batch_edit') {
       alert(`Đã biên tập ${res.updated} video.${failureMessage}`);
     } else {
       const actual = Object.entries(res.provider_counts || {}).map(([name, count]) => `${name}: ${count}`).join(', ') || 'không có video';
@@ -3190,15 +3267,19 @@ async function runAIProcess(type) {
     }
     await loadQueue(true);
   } catch (e) {
-    alert('Lỗi xử lý AI/Biên tập: ' + e.message);
+    if (globalThis.StudioContent) StudioContent.showAIError(e.message);
+    else alert('Lỗi xử lý AI/Biên tập: ' + e.message);
   } finally {
     gAIProcessRunning = false;
+    globalThis.StudioContent?.setAIBusy(false);
     buttons.forEach((button, index) => { button.disabled = disabled[index]; });
   }
 }
 
 async function loadRenderResources() {
-  const data = await apiFetch('/api/render-resources');
+  let data;
+  try { data = await apiFetch('/api/render-resources'); }
+  catch (error) { window.StudioContent?.showResourcesError(error.message); throw error; }
   const res = data.resources || {};
   gFFmpegPresets = res.ffmpeg_presets || [];
 
@@ -3245,6 +3326,7 @@ async function loadRenderResources() {
       </div>
     </div>
   `).join('');
+  window.StudioContent?.refreshRender();
 }
 
 function onSelectFFmpegPreset(idxStr) {
@@ -3253,6 +3335,7 @@ function onSelectFFmpegPreset(idxStr) {
   if (p) {
     document.getElementById('rc-custom-cmd').value = p.command;
     document.getElementById('rc-mode').value = 'custom_ffmpeg';
+    window.StudioContent?.refreshRender();
   }
 }
 
@@ -3500,6 +3583,7 @@ async function saveRenderPreset(updateExisting = false) {
     showToast(`💾 Đã lưu Preset Render "${name}"!`, 'info');
     await loadRenderPresets();
     document.getElementById('rp-select').value = String(result.id);
+    window.StudioContent?.refreshRender({clean:true});
   } catch (e) {
     alert('Lỗi lưu preset: ' + e.message);
   }
@@ -3539,6 +3623,7 @@ function loadPresetToForm() {
   set('rc-custom-cmd', cfg.custom_command || '');
   fillBrandingForm(cfg);
   fillEditForm(cfg);
+  window.StudioContent?.refreshRender({clean:true});
   showToast(`📋 Đã nạp preset "${p.name}" vào form — bấm "Áp Dụng" để gán cho video.`, 'info');
 }
 
@@ -3554,6 +3639,7 @@ async function deleteRenderPreset() {
     await apiFetch(`/api/render-presets/${id}?expected_revision=${encodeURIComponent(p.revision)}`, { method: 'DELETE' });
     if (gLoadedRenderPreset?.id === id) gLoadedRenderPreset = null;
     showLoadedPreset();
+    window.StudioContent?.refreshRender({clean:true});
     showToast('🗑️ Đã xóa preset.', 'warning');
     await loadRenderPresets();
   } catch (e) {
@@ -3592,7 +3678,9 @@ async function applyShortsBooster() {
 }
 
 async function loadMonitors() {
-  const list = await apiFetch('/api/monitors');
+  let list;
+  try { list = await apiFetch('/api/monitors'); }
+  catch (error) { window.StudioAdmin?.onMonitorsError(error); throw error; }
   const tbody = document.getElementById('monitors-tbody');
   tbody.innerHTML = list.map(m => {
     const transitioning = ['Starting', 'Stopping'].includes(m.lifecycle_state);
@@ -3603,7 +3691,7 @@ async function loadMonitors() {
     <tr>
       <td>#${m.id}</td>
       <td><b>${escapeHtml(m.name)}</b><br/><span style="font-size:11px;color:var(--text-muted)">${escapeHtml((m.source_urls || '').split('\n')[0])}</span></td>
-      <td><span class="badge badge-video">${escapeHtml(m.target_group_name || 'Mặc định')}</span></td>
+      <td><span class="badge badge-video">${escapeHtml(m.target_channel_id ? (gChannels.find(c => Number(c.id) === Number(m.target_channel_id))?.name || `Kênh #${m.target_channel_id}`) : (m.target_group_name || 'Mặc định'))}</span></td>
       <td>${m.check_interval_minutes} phút</td>
       <td>
         <span class="badge ${m.is_running ? 'badge-ok' : 'badge-wait'}">${escapeHtml(m.status)}</span>
@@ -3618,6 +3706,7 @@ async function loadMonitors() {
     </tr>
   `;
   }).join('');
+  window.StudioAdmin?.onMonitorsLoaded(list);
   if (gMonitorLifecycleTimer) clearTimeout(gMonitorLifecycleTimer);
   gMonitorLifecycleTimer = null;
   if (list.some(m => ['Starting', 'Stopping'].includes(m.lifecycle_state))) {
@@ -3693,8 +3782,10 @@ async function deleteMonitor(id) {
   }
 }
 
-async function loadAppSettings() {
+async function loadAppSettings(force = false) {
+  if (!force && window.StudioAdmin?.hasUnsavedSettings()) return;
   const s = await apiFetch('/api/settings');
+  if (!force && window.StudioAdmin?.hasUnsavedSettings()) return;
   const setSecretInput = (id, configured) => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -3718,6 +3809,7 @@ async function loadAppSettings() {
   document.getElementById('set-del-temp').checked = s.delete_temp_after_upload !== false;
   document.getElementById('set-external-backup-dir').value = s.external_backup_dir || '';
   document.getElementById('set-external-backup-keep').value = s.external_backup_keep || 10;
+  window.StudioAdmin?.onSettingsLoaded(s);
   await loadStorageOverview();
 }
 
@@ -3751,7 +3843,9 @@ async function loadDiagnostics() {
       `Ổ đĩa trống: ${storageFormatBytes(storage.free_bytes || 0)} · temp ${storageFormatBytes(storage.temp_bytes || 0)} · output ${storageFormatBytes(storage.output_bytes || 0)} · artifact ${storage.artifact_count || 0}`,
       toolsText,
     ].filter(Boolean).join('\n');
+    window.StudioAdmin?.onDiagnosticsLoaded(data);
   } catch (error) {
+    window.StudioAdmin?.onDiagnosticsError(error);
     panel.textContent = `Không đọc được diagnostics: ${error.message}`;
   }
 }
@@ -3784,13 +3878,26 @@ async function saveAppSettings() {
     const value = document.getElementById(id).value.trim();
     if (value) secretPayload[key] = value;
   }
-  await apiFetch('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
-  if (Object.keys(secretPayload).length) {
-    await apiFetch('/api/settings/secrets', { method: 'POST', body: JSON.stringify(secretPayload) });
+  if (window.StudioAdmin?.onSettingsSaving() === false) return;
+  let settingsSaved = false, secretsSaved = !Object.keys(secretPayload).length;
+  try {
+    await apiFetch('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
+    settingsSaved = true;
+    if (Object.keys(secretPayload).length) {
+      await apiFetch('/api/settings/secrets', { method: 'POST', body: JSON.stringify(secretPayload) });
+      secretsSaved = true;
+    }
+    await loadAppSettings(true);
+    await loadDiagnostics();
+    window.StudioAdmin?.onSettingsSaved();
+    showToast('Đã lưu cấu hình hệ thống.', 'success');
+  } catch (error) {
+    const message = settingsSaved
+      ? (secretsSaved ? 'Đã lưu, nhưng chưa tải lại được dữ liệu: ' : 'Đã lưu cài đặt chung; khóa API chưa lưu: ') + error.message
+      : 'Chưa lưu được cài đặt: ' + error.message;
+    if (window.StudioAdmin) StudioAdmin.onSettingsError(message, settingsSaved);
+    else alert(message);
   }
-  await loadAppSettings();
-  await loadDiagnostics();
-  alert('Đã lưu cấu hình hệ thống thành công!');
 }
 
 function readRenderSpeedOrAlert() {
@@ -3974,9 +4081,14 @@ async function loadLogModules() {
   } catch (e) {}
 }
 
-async function loadLogs() {
+let gLogsRequest = 0;
+async function loadLogs(force = false) {
+  if (window.StudioAdmin && !StudioAdmin.shouldLoadLogs(force)) return;
+  const requestId = ++gLogsRequest;
+  const query = buildLogQuery({ limit: 80 });
   try {
-    const logs = await apiFetch('/api/logs?' + buildLogQuery({ limit: 80 }));
+    const logs = await apiFetch('/api/logs?' + query);
+    if (requestId !== gLogsRequest || query !== buildLogQuery({ limit: 80 }) || (window.StudioAdmin && !StudioAdmin.shouldLoadLogs(force))) return;
     const tbody = document.getElementById('logs-tbody');
     if (!tbody) return;
     tbody.innerHTML = logs.length ? logs.map(l => {
@@ -3998,7 +4110,11 @@ async function loadLogs() {
     }).join('') : `
       <tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:18px;">Không có log phù hợp bộ lọc.</td></tr>
     `;
-  } catch (e) {}
+    window.StudioAdmin?.onLogsLoaded(logs);
+  } catch (e) {
+    if (requestId === gLogsRequest) window.StudioAdmin?.onLogsError(e);
+    return {refreshFailed:true};
+  }
 }
 
 function exportLogs() {
@@ -4006,9 +4122,16 @@ function exportLogs() {
 }
 
 async function clearLogs() {
-  await apiFetch('/api/logs', { method: 'DELETE' });
-  await loadLogs();
-  await loadLogModules();
+  const accepted = window.StudioAdmin ? await StudioAdmin.confirmClearLogs() : confirm('Xóa toàn bộ nhật ký? Bộ lọc hiện tại không giới hạn phạm vi xóa.');
+  if (!accepted) return;
+  try {
+    await apiFetch('/api/logs', { method: 'DELETE' });
+    await loadLogs(true);
+    await loadLogModules();
+  } catch (error) {
+    window.StudioAdmin?.onLogsError(error);
+    showToast('Không xóa được nhật ký: ' + error.message, 'error');
+  }
 }
 
 function escapeHtml(str) {
@@ -4037,4 +4160,4 @@ function safePublishedVideoUrl(value) {
   }
 }
 
-window.addEventListener('DOMContentLoaded', initApp);
+window.addEventListener('DOMContentLoaded', () => queueMicrotask(initApp));
