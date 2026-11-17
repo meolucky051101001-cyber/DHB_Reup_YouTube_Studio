@@ -41,6 +41,8 @@ let gLiveRefreshInFlight = false;
 let gLiveRefreshTimer = null;
 let gMonitorLifecycleTimer = null;
 let gApiRetryTimer = null;
+let gPipelineStartPending = false;
+const gMonitorTogglePending = new Set();
 
 function selectedMultiValues(selectEl) {
   return selectEl ? Array.from(selectEl.selectedOptions || []).map(option => option.value).filter(Boolean) : [];
@@ -3001,69 +3003,75 @@ function findChannelIdBlockers(ids, forceReupload) {
 }
 
 async function startPipeline(doDownload, doRender, doUpload, overrideIds = null) {
-  let previewToken = '';
-  let ids;
-  if (Array.isArray(overrideIds) && overrideIds.length > 0) {
-    ids = overrideIds.slice();
-  } else {
-    ids = getTargetIdsOrAlert();
-    if (!ids.length) {
-      alert('Chưa có video nào để chạy.');
-      return;
-    }
-    if (!gSelectedIds.size && !confirm(`Bạn chưa chọn thủ công. Hệ thống sẽ chạy ${ids.length} video đang hiển thị theo bộ lọc hiện tại. Tiếp tục?`)) return;
-  }
-
-  if (doUpload) {
-    const published = gQueueItems.filter(v => ids.includes(v.id)
-      && (v.status === 'Completed' || (v.published_url || '').trim()));
-    if (published.length > 0) {
-      alert(
-        `${published.length} video đã đăng cần được cho phép đăng lại riêng từng dòng bằng nút 🔁. ` +
-        `Các video đó sẽ bị bỏ qua trong lượt chạy này.`
-      );
-      const publishedIds = new Set(published.map(v => Number(v.id)));
-      ids = ids.filter(id => !publishedIds.has(Number(id)));
-      if (!ids.length) return;
-    }
-    try {
-      const preview = await apiFetch('/api/queue/preview-distribution', {
-        method: 'POST',
-        body: JSON.stringify({ ids, do_download: doDownload, do_render: doRender, do_upload: doUpload }),
-      });
-      const operation = doRender ? 'Render và đăng' : 'Đăng file có sẵn';
-      if (!await showDistributionDialog(preview, operation, true)) return;
-      previewToken = preview.preview_id;
-    } catch (e) {
-      alert('Không xem được preview phân phối: ' + e.message);
-      return;
-    }
-  }
-
+  if (gPipelineStartPending) return;
+  gPipelineStartPending = true;
   try {
-    const res = await apiFetch('/api/pipeline/start', {
-      method: 'POST',
-      body: JSON.stringify({
-        ids,
-        do_download: doDownload,
-        do_render: doRender,
-        do_upload: doUpload,
-        force_reupload: false,
-        preview_id: previewToken,
-      }),
-    });
-    if (!res.ok) {
-      alert(res.message);
-      return;
+    let previewToken = '';
+    let ids;
+    if (Array.isArray(overrideIds) && overrideIds.length > 0) {
+      ids = overrideIds.slice();
+    } else {
+      ids = getTargetIdsOrAlert();
+      if (!ids.length) {
+        alert('Chưa có video nào để chạy.');
+        return;
+      }
+      if (!gSelectedIds.size && !confirm(`Bạn chưa chọn thủ công. Hệ thống sẽ chạy ${ids.length} video đang hiển thị theo bộ lọc hiện tại. Tiếp tục?`)) return;
     }
-    if (res.replayed && res.state === 'interrupted') {
-      alert('Lượt trước đã bị ngắt. Hãy kiểm tra hàng đợi và xem trước lại các video chưa đăng.');
+
+    if (doUpload) {
+      const published = gQueueItems.filter(v => ids.includes(v.id)
+        && (v.status === 'Completed' || (v.published_url || '').trim()));
+      if (published.length > 0) {
+        alert(
+          `${published.length} video đã đăng cần được cho phép đăng lại riêng từng dòng bằng nút 🔁. ` +
+          `Các video đó sẽ bị bỏ qua trong lượt chạy này.`
+        );
+        const publishedIds = new Set(published.map(v => Number(v.id)));
+        ids = ids.filter(id => !publishedIds.has(Number(id)));
+        if (!ids.length) return;
+      }
+      try {
+        const preview = await apiFetch('/api/queue/preview-distribution', {
+          method: 'POST',
+          body: JSON.stringify({ ids, do_download: doDownload, do_render: doRender, do_upload: doUpload }),
+        });
+        const operation = doRender ? 'Render và đăng' : 'Đăng file có sẵn';
+        if (!await showDistributionDialog(preview, operation, true)) return;
+        previewToken = preview.preview_id;
+      } catch (e) {
+        alert('Không xem được preview phân phối: ' + e.message);
+        return;
+      }
     }
-    if (res.skipped && res.skipped.length) {
-      showToast(res.message || `Đã bỏ qua ${res.skipped.length} video đã đăng/đang upload dở.`, 'warning');
+
+    try {
+      const res = await apiFetch('/api/pipeline/start', {
+        method: 'POST',
+        body: JSON.stringify({
+          ids,
+          do_download: doDownload,
+          do_render: doRender,
+          do_upload: doUpload,
+          force_reupload: false,
+          preview_id: previewToken,
+        }),
+      });
+      if (!res.ok) {
+        alert(res.message);
+        return;
+      }
+      if (res.replayed && res.state === 'interrupted') {
+        alert('Lượt trước đã bị ngắt. Hãy kiểm tra hàng đợi và xem trước lại các video chưa đăng.');
+      }
+      if (res.skipped && res.skipped.length) {
+        showToast(res.message || `Đã bỏ qua ${res.skipped.length} video đã đăng/đang upload dở.`, 'warning');
+      }
+    } catch (e) {
+      alert('Lỗi khởi chạy: ' + e.message);
     }
-  } catch (e) {
-    alert('Lỗi khởi chạy: ' + e.message);
+  } finally {
+    gPipelineStartPending = false;
   }
 }
 
@@ -3142,6 +3150,8 @@ function showDistributionDialog(preview, operation, allowStart = false) {
       <header>
         <h2 id="upload-preview-title">Xem trước lô đăng YouTube</h2>
         <p>${escapeHtml(operation)} · ${items.length} video</p>
+        <p>Bước cuối trước khi chạy. Kiểm tra file, kênh và chế độ của từng video bên dưới.</p>
+        <p>Upload bắt đầu sau xác nhận và chờ lượt chung tối thiểu 30 phút tính từ khi lượt trước kết thúc. Lịch bên dưới là giờ YouTube phát hành, không phải giờ tool tự bắt đầu lô.</p>
         ${blocked ? `<p class="upload-preview-error">${blocked} video cần xử lý. Sửa các dòng bên dưới rồi xem trước lại.</p>` : ''}
         ${publicCount ? `<p class="upload-preview-warning">${publicCount} video đặt Công khai.</p>` : ''}
       </header>
@@ -3180,7 +3190,7 @@ async function stopPipeline() {
     const res = await apiFetch('/api/pipeline/stop', { method: 'POST' });
     const stopping = res.batch_state === 'stopping';
     document.getElementById('queue-stopping-status').hidden = !stopping;
-    showToast(stopping ? 'Đã yêu cầu dừng. Video đang upload sẽ hoàn tất trước khi dừng hẳn.' : 'Lô hiện đã dừng.', 'warning');
+    showToast(stopping ? 'Đã yêu cầu dừng lô hiện tại. Video đang upload sẽ hoàn tất trước khi dừng hẳn. Các nguồn tự động cần dừng riêng ở Theo dõi nguồn.' : 'Lô hiện đã dừng. Các nguồn tự động được điều khiển riêng ở Theo dõi nguồn.', 'warning');
     await loadQueue(true);
     await loadLogs();
   } catch (e) {
@@ -3682,11 +3692,12 @@ async function loadMonitors() {
   try { list = await apiFetch('/api/monitors'); }
   catch (error) { window.StudioAdmin?.onMonitorsError(error); throw error; }
   const tbody = document.getElementById('monitors-tbody');
+  const focusedMonitorId = tbody.contains(document.activeElement) ? document.activeElement.dataset.monitorToggle : null;
   tbody.innerHTML = list.map(m => {
     const transitioning = ['Starting', 'Stopping'].includes(m.lifecycle_state);
     const actionLabel = m.lifecycle_state === 'Stopping' ? '⏳ Đang dừng...' :
       m.lifecycle_state === 'Starting' ? '⏳ Đang khởi động...' :
-      m.is_running ? '⏹️ Dừng' : '▶️ Chạy 24/7';
+      m.is_running ? '⏹️ Dừng' : '▶️ Bật nguồn';
     return `
     <tr>
       <td>#${m.id}</td>
@@ -3698,7 +3709,7 @@ async function loadMonitors() {
         ${m.last_checked_at ? `<div style="font-size:10.5px;color:var(--text-muted)">${escapeHtml(m.last_checked_at)}</div>` : ''}
       </td>
       <td>
-        <button class="btn ${m.is_running ? 'btn-warning' : 'btn-success'} btn-sm" onclick="toggleMonitor(${m.id})" ${transitioning ? 'disabled' : ''}>
+        <button class="btn ${m.is_running ? 'btn-warning' : 'btn-success'} btn-sm" data-monitor-toggle="${Number(m.id)}" onclick="toggleMonitor(${m.id})" ${transitioning ? 'disabled' : ''}>
           ${actionLabel}
         </button>
         <button class="btn btn-outline btn-sm" onclick="deleteMonitor(${m.id})" ${m.can_delete ? '' : 'disabled'} title="${m.can_delete ? 'Xóa monitor' : 'Dừng monitor và đợi worker kết thúc trước khi xóa'}">🗑️</button>
@@ -3707,6 +3718,9 @@ async function loadMonitors() {
   `;
   }).join('');
   window.StudioAdmin?.onMonitorsLoaded(list);
+  if (focusedMonitorId && document.activeElement === document.body) {
+    document.querySelector(`[data-monitor-toggle="${Number(focusedMonitorId)}"]`)?.focus({preventScroll:true});
+  }
   if (gMonitorLifecycleTimer) clearTimeout(gMonitorLifecycleTimer);
   gMonitorLifecycleTimer = null;
   if (list.some(m => ['Starting', 'Stopping'].includes(m.lifecycle_state))) {
@@ -3748,19 +3762,73 @@ async function addMonitor() {
   }
 }
 
+function showMonitorStartDialog(current, preview) {
+  if (document.querySelector('.monitor-start-dialog[open]')) return Promise.resolve(false);
+  const channels = Array.isArray(preview?.channels) ? preview.channels : [];
+  const blocked = Boolean(preview?.blocked) || channels.some(channel => channel.blocked);
+  const valid = channels.length > 0 && typeof preview?.revision === 'string' && preview.revision.length > 0
+    && preview.policy && preview.policy.version === 1;
+  const canStart = valid && !blocked;
+  const visibility = {private:'Riêng tư',unlisted:'Không công khai',public:'Công khai'};
+  const origins = {monitor:'nguồn tự động',option:'bộ tùy chọn',channel:'kênh'};
+  const field = (label, value) => `<div><dt>${label}</dt><dd>${escapeHtml(String(value ?? 'Chưa xác định'))}</dd></div>`;
+  const rows = channels.map(channel => {
+    const source = key => origins[channel.sources?.[key]] || 'chưa xác định';
+    const reasons = (channel.reasons || []).map((reason, index) =>
+      `<li class="upload-preview-error">${escapeHtml(channel.reason_codes?.[index] || 'UPLOAD_BLOCKED')}: ${escapeHtml(reason)}</li>`).join('');
+    return `<li class="upload-preview-item"><div class="upload-preview-item-title"><h3>${escapeHtml(channel.channel_name || 'Kênh chưa xác định')}</h3><span class="upload-preview-badge ${channel.blocked || channel.visibility === 'public' ? 'upload-preview-warning' : ''}">${escapeHtml(channel.blocked ? 'Cần xử lý' : visibility[channel.visibility] || 'Chưa xác định')}</span></div>
+      <dl>${field('Kênh YouTube',channel.youtube_channel_id || `Kênh trong tool #${channel.channel_id}`)}
+      ${field('Phương thức',channel.upload_mode === 'youtube_api' ? 'YouTube Data API · OAuth 2.0' : channel.upload_mode === 'playwright' ? 'YouTube Studio' : 'Kiểm tra cấu hình kênh')}
+      ${field('Profile',channel.profile_name || (channel.upload_mode === 'youtube_api' ? 'Theo OAuth của kênh' : 'Chưa xác định'))}
+      ${field('Hiển thị',`${visibility[channel.visibility] || 'Chưa xác định'} · từ ${source('visibility')}`)}
+      ${field('Dành cho trẻ em',`${channel.made_for_kids ? 'Có' : 'Không'} · từ ${source('made_for_kids')}`)}
+      ${field('Nhãn nội dung AI',`${channel.altered_content ? 'Có' : 'Không'} · từ ${source('altered_content')}`)}</dl>
+      <p class="ui-message-copy">${escapeHtml(effectiveMetadataLines(channel.metadata_effective).join('\n'))}</p>${reasons ? `<ul class="upload-preview-notes">${reasons}</ul>` : ''}</li>`;
+  }).join('');
+  const dialog = document.createElement('dialog');
+  const opener = document.activeElement;
+  dialog.className = 'workspace-dialog upload-preview-dialog monitor-start-dialog';
+  dialog.setAttribute('aria-labelledby', 'monitor-start-title');
+  dialog.innerHTML = `<form method="dialog"><header><h2 id="monitor-start-title">Xem trước nguồn tự động</h2>
+    <p>${escapeHtml(current.name || `Nguồn #${current.id}`)} · ${channels.length} kênh đích có thể được chọn</p>
+    ${!valid ? '<p class="upload-preview-error">Chưa đủ dữ liệu xác nhận. Đóng và tải lại nguồn trước khi thử lại.</p>' : ''}
+    ${blocked ? '<p class="upload-preview-error">Cấu hình đang bị chặn. Sửa kênh hoặc bộ tùy chọn rồi xem trước lại.</p>' : ''}</header>
+    <div class="upload-preview-body"><dl class="monitor-start-summary">${field('Nguồn sẽ quét',current.source_urls)}${field('Chu kỳ quét',`${current.check_interval_minutes} phút`)}${field('Tối đa mỗi lần quét',`${current.max_videos_per_scan} video`)}${field('AI biên tập',current.ai_Action || 'Theo cấu hình nguồn')}</dl>
+    <p class="ui-message-copy">Sau khi bật, nguồn quét định kỳ → AI nếu có → tạo hàng đợi → tải → render → đăng video mới theo cấu hình đã duyệt. Mỗi video được chọn một kênh theo quy tắc phân phối; danh sách dưới đây là các đích có thể được chọn.</p>
+    <p class="ui-message-copy">Upload dùng chung khoảng nghỉ ít nhất 30 phút sau lượt trước. Video lỗi giữ trong hàng đợi để kiểm tra, không tự đăng lại. Thay đổi cấu hình đích hoặc metadata cần xem trước và xác nhận lại.</p>
+    <p class="ui-message-copy">Dừng nguồn ở Theo dõi nguồn và đợi worker kết thúc. Nút dừng lô không dừng nguồn này. Nguồn đã bật có thể được phục hồi khi tool khởi động lại; giữ máy chạy và kiểm tra trạng thái nguồn trước khi rời máy.</p>
+    <ul class="upload-preview-list" aria-label="Kênh của nguồn tự động">${rows}</ul></div>
+    <footer class="quick-queue-actions"><button class="btn btn-outline" type="submit" value="close" autofocus>Đóng</button>${canStart ? '<button class="btn btn-success" type="submit" value="start">Xác nhận và bật nguồn</button>' : ''}</footer></form>`;
+  document.body.append(dialog);
+  return new Promise(resolve => {
+    dialog.addEventListener('close', () => {
+      const accepted = canStart && dialog.returnValue === 'start';
+      dialog.remove();
+      const target = opener?.isConnected && opener !== document.body ? opener
+        : document.querySelector(`[data-monitor-toggle="${Number(current.id)}"]:not(:disabled)`)
+          || document.querySelector('.nav-tab[data-tab="tab-monitor"]');
+      target?.focus({preventScroll:true});
+      resolve(accepted);
+    }, {once:true});
+    dialog.showModal();
+  });
+}
+
 async function toggleMonitor(id) {
+  id = Number(id);
+  if (gMonitorTogglePending.has(id)) return;
+  gMonitorTogglePending.add(id);
   try {
     const monitors = await apiFetch('/api/monitors');
-    const current = monitors.find(m => m.id === id);
-    if (current && !current.is_running) {
+    const current = monitors.find(m => Number(m.id) === id);
+    if (!current) throw new Error('Nguồn không còn trong danh sách. Tải lại trước khi thử lại.');
+    if (['Starting','Stopping'].includes(current.lifecycle_state)) {
+      showToast('Nguồn đang chuyển trạng thái. Đợi worker cập nhật trước khi thao tác tiếp.', 'warning');
+      return;
+    }
+    if (!current.is_running) {
       const preview = await apiFetch(`/api/monitors/${id}/metadata-preview`);
-      const sourceLabel = { monitor: 'monitor', option: 'bộ tùy chọn', channel: 'kênh' };
-      const lines = preview.channels.map(c => `${c.channel_name}: ${c.visibility} (${sourceLabel[c.sources.visibility]}), Trẻ em: ${c.made_for_kids ? 'Có' : 'Không'} (${sourceLabel[c.sources.made_for_kids]}), AI: ${c.altered_content ? 'Có' : 'Không'} (${sourceLabel[c.sources.altered_content]})\n${effectiveMetadataLines(c.metadata_effective).join('\n')}\n${(c.reasons || []).map((reason, i) => `Bị chặn [${c.reason_codes?.[i] || 'UPLOAD_BLOCKED'}]: ${reason}`).join('\n')}`);
-      if (preview.blocked || preview.channels.some(c => c.blocked)) {
-        alert(`Chưa thể bật Monitor. Sửa cấu hình các kênh rồi xem trước lại:\n\n${lines.join('\n\n')}`);
-        return;
-      }
-      if (!confirm(`Xác nhận metadata trước khi bật monitor:\n\n${lines.join('\n')}\n\nThay đổi cấu hình sau xác nhận sẽ chặn các lượt đăng tiếp theo.`)) return;
+      if (!await showMonitorStartDialog(current, preview)) return;
       await apiFetch(`/api/monitors/${id}/metadata-confirm`, { method: 'POST', body: JSON.stringify({ policy: preview.policy, revision: preview.revision }) });
     }
     const result = await apiFetch(`/api/monitors/${id}/toggle`, { method: 'POST' });
@@ -3768,7 +3836,9 @@ async function toggleMonitor(id) {
   } catch (e) {
     alert(e.message);
   } finally {
-    await loadMonitors();
+    try { await loadMonitors(); }
+    catch (_) { showToast('Chưa tải lại được trạng thái nguồn. Kiểm tra trước khi thao tác tiếp.', 'warning'); }
+    finally { gMonitorTogglePending.delete(id); }
   }
 }
 

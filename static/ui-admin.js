@@ -195,7 +195,7 @@
       ['1. Nguồn', ['mon-name', 'mon-urls'], 'Mỗi dòng là một nguồn theo dõi.'],
       ['2. Đích đăng', ['mon-channel', 'mon-visibility'], 'Chọn kênh cụ thể hoặc phân phối theo nhóm. Các giá trị kế thừa sẽ được kiểm tra trước khi bật luồng.'],
       ['3. Xử lý', ['mon-render', 'mon-ai-action']],
-      ['4. Chu kỳ', ['mon-interval'], 'Lưu cấu hình chưa khởi chạy. Bấm Chạy trong danh sách để kiểm tra và bắt đầu.'],
+      ['4. Chu kỳ', ['mon-interval'], 'Lưu cấu hình chưa khởi chạy. Bấm Bật nguồn trong danh sách để kiểm tra và bắt đầu.'],
     ]);
     form.querySelector('button[onclick="addMonitor()"]')?.classList.add('admin-save-action');
     const editor = disclosure('monitor', form, 'Tạo luồng theo dõi', 'mon-name');

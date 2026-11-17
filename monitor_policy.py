@@ -108,7 +108,10 @@ def preview(conn, mon, raw_policy=None):
         except UploadCapabilityError as exc:
             issues = exc.issues
             resolved = None
-        rows.append({'channel_id': channel['id'], 'channel_name': channel['name'], **values, 'sources': sources,
+        rows.append({'channel_id': channel['id'], 'channel_name': channel['name'],
+                     'youtube_channel_id': channel.get('channel_id') or '',
+                     'profile_name': channel.get('profile_name') or '',
+                     'upload_mode': channel.get('upload_mode') or 'playwright', **values, 'sources': sources,
                      'metadata_effective': resolved,
                      'blocked': bool(issues), 'reasons': [issue['message'] for issue in issues],
                      'reason_codes': [issue['code'] for issue in issues], 'capability_issues': issues})

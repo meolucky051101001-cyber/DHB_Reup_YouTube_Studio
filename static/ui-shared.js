@@ -37,7 +37,7 @@
       if (input.dataset.timezoneHint) return;
       input.dataset.timezoneHint = 'true';
       const hint = document.createElement('small'); hint.className = 'ui-field-hint';
-      hint.textContent = `Giờ địa phương trên máy: ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`;
+      hint.textContent = `Lịch phát hành dùng giờ trên máy chạy tool. Múi giờ trình duyệt: ${Intl.DateTimeFormat().resolvedOptions().timeZone}; kiểm tra hai máy cùng múi giờ nếu truy cập từ máy khác.`;
       input.after(hint);
     });
     root.querySelectorAll('button').forEach(button => {

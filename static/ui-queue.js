@@ -147,8 +147,8 @@
     group('Nhập / xuất', [['exportExcel()','Xuất Excel'],['triggerImportExcel()','Excel: cập nhật video'],['exportCsv()','CSV: xuất toàn dự án'],['triggerImportCsv()','CSV: thêm video']]);
     controls.excel = find('exportExcel()'); controls.importExcel = find('triggerImportExcel()');
     main.append(menus);
-    controls.stop = find('stopPipeline()'); move(controls.stop,main,'Dừng toàn hệ thống');
-    if (controls.stop) {controls.stop.className = 'btn btn-danger'; controls.stop.hidden = true; controls.stop.title = 'Yêu cầu dừng toàn bộ pipeline. Video đang upload có thể hoàn tất trước khi dừng hẳn.';}
+    controls.stop = find('stopPipeline()'); move(controls.stop,main,'Dừng lô hiện tại');
+    if (controls.stop) {controls.stop.className = 'btn btn-danger'; controls.stop.hidden = true; controls.stop.title = 'Dừng lô thủ công đang chạy. Video đang upload có thể hoàn tất trước khi dừng hẳn. Nguồn tự động cần dừng riêng ở Theo dõi nguồn.';}
     const filters = document.createElement('div'); filters.className = 'uq-filters';
     const search = $('queue-search');
     if (search) { const wrap = search.closest('.search-input-wrap'); filters.append(wrap || search); wrap?.querySelector('.search-icon')?.setAttribute('aria-hidden','true'); search.setAttribute('aria-label','Tìm video theo tiêu đề, ID hoặc thông tin trong bảng'); search.placeholder = 'Tìm tiêu đề, mã video…'; }
@@ -308,7 +308,7 @@
   function updateRunning(data) {
     if (!ready) return;
     const stopping = data.batch_state === 'stopping';
-    if (controls.stop) {controls.stop.hidden = !data.pipeline_running && !stopping; controls.stop.disabled = stopping; controls.stop.textContent = stopping ? 'Đang dừng toàn hệ thống…' : 'Dừng toàn hệ thống';}
+    if (controls.stop) {controls.stop.hidden = !data.pipeline_running && !stopping; controls.stop.disabled = stopping; controls.stop.textContent = stopping ? 'Đang dừng lô hiện tại…' : 'Dừng lô hiện tại';}
   }
   function setError(message) {
     if (!ready) return;
@@ -318,7 +318,7 @@
   function onOverviewError() {
     if (!ready || !controls.stop) return;
     // Keep a previously visible stop action available when telemetry is stale.
-    controls.stop.title = 'Không đọc được trạng thái mới. Hành động này yêu cầu dừng toàn bộ pipeline theo kiểm tra của máy chủ.';
+    controls.stop.title = 'Không đọc được trạng thái mới. Hành động này yêu cầu dừng lô thủ công theo kiểm tra của máy chủ; nguồn tự động cần dừng riêng.';
   }
   function openSource(mode = 'scan') {
     if (!ready) init(); const panel = $('queue-source-panel'); if (!panel) return;

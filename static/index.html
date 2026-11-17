@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="/static/ui-queue.css?v=ui-20261117" />
   <link rel="stylesheet" href="/static/ui-content.css?v=ui-20261117" />
   <link rel="stylesheet" href="/static/ui-admin.css?v=ui-20261117" />
+  <link rel="stylesheet" href="/static/ui-publish.css?v=publish-20261117" />
 </head>
 <body>
   <a class="skip-link" href="#main-content">Đi đến nội dung</a>
@@ -457,7 +458,7 @@
                   <button class="btn btn-outline btn-sm" onclick="reviewUploadSlot()">Kiểm tra lượt upload</button>
                   <button class="btn btn-accent btn-sm" onclick="startPipeline(true, false, false)" title="Chỉ tải video về máy">⬇️ Chỉ Tải</button>
                   <button class="btn btn-purple btn-sm" onclick="startPipeline(false, true, false)" title="Chỉ render xử lý video FFmpeg">🎬 Chỉ Render</button>
-                  <button class="btn btn-warning btn-sm" onclick="stopPipeline()" title="Dừng toàn bộ luồng xử lý">⏹️ Dừng</button>
+                  <button class="btn btn-warning btn-sm" onclick="stopPipeline()" title="Dừng lô hiện tại; nguồn tự động cần dừng riêng">⏹️ Dừng lô hiện tại</button>
                 </div>
                 <div>
                   <button type="button" class="btn btn-outline btn-sm" id="btn-toggle-sidebar" onclick="toggleSidebar()" title="Ẩn/Hiện cột thiết lập bên trái để mở rộng bảng video tối đa">
@@ -1764,7 +1765,7 @@
         </div>
         <div id="as-summary" style="background:rgba(56,189,248,0.07); border:1px dashed #38bdf8; border-radius:8px; padding:10px 12px; font-size:12.5px; line-height:1.7; color:#e2e8f0;"></div>
         <div style="font-size:11.5px; color:var(--text-muted); margin-top:8px; line-height:1.55;">
-          🛡️ An toàn tài khoản: hệ thống ép giãn cách <b>tối thiểu 30 phút/video</b> (chống spam). Mặc định bắt đầu sau 60 phút để kịp upload trước giờ phát hành.
+          Đây là <b>giờ YouTube phát hành</b>, không tự bắt đầu lô upload. Lưu lịch xong vẫn cần xem trước và xác nhận chạy. Upload dùng chung khoảng nghỉ ít nhất 30 phút sau khi lượt trước kết thúc; cần dự trù cả thời gian tải, render và upload trước giờ phát hành.
           Đối tượng tuổi (trên/dưới 18, trẻ em), nhãn AI và chất lượng HD đặt ở khung "⚡ Gán Cấu Hình Nhanh" trước khi lên lịch.
         </div>
       </div>
@@ -1928,11 +1929,12 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=ui-20261117"></script>
-  <script src="/static/ui-shared.js?v=ui-20261117"></script>
-  <script src="/static/ui-queue.js?v=ui-20261117"></script>
+  <script src="/static/app.js?v=publish-20261117"></script>
+  <script src="/static/ui-shared.js?v=publish-20261117"></script>
+  <script src="/static/ui-queue.js?v=publish-20261117"></script>
   <script src="/static/ui-content.js?v=ui-20261117"></script>
-  <script src="/static/ui-admin.js?v=ui-20261117"></script>
+  <script src="/static/ui-admin.js?v=publish-20261117"></script>
+  <script src="/static/ui-publish.js?v=publish-20261117"></script>
 </body>
 </html>
 
