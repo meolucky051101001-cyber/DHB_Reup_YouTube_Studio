@@ -387,7 +387,7 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.18-gemini3"
+APP_BUILD_VERSION = "2026.11.18-oauth"
 
 
 def get_schedule_state_dir() -> Path:
@@ -4589,6 +4589,170 @@ def api_check_channel_oauth(channel_id: int):
     else:
         add_log("Channel", f"OAuth token kênh #{channel_id} lỗi: {result.get('error')}", "ERROR", channel_name=ch["name"])
     return result
+
+
+def _find_same_profile_oauth_client(conn, profile_name: str, prefer_channel_id: int) -> Optional[Dict[str, Any]]:
+    prof = str(profile_name or "").strip()
+    if not prof:
+        return None
+    rows = conn.execute(
+        "SELECT id, name, oauth_token_json FROM youtube_channels "
+        "WHERE profile_name = ? AND COALESCE(oauth_token_json, '') != '' "
+        "ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, id ASC",
+        (prof, prefer_channel_id),
+    ).fetchall()
+    for row in rows:
+        try:
+            parsed = json.loads(row["oauth_token_json"] or "{}")
+        except Exception:
+            continue
+        cid = str(parsed.get("client_id") or "").strip()
+        csec = str(parsed.get("client_secret") or "").strip()
+        if cid.endswith(".apps.googleusercontent.com") and csec:
+            return {
+                "source_id": int(row["id"]),
+                "source_name": str(row["name"] or ""),
+                "client_id": cid,
+                "client_secret": csec,
+            }
+    return None
+
+
+@app.get("/api/channels/{channel_id}/oauth-setup-info")
+def api_channel_oauth_setup_info(channel_id: int):
+    from connect_youtube_oauth import extract_antidetect_profile_id
+
+    with closing(get_conn()) as conn:
+        ch = conn.execute("SELECT * FROM youtube_channels WHERE id = ?", (channel_id,)).fetchone()
+        if not ch:
+            raise HTTPException(404, "Không tìm thấy kênh.")
+        channel_data = dict(ch)
+        profile_name = str(channel_data.get("profile_name") or "").strip()
+        same_prof = _find_same_profile_oauth_client(conn, profile_name, channel_id)
+    prof = get_profile_binding(profile_name) if profile_name else None
+    ad_id = extract_antidetect_profile_id(channel_data, prof)
+    local_status = get_oauth_token_local_status(channel_data)
+    return {
+        "ok": True,
+        "channel_id": channel_id,
+        "channel_name": channel_data.get("name") or "",
+        "youtube_channel_id": channel_data.get("channel_id") or "",
+        "profile_name": profile_name,
+        "antidetect_bound": bool(ad_id),
+        "upload_mode": channel_data.get("upload_mode") or "playwright",
+        "already_configured": bool(local_status.get("configured") and not local_status.get("error")),
+        "same_profile_client_available": same_prof is not None,
+        "same_profile_source_id": same_prof["source_id"] if same_prof else None,
+        "same_profile_source_name": same_prof["source_name"] if same_prof else "",
+    }
+
+
+@app.post("/api/channels/{channel_id}/open-gcloud-console")
+def api_open_channel_gcloud_console(channel_id: int):
+    from connect_youtube_oauth import GCLOUD_YOUTUBE_API_URL, open_url_in_channel_browser
+
+    with closing(get_conn()) as conn:
+        ch = conn.execute("SELECT * FROM youtube_channels WHERE id = ?", (channel_id,)).fetchone()
+    if not ch:
+        raise HTTPException(404, "Không tìm thấy kênh.")
+    channel_data = dict(ch)
+    profile_name = str(channel_data.get("profile_name") or "").strip()
+    prof = get_profile_binding(profile_name) if profile_name else None
+    try:
+        opened = open_url_in_channel_browser(channel_data, GCLOUD_YOUTUBE_API_URL, prof)
+        add_log(
+            "Channel",
+            f"Đã mở Google Cloud Console trong Profile '{profile_name}' cho kênh #{channel_id}.",
+            "INFO",
+            channel_name=channel_data.get("name") or "",
+        )
+        return {"ok": True, "browser": opened.get("browser", ""), "profile_name": profile_name}
+    except Exception as exc:
+        raise HTTPException(400, f"Không mở được Google Cloud Console trong Profile: {exc}") from exc
+
+
+@app.post("/api/channels/{channel_id}/connect-oauth")
+def api_connect_channel_oauth(channel_id: int, data: Dict[str, Any] = Body(...)):
+    from connect_youtube_oauth import (
+        authorized_credentials,
+        open_url_in_channel_browser,
+        parse_desktop_client_json,
+    )
+    from youtube_uploader import _http_session_for_channel
+
+    activate = data.get("activate", True) is not False
+    use_same_profile = data.get("use_same_profile_client") is True
+    raw_client_json = str(data.get("client_json") or "").strip()
+
+    with closing(get_conn()) as conn:
+        ch = conn.execute("SELECT * FROM youtube_channels WHERE id = ?", (channel_id,)).fetchone()
+        if not ch:
+            raise HTTPException(404, "Không tìm thấy kênh.")
+        channel_data = dict(ch)
+        yt_cid = str(channel_data.get("channel_id") or "").strip()
+        if not re.fullmatch(r"UC[A-Za-z0-9_-]{22}", yt_cid):
+            raise HTTPException(400, "Kênh chưa có YouTube Channel ID (UC...) hợp lệ. Hãy quét kênh từ Profile trước.")
+        dup_count = conn.execute(
+            "SELECT COUNT(*) FROM youtube_channels WHERE channel_id = ?", (yt_cid,)
+        ).fetchone()[0]
+        if dup_count != 1:
+            raise HTTPException(409, "Channel ID này đang bị trùng nhiều dòng trong DHB. Hãy giữ đúng 1 dòng trước khi kết nối.")
+
+        profile_name = str(channel_data.get("profile_name") or "").strip()
+        if use_same_profile:
+            same_prof = _find_same_profile_oauth_client(conn, profile_name, channel_id)
+            if not same_prof:
+                raise HTTPException(400, "Profile này chưa có sẵn OAuth Client. Hãy chọn file JSON Desktop app từ Google Cloud.")
+            client_id, client_secret = same_prof["client_id"], same_prof["client_secret"]
+        else:
+            if not raw_client_json:
+                raise HTTPException(400, "Vui lòng chọn file OAuth Client JSON (Desktop app) tải về từ Google Cloud.")
+            try:
+                client_id, client_secret = parse_desktop_client_json(raw_client_json)
+            except RuntimeError as exc:
+                raise HTTPException(400, str(exc)) from exc
+
+    prof = get_profile_binding(profile_name) if profile_name else None
+    http = _http_session_for_channel(channel_data)
+    try:
+        creds, identity = authorized_credentials(
+            http,
+            client_id,
+            client_secret,
+            yt_cid,
+            open_url=lambda url: open_url_in_channel_browser(channel_data, url, prof),
+            timeout_seconds=240,
+            return_identity=True,
+        )
+    except RuntimeError as exc:
+        add_log("Channel", f"Kết nối OAuth kênh #{channel_id} chưa hoàn tất: {exc}", "WARNING", channel_name=channel_data.get("name") or "")
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        add_log("Channel", f"Lỗi mạng khi kết nối OAuth kênh #{channel_id}: {exc}", "ERROR", channel_name=channel_data.get("name") or "")
+        raise HTTPException(502, "Kết nối mạng tới Google hoặc trình duyệt Antidetect thất bại.") from exc
+    finally:
+        close_fn = getattr(http, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    update_payload: Dict[str, Any] = {"oauth_token_json": json.dumps(creds)}
+    if activate:
+        update_payload["upload_mode"] = "youtube_api"
+    api_update_channel(channel_id, update_payload)
+    add_log(
+        "Channel",
+        f"Đã kết nối OAuth thành công cho kênh #{channel_id} '{identity['name']}' ({yt_cid})"
+        + (" và chuyển sang YouTube Data API." if activate else "."),
+        "SUCCESS",
+        channel_name=channel_data.get("name") or "",
+    )
+    return {
+        "ok": True,
+        "channel_id": channel_id,
+        "youtube_channel_id": identity["channel_id"],
+        "identity_name": identity["name"],
+        "upload_mode": "youtube_api" if activate else (channel_data.get("upload_mode") or "playwright"),
+    }
 
 
 @app.get("/api/groups")

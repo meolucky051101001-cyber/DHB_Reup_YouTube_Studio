@@ -1136,6 +1136,7 @@ function renderChannelTable(list) {
         <td style="font-size:11.5px;color:#38bdf8;"><b>👤 ${escapeHtml(c.profile_name || 'Mặc định')}</b></td>
         <td>${stBadge}</td>
         <td>
+          <button class="btn ${c.upload_mode === 'youtube_api' && c.has_oauth_token ? 'btn-outline' : 'btn-primary'} btn-sm" onclick="openChannelOauthWizard(${c.id})" title="Kết nối / cấp quyền YouTube Data API ngay trong trình duyệt Antidetect của Profile này">${c.upload_mode === 'youtube_api' && c.has_oauth_token ? '🔑 Đổi API' : '🔑 Nối API'}</button>
           <button class="btn btn-accent btn-sm" onclick="openChannelBrowser(${c.id})" title="Mở Chrome để đăng nhập Google cho Profile này">🌐 Đăng Nhập</button>
           <button class="btn btn-outline btn-sm" onclick="checkChannelLogin(${c.id})" title="Kiểm tra phiên đăng nhập Google của Profile">🔍</button>
           <button class="btn btn-outline btn-sm" onclick="openChannelEdit(${c.id})" title="Sửa chi tiết kênh (tên, handle, Channel ID, profile, OAuth token...)">✏️</button>
@@ -1587,6 +1588,145 @@ async function checkChannelOauth(id) {
     alert('Lỗi kiểm tra OAuth token: ' + e.message);
     await loadChannelOauthStatus(id);
   }
+}
+
+async function openChannelOauthWizard(channelId) {
+  let info;
+  try {
+    info = await apiFetch(`/api/channels/${channelId}/oauth-setup-info`);
+  } catch (err) {
+    alert('Không đọc được thông tin OAuth của kênh: ' + (err?.message || err));
+    return;
+  }
+  if (!info.youtube_channel_id) {
+    alert('Kênh này chưa có YouTube Channel ID (UC...). Hãy bấm Quét kênh của Profile tương ứng trước.');
+    return;
+  }
+
+  document.getElementById('oauth-wizard-dialog')?.remove();
+  const dialog = document.createElement('dialog');
+  dialog.id = 'oauth-wizard-dialog';
+  dialog.className = 'workspace-dialog';
+  dialog.style.maxWidth = '640px';
+  dialog.style.width = '94vw';
+  dialog.innerHTML = `
+    <div style="padding:20px 22px;display:flex;flex-direction:column;gap:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div>
+          <h3 style="margin:0 0 4px 0;">🔑 Kết nối YouTube Data API — #${Number(info.channel_id)} ${escapeHtml(info.channel_name)}</h3>
+          <div style="font-size:12px;color:var(--text-muted);">
+            🆔 <b>${escapeHtml(info.youtube_channel_id)}</b> · 👤 Profile cách ly: <b style="color:#38bdf8;">${escapeHtml(info.profile_name || 'Mặc định')}</b>
+          </div>
+        </div>
+        <button type="button" class="btn btn-outline btn-sm" data-oauth-close>Đóng</button>
+      </div>
+
+      ${info.same_profile_client_available ? `
+        <div style="padding:12px 14px;border-radius:10px;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.35);font-size:13px;">
+          <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;margin:0;">
+            <input type="checkbox" id="oauth-use-same-profile" checked style="margin-top:3px;" />
+            <span>
+              <b>Dùng luôn OAuth Client sẵn có của cùng Profile này</b> (từ kênh #${Number(info.same_profile_source_id)} <i>${escapeHtml(info.same_profile_source_name)}</i>).<br/>
+              <small style="color:var(--text-muted);">Không cần vào Google Cloud tạo lại file JSON! Chỉ cần mở Antidetect bên dưới và bấm chọn đúng kênh <b>${escapeHtml(info.channel_name)}</b>.</small>
+            </span>
+          </label>
+        </div>
+      ` : ''}
+
+      <div id="oauth-new-client-section" style="display:${info.same_profile_client_available ? 'none' : 'flex'};flex-direction:column;gap:12px;padding:12px 14px;border-radius:10px;background:rgba(30,41,59,0.7);border:1px solid var(--border-color);">
+        <div style="font-size:13px;line-height:1.55;">
+          <b>Bước 1: Tạo OAuth Client riêng ngay trong cửa sổ Antidetect của Profile này</b> (chống liên đới tài khoản & có riêng ~6 lượt upload/ngày):
+          <ol style="margin:6px 0 8px 18px;padding:0;font-size:12.5px;color:var(--text-muted);">
+            <li>Bấm nút bên dưới để mở Google Cloud ngay trong trình duyệt Antidetect của Profile này → tạo Project mới → bấm <b>ENABLE</b> cho <i>YouTube Data API v3</i>.</li>
+            <li>Vào <b>Google Auth Platform / OAuth consent screen</b> → chọn <b>External</b> → điền tên app → bấm <b>Publish App (In production)</b> để token không hết hạn sau 7 ngày.</li>
+            <li>Vào <b>Clients / Credentials</b> → <b>Create Credentials → OAuth client ID</b> → chọn loại <b>Desktop app</b> → bấm <b>Download JSON</b>.</li>
+          </ol>
+          <button type="button" class="btn btn-outline btn-sm" id="oauth-open-gcloud-btn">🌐 1. Mở Google Cloud Console trong Antidetect Profile này</button>
+        </div>
+        <div style="font-size:13px;">
+          <label style="display:block;font-weight:600;margin-bottom:6px;">Bước 2: Chọn file <code>client_secret_*.json</code> vừa tải về:</label>
+          <input type="file" id="oauth-client-file" accept=".json,application/json" style="width:100%;" />
+        </div>
+      </div>
+
+      <div id="oauth-wizard-status" role="status" aria-live="polite" style="font-size:13px;padding:10px 12px;border-radius:8px;background:rgba(15,23,42,0.7);border:1px solid var(--border-color);color:var(--text-muted);">
+        Sẵn sàng kết nối. Cửa sổ xin quyền sẽ mở <b>trực tiếp bên trong trình duyệt Antidetect</b> của Profile này (không dùng Chrome ngoài).
+      </div>
+
+      <div style="display:flex;justify-content:flex-end;gap:10px;">
+        <button type="button" class="btn btn-success" id="oauth-connect-submit">🚀 Mở Antidetect Cấp Quyền & Bật YouTube API</button>
+      </div>
+    </div>
+  `;
+  document.body.append(dialog);
+
+  const sameProfCb = dialog.querySelector('#oauth-use-same-profile');
+  const newClientSec = dialog.querySelector('#oauth-new-client-section');
+  const statusBox = dialog.querySelector('#oauth-wizard-status');
+  const submitBtn = dialog.querySelector('#oauth-connect-submit');
+  const gcloudBtn = dialog.querySelector('#oauth-open-gcloud-btn');
+  const fileInput = dialog.querySelector('#oauth-client-file');
+
+  dialog.querySelector('[data-oauth-close]').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => dialog.remove(), {once: true});
+
+  if (sameProfCb && newClientSec) {
+    sameProfCb.addEventListener('change', () => {
+      newClientSec.style.display = sameProfCb.checked ? 'none' : 'flex';
+    });
+  }
+
+  if (gcloudBtn) {
+    gcloudBtn.addEventListener('click', async () => {
+      gcloudBtn.disabled = true;
+      statusBox.style.color = '#38bdf8';
+      statusBox.textContent = '⏳ Đang bật trình duyệt Antidetect và mở Google Cloud Console...';
+      try {
+        await apiFetch(`/api/channels/${channelId}/open-gcloud-console`, {method: 'POST', body: JSON.stringify({})});
+        statusBox.style.color = '#34d399';
+        statusBox.textContent = '✅ Đã mở Google Cloud Console trong cửa sổ Antidetect! Sau khi tải file Desktop JSON về, hãy chọn file ở Bước 2 rồi bấm nút Kết nối.';
+      } catch (err) {
+        statusBox.style.color = '#f87171';
+        statusBox.textContent = '❌ ' + (err?.message || err);
+      } finally {
+        gcloudBtn.disabled = false;
+      }
+    });
+  }
+
+  submitBtn.addEventListener('click', async () => {
+    const useSame = Boolean(sameProfCb && sameProfCb.checked);
+    let clientJsonText = '';
+    if (!useSame) {
+      const file = fileInput?.files?.[0];
+      if (!file) {
+        statusBox.style.color = '#f87171';
+        statusBox.textContent = '⚠️ Vui lòng chọn file client_secret_*.json (Desktop app) trước khi bấm kết nối.';
+        return;
+      }
+      clientJsonText = await file.text();
+    }
+    submitBtn.disabled = true;
+    statusBox.style.color = '#fbbf24';
+    statusBox.textContent = `⏳ Đang mở cửa sổ Antidetect cho "${info.channel_name}" (${info.youtube_channel_id})... Hãy chọn ĐÚNG kênh này trên màn hình Google và bấm Cho phép (Allow)!`;
+    try {
+      const res = await apiFetch(`/api/channels/${channelId}/connect-oauth`, {
+        method: 'POST',
+        body: JSON.stringify({use_same_profile_client: useSame, client_json: clientJsonText, activate: true}),
+      });
+      statusBox.style.color = '#34d399';
+      statusBox.textContent = `✅ Đã kết nối thành công kênh "${res.identity_name}" (${res.youtube_channel_id}) và bật chế độ YouTube Data API!`;
+      await loadChannels();
+      if (typeof showToast === 'function') showToast(`Đã bật YouTube API cho kênh ${res.identity_name}!`, 'success');
+      setTimeout(() => { if (dialog.open) dialog.close(); }, 1400);
+    } catch (err) {
+      statusBox.style.color = '#f87171';
+      statusBox.textContent = '❌ ' + (err?.message || err);
+      submitBtn.disabled = false;
+    }
+  });
+
+  dialog.showModal();
 }
 
 async function saveChannelEdit() {

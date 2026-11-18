@@ -51,3 +51,52 @@ class DesktopOAuthTests(unittest.TestCase):
                 oauth.authorized_credentials(http, "client", "secret", "expected")
         self.assertEqual(http.post.call_args.kwargs["data"]["grant_type"], "refresh_token")
         self.assertEqual(http.get.call_args.kwargs["headers"]["Authorization"], "Bearer fresh")
+
+    def test_parse_desktop_client_json_and_antidetect_browser_isolation(self):
+        cid, csec = oauth.parse_desktop_client_json(
+            '{"installed":{"client_id":"123-abc.apps.googleusercontent.com","client_secret":"GOCSPX-secret"}}'
+        )
+        self.assertEqual(cid, "123-abc.apps.googleusercontent.com")
+        self.assertEqual(csec, "GOCSPX-secret")
+
+        with self.assertRaisesRegex(RuntimeError, "Desktop app"):
+            oauth.parse_desktop_client_json('{"web":{"client_id":"123.apps.googleusercontent.com","client_secret":"x"}}')
+
+        # Antidetect-bound channel must NEVER fall back to system webbrowser.open
+        with mock.patch.object(oauth.webbrowser, "open") as sys_open:
+            with self.assertRaisesRegex(RuntimeError, "thiếu ID liên kết"):
+                oauth.open_url_in_channel_browser(
+                    {"profile_path": ""},
+                    "https://accounts.google.com/o/oauth2/v2/auth",
+                    profile_binding={"source": "Antidetect", "antidetect_profile_id": ""},
+                )
+            sys_open.assert_not_called()
+
+    def test_same_profile_client_isolation_exposes_no_secrets(self):
+        import sqlite3
+        import app as studio_app
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE youtube_channels (id INTEGER PRIMARY KEY, name TEXT, profile_name TEXT, oauth_token_json TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO youtube_channels VALUES (66, 'Chị Đẹp Biết Tuốt', 'Profile 5', "
+            "'{\"client_id\":\"879-xyz.apps.googleusercontent.com\",\"client_secret\":\"sec-5\",\"refresh_token\":\"rt-66\"}')"
+        )
+        conn.execute("INSERT INTO youtube_channels VALUES (65, 'Vô tri mỗi ngày', 'Profile 5', '')")
+        conn.execute("INSERT INTO youtube_channels VALUES (62, 'Other Profile Channel', 'Profile 2', '')")
+
+        found_p5 = studio_app._find_same_profile_oauth_client(conn, "Profile 5", 65)
+        self.assertIsNotNone(found_p5)
+        self.assertEqual(found_p5["source_id"], 66)
+        self.assertEqual(found_p5["client_id"], "879-xyz.apps.googleusercontent.com")
+
+        found_p2 = studio_app._find_same_profile_oauth_client(conn, "Profile 2", 62)
+        self.assertIsNone(found_p2)
+        conn.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
