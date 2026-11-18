@@ -610,6 +610,52 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
             "Xem chi tiết tại https://example.com/item_12345678",
         )
 
+    def test_gemini_3_flash_preserved_and_retries_next_candidate_on_503_or_404(self):
+        import ai_engine
+
+        self.assertEqual(ai_engine._normalize_gemini_model("gemini-3.8-flash"), "gemini-3.8-flash")
+        self.assertEqual(ai_engine._normalize_gemini_model("models/gemini-3-flash-preview"), "gemini-3-flash-preview")
+
+        called_urls = []
+
+        class FakeResp:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+            def json(self):
+                return self._payload
+
+        def fake_post(url, **_kwargs):
+            called_urls.append(url)
+            if "gemini-3.8-flash" in url:
+                return FakeResp(503, {"error": {"code": 503}})
+            return FakeResp(200, {
+                "candidates": [{
+                    "content": {
+                        "parts": [
+                            {"thought": True, "text": "internal reasoning"},
+                            {"text": '{"title":"Tiêu đề chuẩn #shorts","description":"Mô tả","tags":"shorts, meovat"}'},
+                        ]
+                    }
+                }]
+            })
+
+        with mock.patch.object(ai_engine, "get_settings", return_value={"gemini_api_key": "AQ.test-key", "gemini_model": "gemini-3.8-flash"}), \
+                mock.patch.object(ai_engine.requests, "post", side_effect=fake_post), \
+                mock.patch.object(ai_engine, "add_log"):
+            out = ai_engine.ai_optimize_youtube_metadata("Dubbed_telegram_15230fc0090b4d6ea7cab7cc409dbb84_紧凑版卡套", provider="gemini")
+        self.assertFalse(out["fallback"])
+        self.assertEqual(out["provider_used"], "gemini")
+        self.assertEqual(out["title"], "Tiêu đề chuẩn #shorts")
+        self.assertEqual(len(called_urls), 2)
+        self.assertIn("gemini-3.8-flash", called_urls[0])
+        self.assertIn("gemini-3-flash-preview", called_urls[1])
+
 
 if __name__ == "__main__":
     unittest.main()
