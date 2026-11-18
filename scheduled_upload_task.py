@@ -64,7 +64,7 @@ def task_xml(*, task_name, python, runtime_dir, state_dir, start_at, interval_da
     element(action, "Command", interpreter)
     element(action, "Arguments", f'-B "{runtime / "scheduled_upload_runner.py"}" run --runtime-dir "{runtime}" --state-dir "{state}"')
     element(action, "WorkingDirectory", runtime)
-    return ET.tostring(root, encoding="unicode", xml_declaration=True)
+    return '<?xml version="1.0" encoding="UTF-16"?>\n' + ET.tostring(root, encoding="unicode", xml_declaration=False)
 
 
 def prepare_plan(*, task_name, python, runtime_dir, state_dir, output_dir):
@@ -128,7 +128,8 @@ def apply_plan(plan_dir):
         "  $uid.InnerText=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; "
         "  $p.PrependChild($uid) | Out-Null "
         "}; "
-        "Register-ScheduledTask -TaskName $Name -Xml $doc.OuterXml -Force | Out-Null"
+        "$xmlText='<?xml version=\"1.0\" encoding=\"UTF-16\"?>' + [Environment]::NewLine + $doc.DocumentElement.OuterXml; "
+        "Register-ScheduledTask -TaskName $Name -Xml $xmlText -Force | Out-Null"
     )
     _powershell(script, {
         "DHB_TASK_NAME": plan["task_name"],
