@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import tempfile
 import time
 from urllib.parse import urlsplit
@@ -307,8 +309,37 @@ class LocalAPI:
         except (requests.RequestException, ValueError):
             raise ScheduleError("LOCAL_API_UNAVAILABLE") from None
 
-    def connect(self):
-        health = self.request("GET", "/health/dhb")
+    def _ensure_local_server(self, port: int) -> dict:
+        try:
+            return self.request("GET", "/health/dhb", timeout=4)
+        except ScheduleError:
+            if not (self.runtime_dir / "app.py").is_file() or not Path(sys.executable).is_file():
+                raise
+            log_dir = self.runtime_dir / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            with (log_dir / "scheduled-server.log").open("ab") as log_handle:
+                subprocess.Popen(
+                    [sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(port), "--no-access-log"],
+                    cwd=self.runtime_dir,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=log_handle,
+                    creationflags=flags,
+                    close_fds=True,
+                )
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline:
+                time.sleep(1)
+                try:
+                    return self.request("GET", "/health/dhb", timeout=3)
+                except ScheduleError:
+                    continue
+            raise ScheduleError("LOCAL_API_UNAVAILABLE")
+
+    def connect(self, *, auto_start=False):
+        parsed_port = urlsplit(self.base).port or 8686
+        health = self._ensure_local_server(parsed_port) if auto_start else self.request("GET", "/health/dhb")
         if (health.get("application") != APPLICATION
                 or Path(str(health.get("source_root", ""))).resolve() != self.runtime_dir.resolve()):
             raise ScheduleError("RUNTIME_IDENTITY_CHANGED")
@@ -447,7 +478,10 @@ class ScheduleRunner:
             validate_release(release, self.runtime)
             self.api = self.api_factory(self.base_url, self.runtime, release)
             try:
-                self.api.connect()
+                if self.api_factory is LocalAPI and not dry_run:
+                    self.api.connect(auto_start=True)
+                else:
+                    self.api.connect()
                 self.api.diagnostics()
                 self.api.verify_channel(self.manifest)
                 rows = self.api.queue(self.manifest)
