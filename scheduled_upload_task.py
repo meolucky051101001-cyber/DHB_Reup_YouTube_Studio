@@ -54,10 +54,10 @@ def task_xml(*, task_name, python, runtime_dir, state_dir, start_at, interval_da
     element(principal, "RunLevel", "LeastPrivilege")
     settings = element(root, "Settings")
     for name, value in (("MultipleInstancesPolicy", "IgnoreNew"), ("DisallowStartIfOnBatteries", "false"),
-                        ("StopIfGoingOnBatteries", "false"), ("StartWhenAvailable", "true"),
-                        ("RunOnlyIfNetworkAvailable", "true"), ("AllowHardTerminate", "true"),
-                        ("Enabled", "true"), ("Hidden", "false"), ("WakeToRun", "true"),
-                        ("ExecutionTimeLimit", "PT2H")):
+                        ("StopIfGoingOnBatteries", "false"), ("AllowHardTerminate", "true"),
+                        ("StartWhenAvailable", "true"), ("RunOnlyIfNetworkAvailable", "true"),
+                        ("AllowStartOnDemand", "true"), ("Enabled", "true"), ("Hidden", "false"),
+                        ("WakeToRun", "true"), ("ExecutionTimeLimit", "PT2H")):
         element(settings, name, value)
     actions = element(root, "Actions", attrs={"Context": "Operator"})
     action = element(actions, "Exec")
@@ -90,11 +90,15 @@ def prepare_plan(*, task_name, python, runtime_dir, state_dir, output_dir):
     return plan
 
 
-def _powershell(script, *arguments):
+def _powershell(script, env_vars):
     if os.name != "nt":
         raise ScheduleError("WINDOWS_REQUIRED")
-    result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
-                             "-Command", script, *map(str, arguments)], capture_output=True, text=True, timeout=60)
+    env = os.environ.copy()
+    env.update({key: str(value) for key, value in env_vars.items()})
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script],
+        env=env, capture_output=True, text=True, timeout=60,
+    )
     if result.returncode:
         raise ScheduleError("TASK_OPERATION_FAILED")
     return result.stdout
@@ -109,13 +113,28 @@ def apply_plan(plan_dir):
     backup = directory / "previous-task.xml"
     if backup.exists() or (directory / "registration.json").exists():
         raise ScheduleError("TASK_PLAN_ALREADY_APPLIED")
-    # All arguments are passed as separate process arguments; none are inserted into code.
-    script = ("param($Name,$XmlPath,$BackupPath) $ErrorActionPreference='Stop'; "
-              "$old=Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue; "
-              "if($old){ Export-ScheduledTask -TaskName $Name | Set-Content -LiteralPath $BackupPath -Encoding Unicode }; "
-              "$xml=Get-Content -LiteralPath $XmlPath -Raw; "
-              "Register-ScheduledTask -TaskName $Name -Xml $xml -Force | Out-Null")
-    _powershell(script, plan["task_name"], directory / "task.xml", backup)
+    # Pass paths and names strictly through environment variables, never interpolated into code.
+    script = (
+        "$ErrorActionPreference='Stop'; "
+        "$Name=$env:DHB_TASK_NAME; $XmlPath=$env:DHB_TASK_XML; $BackupPath=$env:DHB_TASK_BACKUP; "
+        "$old=Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue; "
+        "if($old){ Export-ScheduledTask -TaskName $Name | Set-Content -LiteralPath $BackupPath -Encoding UTF8 }; "
+        "[xml]$doc=Get-Content -LiteralPath $XmlPath -Raw -Encoding UTF8; "
+        "$ns=New-Object System.Xml.XmlNamespaceManager($doc.NameTable); "
+        "$ns.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task'); "
+        "$p=$doc.SelectSingleNode('//t:Principal',$ns); "
+        "if($p -and -not $p.SelectSingleNode('t:UserId',$ns)){ "
+        "  $uid=$doc.CreateElement('UserId','http://schemas.microsoft.com/windows/2004/02/mit/task'); "
+        "  $uid.InnerText=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; "
+        "  $p.PrependChild($uid) | Out-Null "
+        "}; "
+        "Register-ScheduledTask -TaskName $Name -Xml $doc.OuterXml -Force | Out-Null"
+    )
+    _powershell(script, {
+        "DHB_TASK_NAME": plan["task_name"],
+        "DHB_TASK_XML": directory / "task.xml",
+        "DHB_TASK_BACKUP": backup,
+    })
     save_json(directory / "registration.json", {"version": 1, "task_name": plan["task_name"], "had_previous_task": backup.exists()})
 
 
@@ -129,10 +148,16 @@ def restore_plan(plan_dir):
         backup = directory / "previous-task.xml"
         if not backup.is_file():
             raise ScheduleError("TASK_BACKUP_MISSING")
-        _powershell("param($Name,$Path) $ErrorActionPreference='Stop'; Register-ScheduledTask -TaskName $Name -Xml (Get-Content -LiteralPath $Path -Raw) -Force | Out-Null", plan["task_name"], backup)
+        _powershell(
+            "$ErrorActionPreference='Stop'; Register-ScheduledTask -TaskName $env:DHB_TASK_NAME -Xml (Get-Content -LiteralPath $env:DHB_TASK_BACKUP -Raw -Encoding UTF8) -Force | Out-Null",
+            {"DHB_TASK_NAME": plan["task_name"], "DHB_TASK_BACKUP": backup},
+        )
     else:
         # Disabling keeps audit history and makes rollback reviewable; never delete a Task here.
-        _powershell("param($Name) $ErrorActionPreference='Stop'; Disable-ScheduledTask -TaskName $Name | Out-Null", plan["task_name"])
+        _powershell(
+            "$ErrorActionPreference='Stop'; Disable-ScheduledTask -TaskName $env:DHB_TASK_NAME | Out-Null",
+            {"DHB_TASK_NAME": plan["task_name"]},
+        )
 
 
 def main(argv=None):
