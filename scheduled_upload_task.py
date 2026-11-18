@@ -67,6 +67,62 @@ def task_xml(*, task_name, python, runtime_dir, state_dir, start_at, interval_da
     return '<?xml version="1.0" encoding="UTF-16"?>\n' + ET.tostring(root, encoding="unicode", xml_declaration=False)
 
 
+def webserver_task_xml(*, task_name, python, runtime_dir, port=8686):
+    validate_name(task_name)
+    if type(port) is not int or not 1024 <= port <= 65535:
+        raise ScheduleError("TASK_PORT_INVALID")
+    runtime, interpreter = (Path(value).resolve() for value in (runtime_dir, python))
+    if any('"' in str(value) for value in (runtime, interpreter)):
+        raise ScheduleError("TASK_PATH_INVALID")
+    ET.register_namespace("", TASK_NS)
+    root = ET.Element(f"{{{TASK_NS}}}Task", {"version": "1.4"})
+    def element(parent, name, text=None, attrs=None):
+        node = ET.SubElement(parent, f"{{{TASK_NS}}}{name}", attrs or {})
+        if text is not None:
+            node.text = str(text)
+        return node
+    registration = element(root, "RegistrationInfo")
+    element(registration, "Description", "DHB Reup YouTube Studio local web server autostart at user logon.")
+    triggers = element(root, "Triggers")
+    logon = element(triggers, "LogonTrigger")
+    element(logon, "Enabled", "true")
+    principals = element(root, "Principals")
+    principal = element(principals, "Principal", attrs={"id": "Operator"})
+    element(principal, "LogonType", "InteractiveToken")
+    element(principal, "RunLevel", "LeastPrivilege")
+    settings = element(root, "Settings")
+    for name, value in (("MultipleInstancesPolicy", "IgnoreNew"), ("DisallowStartIfOnBatteries", "false"),
+                        ("StopIfGoingOnBatteries", "false"), ("AllowHardTerminate", "true"),
+                        ("StartWhenAvailable", "true"), ("AllowStartOnDemand", "true"),
+                        ("Enabled", "true"), ("Hidden", "true"), ("ExecutionTimeLimit", "PT0S")):
+        element(settings, name, value)
+    actions = element(root, "Actions", attrs={"Context": "Operator"})
+    action = element(actions, "Exec")
+    element(action, "Command", interpreter)
+    element(action, "Arguments", f"-m uvicorn app:app --host 127.0.0.1 --port {port} --no-access-log")
+    element(action, "WorkingDirectory", runtime)
+    return '<?xml version="1.0" encoding="UTF-16"?>\n' + ET.tostring(root, encoding="unicode", xml_declaration=False)
+
+
+def prepare_webserver_plan(*, task_name, python, runtime_dir, output_dir, port=8686):
+    runtime = Path(runtime_dir).resolve()
+    if not (runtime / "app.py").is_file():
+        raise ScheduleError("RUNTIME_INVALID")
+    destination = Path(output_dir)
+    if destination.exists():
+        raise ScheduleError("OUTPUT_EXISTS")
+    xml = webserver_task_xml(task_name=task_name, python=python, runtime_dir=runtime, port=port)
+    destination.mkdir(parents=True, exist_ok=False)
+    (destination / "task.xml").write_text(xml, encoding="utf-8")
+    plan = {"version": 1, "kind": "webserver_autostart", "task_name": task_name,
+            "runtime_root": str(runtime), "python": str(Path(python).resolve()),
+            "port": port, "task_xml": "task.xml", "interactive_session_required": True,
+            "registration_changes": "Replace one named Logon Task only; preserve an existing XML backup before applying.",
+            "rollback": "Restore previous Task XML or disable the Logon Task via restore subcommand."}
+    save_json(destination / "plan.json", plan)
+    return plan
+
+
 def prepare_plan(*, task_name, python, runtime_dir, state_dir, output_dir):
     manifest = load_json(Path(state_dir) / "manifest.json")
     validate_manifest(manifest)
@@ -167,6 +223,10 @@ def main(argv=None):
     plan = sub.add_parser("plan")
     for name in ("task-name", "python", "runtime-dir", "state-dir", "output-dir"):
         plan.add_argument("--" + name, required=True)
+    web_plan = sub.add_parser("webserver-plan")
+    for name in ("task-name", "python", "runtime-dir", "output-dir"):
+        web_plan.add_argument("--" + name, required=True)
+    web_plan.add_argument("--port", type=int, default=8686)
     for name in ("apply", "restore"):
         command = sub.add_parser(name)
         command.add_argument("--plan-dir", required=True)
@@ -175,6 +235,10 @@ def main(argv=None):
         if args.command == "plan":
             result = prepare_plan(task_name=args.task_name, python=args.python, runtime_dir=args.runtime_dir,
                                   state_dir=args.state_dir, output_dir=args.output_dir)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif args.command == "webserver-plan":
+            result = prepare_webserver_plan(task_name=args.task_name, python=args.python,
+                                            runtime_dir=args.runtime_dir, output_dir=args.output_dir, port=args.port)
             print(json.dumps(result, ensure_ascii=False, indent=2))
         elif args.command == "apply":
             apply_plan(args.plan_dir)

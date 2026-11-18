@@ -8,7 +8,7 @@ from pathlib import Path
 
 from scheduled_uploads import (CONTRACT_VERSION, ScheduleError, ScheduleRunner, load_json,
     migrate_legacy, new_state, read_schedule_status, save_json, sha256,
-    validate_manifest, validate_release)
+    sync_schedule_folder, validate_manifest, validate_release)
 
 
 def release_pin(runtime_dir, revision, build):
@@ -49,6 +49,10 @@ def parser():
         command.add_argument("--observer-seconds", type=int, default=3600)
     status = commands.add_parser("status")
     status.add_argument("--state-dir", required=True, type=Path)
+    sync_cmd = commands.add_parser("sync-folder")
+    sync_cmd.add_argument("--runtime-dir", required=True, type=Path)
+    sync_cmd.add_argument("--state-dir", required=True, type=Path)
+    sync_cmd.add_argument("--base-url", default="http://127.0.0.1:8686")
     prepare = commands.add_parser("prepare-release")
     prepare.add_argument("--runtime-dir", required=True, type=Path)
     prepare.add_argument("--revision", required=True)
@@ -71,6 +75,10 @@ def main(argv=None):
     try:
         if args.command == "status":
             print(json.dumps(read_schedule_status(args.state_dir), ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "sync-folder":
+            result = sync_schedule_folder(args.state_dir, args.runtime_dir, base_url=args.base_url)
+            print(json.dumps(result, ensure_ascii=False))
             return 0
         if args.command == "prepare-release":
             value = release_pin(args.runtime_dir, args.revision, args.build)

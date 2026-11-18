@@ -446,7 +446,10 @@
       const nextText = sched.next_due_at
         ? `Kế tiếp: ${new Date(sched.next_due_at).toLocaleString('vi-VN')}`
         : (sched.message || 'Xem trong Quy trình đăng tự động');
-      values.push(['Lịch đăng Private', prog, sched.action_required ? `Cần kiểm tra: ${sched.message || sched.status}` : nextText]);
+      const driftHint = sched.folder_drift?.detected
+        ? 'Có thay đổi thư mục nguồn — mở Quy trình đăng để đồng bộ'
+        : nextText;
+      values.push(['Lịch đăng Private', prog, sched.action_required ? `Cần kiểm tra: ${sched.message || sched.status}` : driftHint]);
     }
     host.replaceChildren();
     values.forEach(([label, value, description]) => {
