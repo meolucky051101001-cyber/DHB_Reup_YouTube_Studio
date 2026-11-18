@@ -115,9 +115,10 @@ def call_llm(
                     json=payload,
                     timeout=30,
                 )
-                if r.status_code in (404, 429, 500, 502, 503, 504):
-                    last_error = RuntimeError(f"Gemini {candidate} HTTP {r.status_code}")
-                    add_log("AI", f"Model {candidate} trả HTTP {r.status_code}, thử model dự phòng kế tiếp...", "WARNING")
+                status_code = getattr(r, "status_code", 200)
+                if status_code in (404, 429, 500, 502, 503, 504):
+                    last_error = RuntimeError(f"Gemini {candidate} HTTP {status_code}")
+                    add_log("AI", f"Model {candidate} trả HTTP {status_code}, thử model dự phòng kế tiếp...", "WARNING")
                     continue
                 r.raise_for_status()
                 text = _extract_gemini_text(r.json())
