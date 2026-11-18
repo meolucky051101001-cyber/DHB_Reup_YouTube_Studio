@@ -498,7 +498,117 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
             self.assertTrue(data["configured"])
             self.assertEqual(data["completed_count"], 1)
             self.assertEqual(data["total_count"], 3)
+            self.assertFalse(data["folder_drift"]["detected"])
             self.assertNotIn(str(self.sources), json.dumps(data))
+
+    def test_folder_drift_detection_and_sync_folder_preserves_cursor(self):
+        self.file2.unlink()
+        file3 = self.sources / "brand_new.mp4"
+        file3.write_bytes(b"video-brand-new")
+
+        drift_status = su.read_schedule_status(self.state_dir)
+        self.assertTrue(drift_status["folder_drift"]["detected"])
+        self.assertEqual(drift_status["folder_drift"]["missing_future_count"], 1)
+        self.assertEqual(drift_status["folder_drift"]["new_files_count"], 1)
+        self.assertTrue(drift_status["folder_drift"]["next_source_exists"])
+        self.assertNotIn(str(self.sources), json.dumps(drift_status))
+
+        db_rows = list(self.base_rows().values())
+        deleted_batches = []
+        previewed_batches = []
+
+        class FakeSyncAPI:
+            def __init__(self_api, _base, _rt, _rel):
+                self_api.session = None
+
+            def connect(self_api):
+                return None
+
+            def diagnostics(self_api, *, idle=False):
+                return {"workers": {"pipeline_running": False, "active_batch_threads": 0, "monitor_workers": 0}}
+
+            def verify_channel(self_api, _m):
+                return None
+
+            def project_rows(self_api, _project):
+                return [dict(r) for r in db_rows]
+
+            def delete_rows(self_api, ids):
+                deleted_batches.append(list(ids))
+                db_rows[:] = [r for r in db_rows if r["id"] not in set(ids)]
+                return {"ok": True, "deleted": len(ids)}
+
+            def scan_folder(self_api, _manifest):
+                db_rows.append({
+                    "id": 242,
+                    "status": "Pending",
+                    "published_url": "",
+                    "input_video_path": str(file3),
+                    "visibility": "private",
+                    "schedule_time": "",
+                    "target_channel_id": 66,
+                    "is_claimed": False,
+                    "requires_review": False,
+                })
+                return {"ok": True, "added": 1, "skipped": 1}
+
+            def preview_batch(self_api, _manifest, queue_ids):
+                previewed_batches.append(list(queue_ids))
+
+        res = su.sync_schedule_folder(self.state_dir, self.runtime_dir, api_factory=FakeSyncAPI)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["removed_pending_count"], 1)
+        self.assertEqual(res["added_count"], 1)
+        self.assertEqual(deleted_batches, [[241]])
+        self.assertEqual(previewed_batches, [[240, 242]])
+
+        after = res["schedule"]
+        self.assertFalse(after["folder_drift"]["detected"])
+        self.assertEqual(after["completed_count"], 1)
+        self.assertEqual(after["total_count"], 3)
+        self.assertEqual(after["next_queue_id"], 240)
+        self.assertEqual(after["last_started_at"], "2026-11-17T16:13:10+00:00")
+        self.assertNotIn(str(self.sources), json.dumps(res))
+
+    def test_webserver_autostart_plan_xml_contract(self):
+        plan_dir = self.root / "webserver-plan"
+        py_exe = self.root / "python.exe"
+        py_exe.write_bytes(b"stub")
+        (self.runtime_dir / "app.py").write_text("# stub\n", encoding="utf-8")
+        plan = schedule_task.prepare_webserver_plan(
+            task_name="DHB-Studio-WebServer-Autostart",
+            python=py_exe,
+            runtime_dir=self.runtime_dir,
+            output_dir=plan_dir,
+            port=8686,
+        )
+        self.assertEqual(plan["kind"], "webserver_autostart")
+        xml_text = (plan_dir / "task.xml").read_text(encoding="utf-8")
+        self.assertIn('encoding="UTF-16"', xml_text)
+        self.assertIn("<LogonTrigger>", xml_text)
+        self.assertIn("<Hidden>true</Hidden>", xml_text)
+        self.assertIn("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>", xml_text)
+        self.assertIn("-m uvicorn app:app --host 127.0.0.1 --port 8686 --no-access-log", xml_text)
+
+    def test_clean_raw_video_stem_strips_dubbed_hex_noise(self):
+        import ai_engine
+
+        self.assertEqual(
+            ai_engine.clean_raw_video_stem("Dubbed_telegram_15230fc0090b4d6ea7cab7cc409dbb84_紧凑版卡套我向你道歉"),
+            "紧凑版卡套我向你道歉",
+        )
+        self.assertEqual(
+            ai_engine.clean_raw_video_stem("Dubbed_telegram_47d82bcb6911484990e8f10cd691a5a5_1200军装开箱试穿_93c6a186"),
+            "1200军装开箱试穿",
+        )
+        self.assertEqual(
+            ai_engine.clean_raw_video_stem("Dubbed_corrected_telegram_154f505728f44833b720ff6895b8379a"),
+            "Dubbed_corrected_telegram_154f505728f44833b720ff6895b8379a",
+        )
+        self.assertEqual(
+            ai_engine.clean_raw_video_stem("Xem chi tiết tại https://example.com/item_12345678"),
+            "Xem chi tiết tại https://example.com/item_12345678",
+        )
 
 
 if __name__ == "__main__":

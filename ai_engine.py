@@ -160,10 +160,35 @@ def call_llm(
     return translate_google_free(prompt, "vi")
 
 
+_RAW_DUBBED_PREFIX_RE = re.compile(
+    r"^(?:dubbed_(?:corrected_)?(?:telegram|douyin|tiktok|kuaishou|xiaohongshu|youtube|facebook)_"
+    r"|dubbed_(?:corrected_)?)"
+    r"(?:[0-9a-f]{16,64}[_-]*)?",
+    re.IGNORECASE,
+)
+_TRAILING_HEX_SUFFIX_RE = re.compile(r"(?:[_-][0-9a-f]{8}){1,2}$", re.IGNORECASE)
+
+
+def clean_raw_video_stem(text: str) -> str:
+    """Làm sạch tiền tố kỹ thuật dạng Dubbed_telegram_<uuid>_ và hậu tố hash tạm khỏi tên file."""
+    raw = str(text or "").strip()
+    if not raw or "http://" in raw.lower() or "https://" in raw.lower():
+        return raw
+    cleaned = _RAW_DUBBED_PREFIX_RE.sub("", raw).strip(" _-")
+    cleaned = _TRAILING_HEX_SUFFIX_RE.sub("", cleaned).strip(" _-")
+    if re.fullmatch(r"[0-9a-f]{16,64}", cleaned, flags=re.IGNORECASE):
+        cleaned = ""
+    cleaned = re.sub(r"[_]+", " ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned or raw
+
+
 def _fallback_translate_metadata(title: str, description: str, target_lang: str) -> Dict[str, str]:
     """Fallback an toàn: chỉ dịch riêng Title và Description, không bao giờ dịch câu lệnh Prompt."""
-    new_title = translate_google_free(title, target_lang).strip()
-    new_desc = translate_google_free(description or title, target_lang).strip()
+    clean_title = clean_raw_video_stem(title)
+    clean_desc = clean_raw_video_stem(description) if (not description or description == title) else description
+    new_title = translate_google_free(clean_title, target_lang).strip()
+    new_desc = translate_google_free(clean_desc or clean_title, target_lang).strip()
     if "#shorts" not in new_title.lower() and len(new_title) <= 90:
         new_title = f"{new_title} #shorts".strip()
     return {
@@ -247,10 +272,13 @@ def ai_optimize_youtube_metadata(
     else:
         default_inst = "Tạo tiêu đề hấp dẫn kích thích click (CTR cao, tối đa 95 ký tự, có 2 hashtag #shorts), mô tả cuốn hút chuẩn SEO và 10 từ khóa tags cách nhau bởi dấu phẩy."
 
+    clean_title = clean_raw_video_stem(title)
+    clean_desc = clean_raw_video_stem(description) if (not description or description == title) else description
+
     prompt = (
         f"Hãy xử lý thông tin video dưới đây sang ngôn ngữ [{target_lang}] để đăng lên YouTube:\n"
-        f"- Tiêu đề gốc: {title}\n"
-        f"- Mô tả gốc: {description}\n"
+        f"- Tiêu đề gốc: {clean_title}\n"
+        f"- Mô tả gốc: {clean_desc}\n"
         f"- Yêu cầu: {custom_prompt or default_inst}\n\n"
         "Trả về ĐÚNG định dạng JSON sau (không dùng markdown block khác):\n"
         '{"title": "...", "description": "...", "tags": "tag1, tag2, tag3"}'
@@ -262,8 +290,8 @@ def ai_optimize_youtube_metadata(
         if m:
             parsed = json.loads(m.group(0))
             result = {
-                "title": str(parsed.get("title") or title)[:100],
-                "description": str(parsed.get("description") or description or title),
+                "title": str(parsed.get("title") or clean_title)[:100],
+                "description": str(parsed.get("description") or clean_desc or clean_title),
                 "tags": str(parsed.get("tags") or "shorts, viral"),
             }
             result["description"], result["links_preserved"] = _preserve_source_links(description, result["description"])

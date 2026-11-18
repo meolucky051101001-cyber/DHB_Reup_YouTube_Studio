@@ -246,6 +246,32 @@ def next_due(manifest, state):
     return first
 
 
+VIDEO_SUFFIXES = frozenset((".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"))
+
+
+def detect_folder_drift(manifest, state):
+    """Safe metadata-only check; never hashes files or exposes filesystem paths."""
+    jobs = manifest["jobs"]
+    index = state["next_index"]
+    pending = jobs[index:]
+    next_exists = True if not pending else Path(pending[0]["path"]).is_file()
+    missing_future = sum(1 for job in pending if not Path(job["path"]).is_file())
+    known = {os.path.normcase(str(Path(job["path"]).resolve())) for job in jobs}
+    source_root = Path(manifest["source_directory"])
+    new_files = 0
+    if source_root.is_dir():
+        for entry in source_root.iterdir():
+            if entry.is_file() and entry.suffix.lower() in VIDEO_SUFFIXES:
+                if os.path.normcase(str(entry.resolve())) not in known:
+                    new_files += 1
+    return {
+        "detected": bool(missing_future or new_files),
+        "missing_future_count": missing_future,
+        "new_files_count": new_files,
+        "next_source_exists": next_exists,
+    }
+
+
 def read_schedule_status(state_dir, *, now=None):
     """Safe UI view. Never contacts a runtime, writes state or exposes file paths."""
     if not state_dir or not (Path(state_dir) / "manifest.json").is_file():
@@ -270,14 +296,16 @@ def read_schedule_status(state_dir, *, now=None):
             if result.get("finished_at"):
                 public_result["finished_at"] = stamp(parse_time(result["finished_at"]))
         index = state["next_index"]
+        drift = detect_folder_drift(manifest, state)
         return {"configured": True, "status": status, "message": MESSAGES[status],
                 "last_checked_at": state.get("last_checked_at"), "last_started_at": state.get("last_started_at"),
                 "last_result": public_result, "next_due_at": stamp(due) if index < len(manifest["jobs"]) else None,
                 "inflight_queue_id": state.get("inflight_queue_id"),
                 "next_queue_id": manifest["jobs"][index]["queue_id"] if index < len(manifest["jobs"]) else None,
                 "completed_count": index, "total_count": len(manifest["jobs"]),
+                "folder_drift": drift,
                 "task_session_required": True,
-                "action_required": status in {"needs_review", "error", "missed"},
+                "action_required": status in {"needs_review", "error", "missed"} or not drift["next_source_exists"],
                 "task_disable_recommended": status == "finished"}
     except (OSError, ScheduleError, TypeError, ValueError, KeyError):
         return {"configured": True, "status": "error", "message": "Cấu hình hoặc trạng thái lịch không hợp lệ; cần kiểm tra trước khi đăng.", "action_required": True}
@@ -397,6 +425,167 @@ class LocalAPI:
 
     def start(self, payload):
         return self.request("POST", "/api/pipeline/start", json=payload, timeout=30)
+
+    def project_rows(self, project):
+        rows = self.request("GET", "/api/queue", params={"project": project})
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ScheduleError("QUEUE_INVALID")
+        return rows
+
+    def delete_rows(self, ids):
+        if not ids:
+            return {"ok": True, "deleted": 0}
+        result = self.request("POST", "/api/queue/delete", json={"ids": list(ids)}, timeout=30)
+        if not isinstance(result, dict) or not result.get("ok"):
+            raise ScheduleError("QUEUE_DELETE_FAILED")
+        return result
+
+    def scan_folder(self, manifest):
+        result = self.request(
+            "POST",
+            "/api/queue/scan",
+            json={
+                "project_name": manifest["project"],
+                "urls": manifest["source_directory"],
+                "max_items": 500,
+                "recursive": False,
+                "target_channel_id": manifest["channel"]["id"],
+                "upload_to": "Shorts",
+                "render_mode": "shorts_9_16",
+                "resolution": "1080p",
+                "visibility": "private",
+                "schedule_time": "",
+                "made_for_kids": 0,
+                "age_restriction": 0,
+                "altered_content": 0,
+                "emulate_mobile": False,
+            },
+            timeout=90,
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            raise ScheduleError("QUEUE_SCAN_FAILED")
+        return result
+
+    def preview_batch(self, manifest, queue_ids):
+        if not queue_ids:
+            return
+        payload = {"ids": list(queue_ids), "do_download": False, "do_render": False, "do_upload": True}
+        result = self.request("POST", "/api/queue/preview-distribution", json=payload, timeout=45)
+        items = result.get("items") or []
+        if not result.get("ok") or len(items) != len(queue_ids):
+            raise ScheduleError("PREVIEW_BLOCKED")
+        expected = manifest["channel"]
+        for row in items:
+            if (row.get("blocked") or row.get("channel_id") != expected["id"]
+                    or row.get("channel_name") != expected["name"] or row.get("upload_mode") != "youtube_api"
+                    or row.get("visibility") != "private" or row.get("schedule_time")):
+                raise ScheduleError("PREVIEW_CHANGED")
+
+
+def sync_schedule_folder(state_dir, runtime_dir, *, api_factory=LocalAPI, base_url="http://127.0.0.1:8686", check_release=True):
+    """Synchronize source_directory drift safely without resetting next_index or cadence."""
+    directory, runtime = Path(state_dir), Path(runtime_dir)
+    if not directory.is_dir():
+        raise ScheduleError("SCHEDULE_UNINITIALIZED")
+    with single_instance(directory):
+        manifest = load_json(directory / "manifest.json")
+        validate_manifest(manifest)
+        state = load_json(directory / "state.json")
+        validate_state(state, manifest)
+        if state.get("inflight_queue_id") is not None or state.get("submission_state") != "ready":
+            raise ScheduleError("SCHEDULE_NOT_IDLE")
+        release = load_json(directory / "release.json") if check_release else {"version": 1}
+        if check_release:
+            validate_release(release, runtime)
+        api = api_factory(base_url, runtime, release)
+        try:
+            if api_factory is LocalAPI:
+                api.connect(auto_start=True)
+            else:
+                api.connect()
+            api.diagnostics(idle=True)
+            api.verify_channel(manifest)
+
+            index = state["next_index"]
+            completed_jobs = list(manifest["jobs"][:index])
+            completed_ids = {job["queue_id"] for job in completed_jobs}
+            source_root = Path(manifest["source_directory"]).resolve()
+
+            rows = api.project_rows(manifest["project"])
+            by_id = {int(row["id"]): row for row in rows if _integer(row.get("id"))}
+            for job in completed_jobs:
+                row = by_id.get(job["queue_id"])
+                if not row or row.get("status") != "Completed" or not row.get("published_url") or row.get("is_claimed") or row.get("requires_review"):
+                    raise ScheduleError("COMPLETED_ITEM_CHANGED")
+
+            stale_ids = []
+            for qid, row in sorted(by_id.items()):
+                if qid in completed_ids:
+                    continue
+                if row.get("status") != "Pending" or row.get("published_url") or row.get("is_claimed") or row.get("requires_review"):
+                    raise ScheduleError("PENDING_ITEM_CHANGED")
+                candidate = Path(str(row.get("input_video_path") or ""))
+                in_root = False
+                if candidate.is_file():
+                    try:
+                        candidate.resolve().relative_to(source_root)
+                        in_root = True
+                    except (ValueError, OSError):
+                        in_root = False
+                if not in_root:
+                    stale_ids.append(qid)
+
+            if stale_ids:
+                api.delete_rows(stale_ids)
+
+            scan_res = api.scan_folder(manifest)
+            updated_rows = api.project_rows(manifest["project"])
+            updated_by_id = {int(row["id"]): row for row in updated_rows if _integer(row.get("id"))}
+
+            prior_pending_order = [job["queue_id"] for job in manifest["jobs"][index:] if job["queue_id"] in updated_by_id]
+            seen_pending = set(prior_pending_order)
+            extra_pending = sorted(
+                qid for qid in updated_by_id
+                if qid not in completed_ids and qid not in seen_pending
+            )
+            ordered_pending_ids = prior_pending_order + extra_pending
+            if not completed_jobs and not ordered_pending_ids:
+                raise ScheduleError("MANIFEST_JOBS")
+
+            pending_jobs = []
+            for qid in ordered_pending_ids:
+                row = updated_by_id[qid]
+                file_path = Path(str(row.get("input_video_path") or ""))
+                if (not file_path.is_file() or row.get("status") != "Pending" or row.get("published_url")
+                        or row.get("visibility") != "private" or row.get("schedule_time")
+                        or row.get("target_channel_id") != manifest["channel"]["id"]):
+                    raise ScheduleError("QUEUE_BINDING_CHANGED")
+                pending_jobs.append({"queue_id": qid, "path": str(file_path), "sha256": sha256(file_path)})
+
+            api.preview_batch(manifest, ordered_pending_ids)
+            new_jobs = completed_jobs + pending_jobs
+            new_manifest = {**manifest, "jobs": new_jobs}
+            validate_manifest(new_manifest)
+
+            new_state_obj = {**state, "manifest_sha256": manifest_digest(new_manifest), "last_checked_at": stamp(utc_now()), "error_code": ""}
+            if new_state_obj["next_index"] >= len(new_jobs):
+                new_state_obj["status"] = "finished"
+            elif new_state_obj["status"] in {"finished", "error"}:
+                new_state_obj["status"] = "waiting" if new_state_obj.get("last_started_at") else "ready"
+            validate_state(new_state_obj, new_manifest)
+
+            save_json(directory / "manifest.json", new_manifest)
+            save_json(directory / "state.json", new_state_obj)
+            return {
+                "ok": True,
+                "removed_pending_count": len(stale_ids),
+                "added_count": int(scan_res.get("added") or 0),
+                "schedule": read_schedule_status(directory),
+            }
+        finally:
+            session = getattr(api, "session", None)
+            if session is not None:
+                session.close()
 
 
 class ScheduleRunner:

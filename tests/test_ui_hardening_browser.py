@@ -184,12 +184,62 @@ class UploadWorkflowHardeningBrowserTests(unittest.TestCase):
         self.page.keyboard.press("Escape")
 
         self.page.evaluate(
-            "payload => window.StudioAdmin.onDiagnosticsLoaded({version: '2026.11.18-hardening', database: {available: true}, scheduled_uploads: payload})",
+            "payload => window.StudioAdmin.onDiagnosticsLoaded({version: '2026.11.18-ops', database: {available: true}, scheduled_uploads: payload})",
             sched_payload,
         )
         diag_text = self.page.locator("#admin-diagnostics-cards").inner_text()
         self.assertIn("Lịch đăng Private", diag_text)
         self.assertIn("1/21 video", diag_text)
+        self.assertEqual(self.fixture.errors, [])
+
+    def test_schedule_folder_drift_warning_and_sync_button(self):
+        self.fixture.seed_queue([])
+        drift_payload = {
+            "configured": True,
+            "status": "waiting",
+            "message": "Đang chờ đủ khoảng cách giữa hai lượt đăng.",
+            "completed_count": 1,
+            "total_count": 25,
+            "next_queue_id": 240,
+            "next_due_at": "2026-11-20T16:15:00+00:00",
+            "folder_drift": {
+                "detected": True,
+                "missing_future_count": 1,
+                "new_files_count": 2,
+                "next_source_exists": True,
+            },
+            "task_session_required": True,
+            "action_required": False,
+            "task_disable_recommended": False,
+        }
+        synced_payload = {
+            **drift_payload,
+            "total_count": 26,
+            "folder_drift": {
+                "detected": False,
+                "missing_future_count": 0,
+                "new_files_count": 0,
+                "next_source_exists": True,
+            },
+        }
+        self.fixture.responses["/api/scheduled-uploads/status"] = drift_payload
+        self.fixture.responses["/api/scheduled-uploads/sync"] = {
+            "ok": True,
+            "removed_pending_count": 1,
+            "added_count": 2,
+            "schedule": synced_payload,
+        }
+        self.page.locator("#publish-workflow-open").click()
+        banner = self.page.locator("#publish-schedule-status")
+        banner.wait_for(state="visible")
+        self.assertEqual(banner.get_attribute("data-state"), "warning")
+        self.assertIn("1 file chờ không còn trên đĩa", banner.inner_text())
+        self.assertIn("2 file mới chưa nạp vào lịch", banner.inner_text())
+
+        with self.page.expect_response("**/api/scheduled-uploads/sync"):
+            banner.locator("#publish-schedule-sync").click()
+        self.page.wait_for_function("document.getElementById('publish-schedule-status')?.dataset?.state === 'ready'")
+        self.assertIn("1/26 video", banner.inner_text())
         self.assertEqual(self.fixture.errors, [])
 
 

@@ -78,7 +78,7 @@ from youtube_uploader import (
     normalize_published_video_url,
     recheck_api_video_receipt,
 )
-from scheduled_uploads import read_schedule_status
+from scheduled_uploads import ScheduleError, read_schedule_status, sync_schedule_folder
 from pipeline_manager import pipeline_manager, upload_slot_recovery_status, acknowledge_upload_slot_recovery
 from group_distribution import target_group_names
 from phase4_rules import (
@@ -387,7 +387,7 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.18-hardening"
+APP_BUILD_VERSION = "2026.11.18-ops"
 
 
 def get_schedule_state_dir() -> Path:
@@ -701,6 +701,97 @@ def api_diagnostics():
 @app.get("/api/scheduled-uploads/status")
 def api_scheduled_uploads_status():
     return read_schedule_status(get_schedule_state_dir())
+
+
+class _InProcessScheduleAPI:
+    """In-process adapter for safe schedule folder synchronization from the Web UI."""
+
+    def __init__(self, _base_url, _runtime_dir, _release):
+        self.session = None
+
+    def connect(self):
+        return None
+
+    def diagnostics(self, *, idle=False):
+        diag = api_diagnostics()
+        workers = diag.get("workers") or {}
+        if idle and any(workers.get(key) for key in ("pipeline_running", "active_batch_threads", "monitor_workers")):
+            raise ScheduleError("WORKER_BUSY")
+        return diag
+
+    def verify_channel(self, manifest):
+        expected = manifest["channel"]
+        channels = api_list_channels(profile=None)
+        channel = next((row for row in channels if row.get("id") == expected["id"]), None)
+        if (not channel or any(channel.get(key) != expected[key] for key in ("channel_id", "name"))
+                or channel.get("upload_mode") != "youtube_api"):
+            raise ScheduleError("CHANNEL_CHANGED")
+
+    def project_rows(self, project):
+        return api_get_queue(project=project)
+
+    def delete_rows(self, ids):
+        return api_delete_queue_items(data={"ids": list(ids)})
+
+    def scan_folder(self, manifest):
+        return api_scan_and_add(data={
+            "project_name": manifest["project"],
+            "urls": manifest["source_directory"],
+            "max_items": 500,
+            "recursive": False,
+            "target_channel_id": manifest["channel"]["id"],
+            "upload_to": "Shorts",
+            "render_mode": "shorts_9_16",
+            "resolution": "1080p",
+            "visibility": "private",
+            "schedule_time": "",
+            "made_for_kids": 0,
+            "age_restriction": 0,
+            "altered_content": 0,
+            "emulate_mobile": False,
+        })
+
+    def preview_batch(self, manifest, queue_ids):
+        if not queue_ids:
+            return
+        result = api_preview_distribution(data={
+            "ids": list(queue_ids),
+            "do_download": False,
+            "do_render": False,
+            "do_upload": True,
+        })
+        items = result.get("items") or []
+        if not result.get("ok") or len(items) != len(queue_ids):
+            raise ScheduleError("PREVIEW_BLOCKED")
+        expected = manifest["channel"]
+        for row in items:
+            if (row.get("blocked") or row.get("channel_id") != expected["id"]
+                    or row.get("channel_name") != expected["name"] or row.get("upload_mode") != "youtube_api"
+                    or row.get("visibility") != "private" or row.get("schedule_time")):
+                raise ScheduleError("PREVIEW_CHANGED")
+
+
+@app.post("/api/scheduled-uploads/sync")
+def api_scheduled_uploads_sync():
+    state_dir = get_schedule_state_dir()
+    try:
+        result = sync_schedule_folder(
+            state_dir,
+            APP_ROOT,
+            api_factory=_InProcessScheduleAPI,
+            check_release=False,
+        )
+        add_log(
+            "Schedule",
+            f"Đã đồng bộ thư mục lịch đăng (+{result['added_count']} mới, -{result['removed_pending_count']} mất file).",
+            "SUCCESS",
+        )
+        return result
+    except ScheduleError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"Không thể đồng bộ thư mục lịch đăng ({exc.code}).", "code": exc.code},
+        ) from exc
 
 
 @app.post("/api/sync-dhb")
