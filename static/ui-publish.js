@@ -131,7 +131,7 @@
     dialog.id = 'publish-workflow-dialog'; dialog.setAttribute('aria-labelledby', 'publish-workflow-title');
     dialog.setAttribute('aria-modal', 'true');
     dialog.innerHTML = `<header class="publish-header"><div><p class="publish-eyebrow">Chuẩn bị → xem trước → xác nhận → theo dõi</p><h2 id="publish-workflow-title">Quy trình đăng tự động</h2><p>Chọn cách vận hành và kiểm tra phạm vi trước khi chạy.</p></div><button type="button" id="publish-close" class="btn btn-outline" autofocus>Đóng</button></header>
-      <div class="publish-body"><fieldset class="publish-flow-choices"><legend>Cách vận hành</legend>
+      <div class="publish-body"><section id="publish-schedule-status" class="publish-schedule-banner" aria-live="polite" hidden></section><fieldset class="publish-flow-choices"><legend>Cách vận hành</legend>
         <label><input type="radio" name="publish-flow" id="publish-flow-batch" value="batch" checked><span><strong>Đăng một lô</strong><small>Chuẩn bị tập video cụ thể, xem trước và duyệt một lần.</small></span></label>
         <label><input type="radio" name="publish-flow" id="publish-flow-monitor" value="monitor"><span><strong>Theo dõi nguồn liên tục</strong><small>Duyệt cấu hình luồng, tự xử lý video mới theo chu kỳ.</small></span></label></fieldset>
       <section id="publish-batch-panel" aria-labelledby="publish-batch-title"><h3 id="publish-batch-title">1. Kiểm tra video của lô</h3>
@@ -183,6 +183,38 @@
       if (state.followup) requestAnimationFrame(() => runFollowup(state.followup));
     }, {once: true});
     dialog.showModal(); refreshValidity(); state.timer = setInterval(refreshValidity, 500);
+    if (typeof apiFetch === 'function') {
+      apiFetch('/api/scheduled-uploads/status', { cache: 'no-store' }).then(sched => {
+        if (!dialog.isConnected || !sched?.configured) return;
+        const box = byId('publish-schedule-status');
+        if (!box) return;
+        box.replaceChildren();
+        box.dataset.state = sched.action_required ? 'error' : (sched.status === 'finished' ? 'done' : 'ready');
+        const heading = node('strong', '', `Lịch đăng Private định kỳ: ${sched.message || sched.status}`);
+        const details = [];
+        if (Number.isInteger(sched.completed_count) && Number.isInteger(sched.total_count)) {
+          details.push(`Tiến độ: ${sched.completed_count}/${sched.total_count} video`);
+        }
+        if (sched.inflight_queue_id) details.push(`Đang xử lý: #${sched.inflight_queue_id}`);
+        else if (sched.next_queue_id) details.push(`Kế tiếp: #${sched.next_queue_id}`);
+        if (sched.next_due_at) {
+          const dt = new Date(sched.next_due_at);
+          details.push(`Hẹn chạy tiếp: ${Number.isNaN(dt.getTime()) ? sched.next_due_at : dt.toLocaleString('vi-VN')}`);
+        }
+        if (sched.last_result?.queue_id) {
+          details.push(`Lượt gần nhất: #${sched.last_result.queue_id} (${sched.last_result.status})`);
+        }
+        const meta = node('p', 'publish-schedule-meta', details.join(' · '));
+        box.append(heading);
+        if (details.length) box.append(meta);
+        if (sched.task_disable_recommended) {
+          box.append(node('p', 'publish-schedule-note', 'Đã hoàn tất toàn bộ lô video; bạn có thể tắt Windows Task để kết thúc chu kỳ kiểm tra.'));
+        } else if (sched.task_session_required) {
+          box.append(node('p', 'publish-schedule-note', 'Lưu ý: Windows Scheduled Task yêu cầu máy bật, có mạng và tài khoản hiện tại đang đăng nhập.'));
+        }
+        box.hidden = false;
+      }).catch(() => {});
+    }
   }
   function mount() {
     if (byId('publish-workflow-open')) return;

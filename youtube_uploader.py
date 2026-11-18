@@ -6,7 +6,7 @@ import subprocess
 import shutil
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Any, Optional
 from urllib.parse import quote, urlsplit, parse_qs
@@ -44,13 +44,39 @@ class UploadVerificationError(RuntimeError):
         super().__init__(str(message))
 
 
-def _api_expected_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+def _canonical_publish_at(value):
+    if not isinstance(value, str) or not value.strip() or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00').replace(' ', 'T'))
+        return parsed.astimezone(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def api_expected_metadata(metadata: Dict[str, Any], channel_id=None) -> Dict[str, Any]:
+    """Safe evidence baseline shared by approval, upload and receipt rechecks."""
     category = str(metadata.get("category_id") or "").strip()
     expected = {"category_id": category if re.fullmatch(r"[1-9][0-9]{0,2}", category) else None}
     language = metadata.get("video_language")
     if language:
         expected["video_language"] = _safe_audio_language(language)
+    expected.update(privacy_status='private' if metadata.get('privacy_status') == 'schedule'
+                    else metadata.get('privacy_status'),
+                    made_for_kids=bool(metadata.get('made_for_kids')),
+                    altered_content=bool(metadata.get('altered_content')),
+                    publish_at=_canonical_publish_at(metadata.get('schedule_time'))
+                    if metadata.get('privacy_status') == 'schedule' else None)
+    channel_id = channel_id if channel_id is not None else metadata.get('youtube_channel_id')
+    if channel_id is not None and str(channel_id).strip() != '':
+        channel_id = str(channel_id).strip()
+        if not re.fullmatch(r'UC[A-Za-z0-9_-]{22}', channel_id):
+            raise ValueError('YouTube channel ID không hợp lệ cho bằng chứng upload.')
+        expected['youtube_channel_id'] = channel_id
     return expected
+
+
+_api_expected_metadata = api_expected_metadata
 
 
 def _safe_audio_language(value):
@@ -61,15 +87,43 @@ def _safe_audio_language(value):
 
 
 def _observed_api_metadata(item):
-    snippet = item.get("snippet")
-    if not isinstance(snippet, dict):
-        return {"category_id": None}
-    category = snippet.get("categoryId")
-    observed = {"category_id": category if isinstance(category, str)
-                and re.fullmatch(r"[1-9][0-9]{0,2}", category) else None}
-    if "defaultAudioLanguage" in snippet:
-        observed["video_language"] = _safe_audio_language(snippet["defaultAudioLanguage"])
-    return observed
+    return _api_readback_fields(item)[0]
+
+
+def _api_readback_fields(item):
+    """Whitelist provider values and distinguish omitted, null and malformed fields."""
+    from upload_evidence import _metadata_value
+    mapping = {
+        'category_id': ('snippet', 'categoryId'),
+        'video_language': ('snippet', 'defaultAudioLanguage'),
+        'youtube_channel_id': ('snippet', 'channelId'),
+        'privacy_status': ('status', 'privacyStatus'),
+        'made_for_kids': ('status', 'selfDeclaredMadeForKids'),
+        'altered_content': ('status', 'containsSyntheticMedia'),
+        'publish_at': ('status', 'publishAt'),
+        'upload_status': ('status', 'uploadStatus'),
+        'processing_status': ('processingDetails', 'processingStatus'),
+    }
+    observed, states = {}, {}
+    for key, (section, provider_key) in mapping.items():
+        container = item.get(section)
+        if not isinstance(container, dict) or provider_key not in container:
+            states[key] = 'missing'
+        elif container[provider_key] is None:
+            states[key] = 'null'
+        else:
+            value = container[provider_key]
+            if key == 'publish_at':
+                value = _canonical_publish_at(value)
+                valid = value is not None
+            else:
+                valid = _metadata_value(key, value)
+            states[key] = 'present' if valid else 'invalid'
+            if valid:
+                observed[key] = value
+        if key == 'publish_at' and states[key] in ('missing', 'null'):
+            observed[key] = None
+    return observed, states
 
 
 def _safe_video_id(value: Any) -> str:
@@ -78,7 +132,7 @@ def _safe_video_id(value: Any) -> str:
 
 def _emit_upload_evidence(evidence_sink, *, video_id: str, state: str,
                           metadata: Dict[str, Any], code: str = "",
-                          observed: Optional[Dict[str, Any]] = None):
+                          observed: Optional[Dict[str, Any]] = None, field_states=None):
     safe_id = _safe_video_id(video_id)
     if not safe_id:
         raise UploadVerificationError("API_VIDEO_ID_INVALID", "YouTube không trả Video ID hợp lệ.",
@@ -86,12 +140,14 @@ def _emit_upload_evidence(evidence_sink, *, video_id: str, state: str,
     if evidence_sink is None:
         return
     event = {
+        "version": 2,
         "backend": "youtube_api",
         "video_id": safe_id,
         "verification_state": state,
         "expected": _api_expected_metadata(metadata),
         "observed": dict(observed or {}),
         "code": str(code or ("API_VIDEO_ID_RECEIVED" if state == "received" else "API_VIDEO_VERIFIED")),
+        "field_states": dict(field_states or {}),
     }
     # The pipeline sink owns timestamps, channel binding, and DB schema. Never
     # add headers, OAuth values, resumable URLs or provider response text here.
@@ -99,10 +155,10 @@ def _emit_upload_evidence(evidence_sink, *, video_id: str, state: str,
 
 
 def _verification_failure(code: str, message: str, metadata: Dict[str, Any], video_id: str,
-                          evidence_sink=None, *, observed=None):
+                          evidence_sink=None, *, observed=None, field_states=None):
     _emit_upload_evidence(evidence_sink, video_id=video_id,
                           state="mismatch" if code.endswith("_MISMATCH") else "unknown",
-                          metadata=metadata, code=code, observed=observed)
+                          metadata=metadata, code=code, observed=observed, field_states=field_states)
     raise UploadVerificationError(code, message, expected=_api_expected_metadata(metadata),
                                   observed=observed)
 
@@ -1669,15 +1725,17 @@ def _query_resumable_upload_status(http, upload_url: str, access_token: str, fil
 
 
 def _verify_api_video(http, video_id: str, access_token: str, metadata: Dict[str, Any], progress_callback=None,
-                      *, evidence_sink=None):
+                      *, evidence_sink=None, timeout_seconds=None, warnings_out: Optional[list] = None):
     """Read exact-ID metadata within a finite deadline; never retry an upload."""
     try:
-        timeout_seconds = int(get_settings().get("youtube_processing_timeout_seconds", 900) or 900)
+        timeout_seconds = int(timeout_seconds if timeout_seconds is not None else
+                              get_settings().get("youtube_processing_timeout_seconds", 900) or 900)
     except (TypeError, ValueError):
         timeout_seconds = 900
     timeout_seconds = max(30, min(3600, timeout_seconds))
     deadline = time.monotonic() + timeout_seconds
     delay = 2
+    missing_ai_reads = 0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1726,15 +1784,16 @@ def _verify_api_video(http, video_id: str, access_token: str, metadata: Dict[str
             _verification_failure("API_VIDEO_READBACK_ID_MISSING", "YouTube chưa trả video ID vừa tạo khi đọc lại; cần đối soát kết quả upload.", metadata,
                                   video_id, evidence_sink)
         item = items[0]
+        observed, field_states = _api_readback_fields(item)
         status, processing = item.get("status"), item.get("processingDetails")
         if not isinstance(status, dict) or not isinstance(processing, dict):
             _verification_failure("API_VIDEO_READBACK_MALFORMED", "Thiếu trạng thái xử lý video để xác minh.",
-                                  metadata, video_id, evidence_sink)
+                                  metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
         upload_status = str(status.get("uploadStatus") or "").lower()
         processing_status = str(processing.get("processingStatus") or "").lower()
         if upload_status in {"failed", "rejected", "deleted"} or processing_status in {"failed", "terminated"}:
             _verification_failure("API_VIDEO_PROCESSING_FAILED", "YouTube không xử lý xong video.", metadata,
-                                  video_id, evidence_sink)
+                                  video_id, evidence_sink, observed=observed, field_states=field_states)
         if (
             (processing_status == "processing" or upload_status == "uploaded")
             and processing_status != "succeeded"
@@ -1742,7 +1801,7 @@ def _verify_api_video(http, video_id: str, access_token: str, metadata: Dict[str
         ):
             if time.monotonic() >= deadline:
                 _verification_failure("API_VIDEO_PROCESSING_TIMEOUT", "YouTube vẫn đang xử lý video sau thời hạn xác minh.", metadata,
-                                      video_id, evidence_sink)
+                                      video_id, evidence_sink, observed=observed, field_states=field_states)
             if progress_callback:
                 progress_callback(96, "YouTube đang xử lý video sau khi chuyển file hoàn tất...")
             time.sleep(min(delay, max(0, deadline - time.monotonic())))
@@ -1750,38 +1809,41 @@ def _verify_api_video(http, video_id: str, access_token: str, metadata: Dict[str
             continue
         if upload_status != "processed" and processing_status != "succeeded":
             _verification_failure("API_VIDEO_PROCESSING_UNKNOWN", "Chưa xác định được trạng thái xử lý cuối của video.", metadata,
-                                  video_id, evidence_sink)
+                                  video_id, evidence_sink, observed=observed, field_states=field_states)
 
-        observed = _observed_api_metadata(item)
         expected = _api_expected_metadata(metadata)
-        if observed["category_id"] is None:
+        if observed.get("category_id") is None:
             _verification_failure("API_VIDEO_CATEGORY_MISSING", "YouTube không trả danh mục hợp lệ để xác minh.",
-                                  metadata, video_id, evidence_sink, observed=observed)
+                                  metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
         if expected["category_id"] and observed["category_id"] != expected["category_id"]:
             _verification_failure("API_VIDEO_CATEGORY_MISMATCH", "Danh mục đọc lại từ YouTube không khớp giá trị đã yêu cầu.",
-                                  metadata, video_id, evidence_sink, observed=observed)
+                                  metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
         if "video_language" in expected and observed.get("video_language") is None:
             _verification_failure("API_VIDEO_LANGUAGE_MISSING", "YouTube không trả ngôn ngữ audio hợp lệ để xác minh.",
-                                  metadata, video_id, evidence_sink, observed=observed)
+                                  metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
         if "video_language" in expected and observed.get("video_language") != expected["video_language"]:
             _verification_failure("API_VIDEO_LANGUAGE_MISMATCH", "Ngôn ngữ audio đọc lại từ YouTube không khớp giá trị đã yêu cầu.",
-                                  metadata, video_id, evidence_sink, observed=observed)
+                                  metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
+
+        if expected.get('youtube_channel_id'):
+            if not observed.get('youtube_channel_id'):
+                _verification_failure('API_VIDEO_CHANNEL_MISSING', 'YouTube không trả kênh sở hữu video để xác minh.',
+                                      metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
+            if observed['youtube_channel_id'] != expected['youtube_channel_id']:
+                _verification_failure('API_VIDEO_CHANNEL_MISMATCH', 'Video đọc lại thuộc kênh khác kênh đã phê duyệt.',
+                                      metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
 
         expected_privacy = "private" if metadata.get("privacy_status") == "schedule" else metadata.get("privacy_status")
         if str(status.get("privacyStatus") or "").lower() != expected_privacy:
-            _verification_failure("API_VIDEO_VISIBILITY_MISMATCH", "Visibility đọc lại từ YouTube không khớp giá trị đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed)
+            _verification_failure("API_VIDEO_VISIBILITY_MISMATCH", "Visibility đọc lại từ YouTube không khớp giá trị đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
         if type(status.get("selfDeclaredMadeForKids")) is not bool:
-            _verification_failure("API_VIDEO_AUDIENCE_MISSING", "YouTube không trả lại trạng thái Dành cho trẻ em để xác minh.", metadata, video_id, evidence_sink, observed=observed)
-        if type(status.get("containsSyntheticMedia")) is not bool:
-            _verification_failure("API_VIDEO_AI_MISSING", "YouTube không trả lại nhãn nội dung AI để xác minh.", metadata, video_id, evidence_sink, observed=observed)
+            _verification_failure("API_VIDEO_AUDIENCE_MISSING", "YouTube không trả lại trạng thái Dành cho trẻ em để xác minh.", metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
         if bool(status.get("selfDeclaredMadeForKids")) != bool(metadata.get("made_for_kids")):
-            _verification_failure("API_VIDEO_AUDIENCE_MISMATCH", "Thiết lập Dành cho trẻ em đọc lại từ YouTube không khớp giá trị đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed)
-        if bool(status.get("containsSyntheticMedia")) != bool(metadata.get("altered_content")):
-            _verification_failure("API_VIDEO_AI_MISMATCH", "Nhãn nội dung AI đọc lại từ YouTube không khớp giá trị đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed)
+            _verification_failure("API_VIDEO_AUDIENCE_MISMATCH", "Thiết lập Dành cho trẻ em đọc lại từ YouTube không khớp giá trị đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
         if metadata.get("privacy_status") == "schedule":
             raw_publish_at = str(status.get("publishAt") or "").strip()
             if not raw_publish_at:
-                _verification_failure("API_VIDEO_SCHEDULE_MISSING", "YouTube không trả lại thời gian công bố đã hẹn.", metadata, video_id, evidence_sink, observed=observed)
+                _verification_failure("API_VIDEO_SCHEDULE_MISSING", "YouTube không trả lại thời gian công bố đã hẹn.", metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
             try:
                 actual_publish_at = datetime.fromisoformat(
                     raw_publish_at.replace("Z", "+00:00")  # noqa: FURB162 - supports Python 3.10
@@ -1790,12 +1852,133 @@ def _verify_api_video(http, video_id: str, access_token: str, metadata: Dict[str
                     str(metadata.get("schedule_time") or "").replace(" ", "T")
                 ).astimezone()
             except (TypeError, ValueError):
-                _verification_failure("API_VIDEO_SCHEDULE_INVALID", "Không đọc/so sánh được thời gian hẹn từ YouTube.", metadata, video_id, evidence_sink, observed=observed)
+                _verification_failure("API_VIDEO_SCHEDULE_INVALID", "Không đọc/so sánh được thời gian hẹn từ YouTube.", metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
             if abs(actual_publish_at.timestamp() - expected_publish_at.timestamp()) > 60:
-                _verification_failure("API_VIDEO_SCHEDULE_MISMATCH", "Thời gian công bố đọc lại từ YouTube không khớp lịch đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed)
+                _verification_failure("API_VIDEO_SCHEDULE_MISMATCH", "Thời gian công bố đọc lại từ YouTube không khớp lịch đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
+        elif observed.get('publish_at') is not None:
+            _verification_failure('API_VIDEO_SCHEDULE_MISMATCH', 'Video có lịch công bố ngoài yêu cầu đã phê duyệt.',
+                                  metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
+        if type(status.get("containsSyntheticMedia")) is not bool:
+            if field_states.get("altered_content") == "missing":
+                missing_ai_reads += 1
+                remaining = max(0, deadline - time.monotonic())
+                if missing_ai_reads < 3 and remaining > 0:
+                    if progress_callback:
+                        progress_callback(97, 'YouTube đã xử lý video; đang đọc lại nhãn nội dung AI, không gửi lại file...')
+                    time.sleep(min(delay, remaining))
+                    delay = min(30, delay * 2)
+                    continue
+                if not bool(metadata.get("altered_content")):
+                    if warnings_out is not None:
+                        warnings_out.append({
+                            "step": "metadata_readback",
+                            "code": "API_VIDEO_AI_OMITTED",
+                            "message": "Video đã xử lý xong và khớp kênh/quyền riêng tư trên YouTube; API lược bỏ trường nhãn nội dung AI (containsSyntheticMedia) khi không bật nhãn AI.",
+                        })
+                    _emit_upload_evidence(evidence_sink, video_id=video_id, state="verified", metadata=metadata,
+                                          code="API_VIDEO_AI_OMITTED", observed=observed, field_states=field_states)
+                    return item
+            code = 'API_VIDEO_AI_MISSING' if field_states.get('altered_content') == 'missing' else 'API_VIDEO_AI_INVALID'
+            _verification_failure(code, 'Video đã được YouTube xử lý; nhãn nội dung AI chưa xác minh được. '
+                                  'Hãy đối soát đúng Video ID đã nhận, không upload lại file.',
+                                  metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
+        if bool(status.get("containsSyntheticMedia")) != bool(metadata.get("altered_content")):
+            _verification_failure("API_VIDEO_AI_MISMATCH", "Nhãn nội dung AI đọc lại từ YouTube không khớp giá trị đã yêu cầu.", metadata, video_id, evidence_sink, observed=observed, field_states=field_states)
         _emit_upload_evidence(evidence_sink, video_id=video_id, state="verified", metadata=metadata,
-                              observed=observed)
+                              observed=observed, field_states=field_states)
         return item
+
+
+def recheck_api_video_receipt(
+    channel: Dict[str, Any],
+    video_id: str,
+    expected_metadata: Dict[str, Any],
+    *,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Read-only exact-ID verification on YouTube Data API; never uploads or modifies a video."""
+    safe_id = _safe_video_id(video_id)
+    if not safe_id:
+        raise ValueError("Video ID trong receipt không hợp lệ.")
+    if not isinstance(expected_metadata, dict) or not expected_metadata:
+        raise ValueError("Metadata mong đợi trong receipt không hợp lệ.")
+    from upload_evidence import _publish_at_matches
+    owned_session = session is None
+    http = session or _http_session_for_channel(channel)
+    try:
+        oauth_data = _parse_oauth_payload(channel.get("oauth_token_json") or "")
+        if not oauth_data:
+            raise RuntimeError("Kênh chưa có cấu hình OAuth token hợp lệ để đọc lại video.")
+        access_token = _refresh_google_access_token(oauth_data, session=http)
+        identity = _fetch_oauth_channel_identity(access_token, session=http)
+        target_id = str(channel.get("channel_id") or "").strip()
+        if target_id and identity.get("channel_id") != target_id:
+            raise RuntimeError("Token OAuth hiện tại không thuộc đúng Channel ID của kênh đích.")
+        try:
+            response = http.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={"part": "snippet,status,processingDetails", "id": safe_id},
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=20,
+            )
+        except requests.RequestException:
+            raise RuntimeError("Không kết nối được YouTube Data API khi đọc lại video.") from None
+        if response.status_code != 200:
+            raise RuntimeError(f"YouTube Data API trả mã HTTP {response.status_code} khi đọc lại video.")
+        try:
+            payload = response.json()
+        except ValueError:
+            raise RuntimeError("Phản hồi đọc lại từ YouTube Data API không đúng JSON.") from None
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict) or items[0].get("id") != safe_id:
+            return {
+                "found": False,
+                "video_id": safe_id,
+                "video_url": f"https://youtu.be/{safe_id}",
+                "upload_state": "missing",
+                "observed": {},
+                "field_states": {},
+                "matches_expected": False,
+                "ai_omitted_when_false": False,
+                "mismatches": ["video_id"],
+            }
+        observed, field_states = _api_readback_fields(items[0])
+        processed = observed.get("upload_status") == "processed" or observed.get("processing_status") == "succeeded"
+        upload_state = "processed" if processed else "received"
+        mismatches = []
+        ai_omitted_when_false = False
+        if not processed:
+            mismatches.append("processing_status")
+        if target_id and observed.get("youtube_channel_id") != target_id:
+            mismatches.append("youtube_channel_id")
+        for key, value in expected_metadata.items():
+            if key == "publish_at":
+                if not _publish_at_matches(value, observed.get("publish_at")):
+                    mismatches.append(key)
+                continue
+            if observed.get(key) == value:
+                continue
+            if (key == "altered_content" and value is False
+                    and "altered_content" not in observed and field_states.get("altered_content") == "missing"):
+                ai_omitted_when_false = True
+                continue
+            mismatches.append(key)
+        return {
+            "found": True,
+            "video_id": safe_id,
+            "video_url": f"https://youtu.be/{safe_id}",
+            "upload_state": upload_state,
+            "observed": observed,
+            "field_states": field_states,
+            "matches_expected": len(mismatches) == 0,
+            "ai_omitted_when_false": ai_omitted_when_false,
+            "mismatches": mismatches,
+        }
+    finally:
+        if owned_session:
+            close_fn = getattr(http, "close", None)
+            if callable(close_fn):
+                close_fn()
 
 
 def _upload_via_youtube_api_with_session(
@@ -1819,6 +2002,9 @@ def _upload_via_youtube_api_with_session(
     if session is None:
         raise ValueError('API upload requires a channel HTTP session from _http_session_for_channel.')
     http = session
+    raw_channel_id = str(channel.get('channel_id') or '').strip()
+    if raw_channel_id:
+        metadata = {**metadata, 'youtube_channel_id': raw_channel_id}
     oauth_data = _parse_oauth_payload(channel.get("oauth_token_json") or "")
     access_token = _refresh_google_access_token(oauth_data, session=http)
 
@@ -2036,10 +2222,10 @@ def _upload_via_youtube_api_with_session(
 
     if progress_callback:
         progress_callback(96, "Đã chuyển file xong; đang chờ YouTube xử lý và đọc lại metadata...")
-    _verify_api_video(http, video_id, access_token, metadata, progress_callback=progress_callback,
-                      evidence_sink=evidence_sink)
-
     warnings = []
+    _verify_api_video(http, video_id, access_token, metadata, progress_callback=progress_callback,
+                      evidence_sink=evidence_sink, warnings_out=warnings)
+
     if thumbnail_path and not os.path.exists(thumbnail_path):
         warnings.append({'step':'thumbnail','code':'FILE_MISSING','message':'Video đã đăng; file thumbnail không còn tồn tại.'})
     if thumbnail_path and os.path.exists(thumbnail_path):

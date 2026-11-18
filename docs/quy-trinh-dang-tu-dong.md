@@ -102,9 +102,10 @@ Nút **Dừng lô hiện tại** dừng pipeline batch trên toàn phạm vi lô
 
 Với NeedsReview, mở **Đối soát → Xem bằng chứng**. `received` chỉ nói đã nhận video ID; `verified`, `mismatch` và `unknown` nói kết quả xác minh metadata. Không có bằng chứng ID cũng không chứng minh file chưa từng được gửi.
 
-- Đã xác minh video tồn tại trên đúng kênh: dùng nhánh **Xác nhận đã đăng**, điền URL và lý do để ghi nhận kết quả.
-- Đã xác minh chưa đăng: dùng nhánh **Xác nhận chưa đăng**, ghi lý do rồi cho phép đăng lại riêng dòng đó. Quyết định này không tự chạy; chọn dòng, tạo bản xem trước mới và xác nhận lô riêng.
+- Đã xác minh video tồn tại trên đúng kênh: dùng nhánh **Xác nhận đã đăng**. Nếu lượt đăng đã có receipt Video ID tự động, hộp thoại tự khóa đúng URL video đó và cho phép bấm **Kiểm tra lại trên YouTube API (chỉ đọc)** để xác minh trạng thái xử lý/quyền riêng tư mà không upload lại file. Nếu lượt đăng cũ không có receipt tự động, người vận hành phải tích xác nhận rõ đã tự đối chiếu đúng video và kênh trên YouTube Studio.
+- Đã xác minh chưa đăng: dùng nhánh **Xác nhận chưa đăng**, tích xác nhận và ghi lý do rồi cho phép đăng lại riêng dòng đó. Quyết định này không tự chạy; chọn dòng, tạo bản xem trước mới và xác nhận lô riêng.
 - Chưa rõ: hủy quyết định, giữ NeedsReview và tiếp tục đối soát. Không dùng retry hàng loạt hoặc sửa status trong DB để mở khóa.
+- Trường hợp YouTube Data API xử lý xong video ở chế độ không gắn nhãn AI (`altered_content=false`) nhưng lược bỏ trường `containsSyntheticMedia` trong phản hồi đọc lại: tool ghi nhận `Completed` kèm cảnh báo hậu kiểm `API_VIDEO_AI_OMITTED` và đánh dấu `metadata_state=partial` trong bằng chứng v2 để không làm đứt gãy lịch tự động; nếu `altered_content=true` hoặc giá trị đọc lại sai lệch thì vẫn giữ `NeedsReview`.
 
 Nếu slot là `recovery_required`, kiểm tra phiên upload cũ trong Studio và xác nhận phiên đó đã kết thúc qua **Kiểm tra lượt đăng**. Xác nhận phục hồi slot đưa nó về cooldown; không giải quyết thay quyết định NeedsReview và không tự gửi lại video.
 
@@ -117,5 +118,14 @@ Sau restart, lượt upload đang dở có thể được giữ để đối so�
 Bắt đầu bằng clip test có thể đối chiếu, gán một kênh và chọn Riêng tư. Kiểm tra bản xem trước rồi ghi ID/URL, kênh, hiển thị, metadata và cảnh báo sau lượt gửi. Kiểm chứng riêng Studio và API nếu sẽ dùng cả hai. Lượt hẹn giờ cần đối chiếu lịch trong Studio; Monitor cần kiểm tra quét lại không tạo lượt trùng và nút dừng hoạt động đúng.
 
 Chỉ tăng số video/profile sau khi đã kiểm tra đúng đích, kết quả, cooldown, dừng và phục hồi. Ghi riêng số lượt đã gửi, NotSent, Completed và NeedsReview; một phiên soak offline không chứng minh hoạt động YouTube thật hay độ sẵn sàng 24/7.
+
+## 10. Lịch đăng Private định kỳ đóng gói (`scheduled_upload_runner.py`)
+
+Khi cần đăng từng video Private theo chu kỳ nhiều ngày (tối thiểu 72 giờ/video) mà không dùng `schedule_time` công khai của YouTube:
+
+1. **Dữ liệu vận hành tách rời mã nguồn:** `manifest.json`, `state.json` và `release.json` nằm trong `data/scheduled_uploads/default` của thư mục runtime (hoặc `DHB_SCHEDULE_STATE_DIR`), không đặt trong thư mục review hay Git.
+2. **Quan sát kết quả cuối:** Runner chỉ gửi tối đa một video mỗi kỳ, lưu bền vững trạng thái `submitting` trước khi gọi `POST /api/pipeline/start`, sau đó theo dõi kết quả cuối (`completed`, `needs_review`, `error`, `missed`, `finished`) mà không bao giờ tự gửi lại một lượt chưa rõ kết quả.
+3. **Hiển thị trên giao diện:** Trạng thái lịch, tiến độ hoàn tất, ID video kế tiếp và cảnh báo cần đối soát được hiển thị trong **Quy trình đăng tự động** và **Hệ thống → Chẩn đoán** (`GET /api/scheduled-uploads/status`).
+4. **Windows Scheduled Task (`scheduled_upload_task.py`):** Chạy dưới phiên đăng nhập hiện tại (`InteractiveToken`), hỗ trợ sao lưu XML cũ trước khi cập nhật và khôi phục khi rollback mà không reset `next_index` hay mốc thời gian 72 giờ.
 
 Tài liệu liên quan: [hướng dẫn giao diện](UI_UX_2026_11.md), [vận hành/backup/phục hồi](van-hanh-local.md), [kết nối OAuth](youtube-oauth.md), [quy trình release](G22_RELEASE.md).

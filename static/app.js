@@ -1910,8 +1910,29 @@ async function openUploadEvidence(queueId) {
     if (!dialog.isConnected) return;
     if (!Array.isArray(result.attempts) || Number(result.queue_id) !== Number(queueId)) throw new Error('Invalid evidence response');
     const states = { received: 'Đã nhận video ID; chưa xác minh', verified: 'Đã xác minh metadata', mismatch: 'Metadata không khớp yêu cầu', unknown: 'Chưa xác định kết quả xác minh' };
-    const outcomes = { InProgress: 'Đang xử lý', NeedsReview: 'Cần đối soát', Completed: 'Đã hoàn tất lượt', Error: 'Lỗi', NotSent: 'Chưa gửi', Cancelled: 'Đã hủy' };
+    const uploadStates = { received: 'Đã nhận Video ID', processed: 'YouTube đã xử lý xong' };
+    const metadataStates = { pending: 'Chờ đọc lại', verified: 'Đã xác minh đầy đủ', partial: 'Đã xác minh (YouTube lược bỏ nhãn AI)', mismatch: 'Metadata lệch yêu cầu', unknown: 'Chưa xác minh xong' };
+    const fieldStates = { present: 'Có trả về', missing: 'YouTube lược bỏ trường', null: 'Giá trị rỗng (null)', invalid: 'Kiểu dữ liệu không hợp lệ' };
+    const outcomes = { InProgress: 'Đang xử lý', NeedsReview: 'Cần đối soát', Completed: 'Đã hoàn tất lượt', Error: 'Lỗi', NotSent: 'Chưa gửi', Cancelled: 'Đã hủy', Warning: 'Hoàn tất kèm cảnh báo', Authorized: 'Đã cho phép đăng lại', ConfirmedPublished: 'Đã xác nhận đăng thủ công' };
+    const formatBool = val => val === true ? 'Bật (true)' : val === false ? 'Tắt (false)' : null;
     const showValue = value => value === null || value === undefined || value === '' ? 'Không có bằng chứng' : escapeHtml(String(value));
+    const showObserved = (evidence, key) => {
+      const obs = evidence.observed?.[key];
+      if (obs !== null && obs !== undefined && obs !== '') {
+        return typeof obs === 'boolean' ? escapeHtml(formatBool(obs)) : escapeHtml(String(obs));
+      }
+      const fState = evidence.field_states?.[key];
+      if (fState && fieldStates[fState]) return escapeHtml(fieldStates[fState]);
+      return 'Không có bằng chứng';
+    };
+    const showExpected = (evidence, key) => {
+      const exp = evidence.expected?.[key];
+      if (key === 'publish_at' && exp === null && Object.prototype.hasOwnProperty.call(evidence.expected || {}, 'publish_at')) {
+        return 'Không hẹn giờ công bố';
+      }
+      if (typeof exp === 'boolean') return escapeHtml(formatBool(exp));
+      return showValue(exp);
+    };
     body.innerHTML = result.attempts.length ? result.attempts.map(attempt => {
       const heading = `<h3>Lượt ${showValue(attempt.attempt_no)} · ${escapeHtml(outcomes[attempt.outcome] || 'Chưa rõ trạng thái lượt')}</h3>`;
       if (attempt.evidence_error) return `<section class="upload-preview-item">${heading}<p>Không đọc được bằng chứng hợp lệ của lượt này. Cần kiểm tra riêng; không suy ra đã đăng hoặc chưa gửi.</p></section>`;
@@ -1920,13 +1941,31 @@ async function openUploadEvidence(queueId) {
       const videoId = typeof evidence.video_id === 'string' && /^[A-Za-z0-9_-]{11}$/.test(evidence.video_id) ? evidence.video_id : '';
       // Derive the link from the validated observed ID, never from arbitrary stored URL text.
       const videoLink = videoId ? `https://youtu.be/${videoId}` : '';
-      const valueRows = [['category_id', 'Danh mục'], ['video_language', 'Ngôn ngữ video']].map(([key, label]) =>
-        `<tr><th scope="row">${label}</th><td>${showValue(evidence.expected?.[key])}</td><td>${showValue(evidence.observed?.[key])}</td></tr>`).join('');
+      const rowDefs = evidence.version === 2
+        ? [
+            ['category_id', 'Danh mục'],
+            ['video_language', 'Ngôn ngữ video'],
+            ['youtube_channel_id', 'YouTube Channel ID'],
+            ['privacy_status', 'Chế độ hiển thị'],
+            ['made_for_kids', 'Dành cho trẻ em'],
+            ['altered_content', 'Nhãn nội dung AI'],
+            ['publish_at', 'Lịch công bố'],
+            ['upload_status', 'Trạng thái upload'],
+            ['processing_status', 'Trạng thái xử lý'],
+          ]
+        : [['category_id', 'Danh mục'], ['video_language', 'Ngôn ngữ video']];
+      const valueRows = rowDefs.filter(([key]) => evidence.version !== 2 || key in (evidence.expected || {}) || key in (evidence.observed || {}) || key in (evidence.field_states || {})).map(([key, label]) =>
+        `<tr><th scope="row">${label}</th><td>${showExpected(evidence, key)}</td><td>${showObserved(evidence, key)}</td></tr>`).join('');
+      const v2Summary = evidence.version === 2
+        ? `<div><dt>Trạng thái xử lý file</dt><dd>${escapeHtml(uploadStates[evidence.upload_state] || showValue(evidence.upload_state))}</dd></div>
+           <div><dt>Trạng thái metadata</dt><dd>${escapeHtml(metadataStates[evidence.metadata_state] || showValue(evidence.metadata_state))}</dd></div>`
+        : '';
       return `<section class="upload-preview-item">${heading}
         <p><strong>${escapeHtml(states[evidence.verification_state] || 'Chưa xác định kết quả xác minh')}</strong></p>
         <dl><div><dt>Phương thức</dt><dd>${evidence.backend === 'youtube_api' ? 'YouTube API' : evidence.backend === 'playwright' ? 'YouTube Studio' : 'Chưa xác định'}</dd></div>
           <div><dt>Kênh đích</dt><dd>${showValue(evidence.channel_id)}</dd></div>
           <div><dt>Video ID đã quan sát</dt><dd>${videoId ? escapeHtml(videoId) : 'Không có ID hợp lệ'}</dd></div>
+          ${v2Summary}
           <div><dt>Nhận bằng chứng lúc</dt><dd>${showValue(evidence.received_at)}</dd></div>
           <div><dt>Cập nhật xác minh lúc</dt><dd>${showValue(evidence.updated_at)}</dd></div>
           <div><dt>Mã xác minh</dt><dd>${showValue(evidence.code)}</dd></div></dl>
@@ -2552,37 +2591,196 @@ async function deleteSelectedQueue() {
   await loadQueue();
 }
 
+function _currentCycleReceiptFromEvidence(attempts) {
+  if (!Array.isArray(attempts)) return { receipt: null, hasCycleAttempts: false, invalid: false };
+  let hasCycleAttempts = false;
+  for (const attempt of attempts) {
+    if (attempt.outcome === 'Authorized') break;
+    hasCycleAttempts = true;
+    if (attempt.evidence_error) return { receipt: null, hasCycleAttempts: true, invalid: true };
+    const ev = attempt.evidence;
+    if (ev && typeof ev === 'object' && typeof ev.video_id === 'string' && /^[A-Za-z0-9_-]{11}$/.test(ev.video_id)) {
+      return { receipt: { ...ev, video_url: `https://youtu.be/${ev.video_id}` }, hasCycleAttempts: true, invalid: false };
+    }
+  }
+  return { receipt: null, hasCycleAttempts, invalid: false };
+}
+
 async function manualReuploadQueueItem(itemId, action) {
   const item = gQueueItems.find(row => Number(row.id) === Number(itemId));
-  if (!item) return;
+  if (!item || document.querySelector('.reconcile-dialog[open]')) return;
 
-  const reason = prompt('Nhập lý do/ghi chú đối soát (bắt buộc, tối thiểu 5 ký tự):');
-  if (!reason || reason.trim().length < 5) return;
+  const opener = document.activeElement;
+  let cycle = { receipt: null, hasCycleAttempts: false, invalid: false };
+  try {
+    const evRes = await apiFetch(`/api/queue/${Number(itemId)}/upload-evidence`, { cache: 'no-store' });
+    cycle = _currentCycleReceiptFromEvidence(evRes?.attempts);
+  } catch (_) {}
 
-  const payload = { action, reason: reason.trim() };
-  if (action === 'reupload') {
-    if ((item.requires_review || item.status === 'NeedsReview')) {
-      if (!confirm('Bạn đã kiểm tra YouTube Studio và xác nhận lượt trước CHƯA đăng video này?')) return;
-      payload.confirm_not_published = true;
-    } else if (!confirm('Cho phép đăng lại riêng video này? Thao tác có thể tạo video trùng trên kênh.')) {
+  const isReview = Boolean(item.requires_review || item.status === 'NeedsReview');
+  const receipt = cycle.receipt;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'workspace-dialog upload-preview-dialog reconcile-dialog';
+  dialog.setAttribute('aria-labelledby', 'reconcile-dialog-title');
+  const titleText = action === 'confirmed_published'
+    ? `Xác nhận video #${Number(itemId)} đã đăng`
+    : `Cho phép đăng lại video #${Number(itemId)}`;
+
+  const receiptNotice = receipt
+    ? `<div class="upload-preview-item" data-reconcile-receipt>
+         <p><strong>Receipt đã lưu từ YouTube:</strong> <code>${escapeHtml(receipt.video_id)}</code> (Kênh #${escapeHtml(String(receipt.channel_id))} · Mã: <code>${escapeHtml(receipt.code || '')}</code>)</p>
+         <p><a href="${receipt.video_url}" target="_blank" rel="noopener noreferrer">Mở đúng video ${escapeHtml(receipt.video_id)} trên YouTube</a></p>
+         ${action === 'confirmed_published' && receipt.backend === 'youtube_api'
+           ? `<div style="margin-top:8px;"><button type="button" class="btn btn-outline btn-sm" data-recheck-receipt>Kiểm tra lại trên YouTube API (chỉ đọc)</button></div>
+              <p data-recheck-status role="status" style="margin-top:8px;font-size:13px;" hidden></p>`
+           : ''}
+       </div>`
+    : (cycle.invalid
+      ? `<p class="uq-detail-error">Bằng chứng upload của lượt này không hợp lệ; hãy kiểm tra kỹ trước khi thao tác.</p>`
+      : `<p class="publish-help">Lượt này chưa có Video ID tự động trong bằng chứng upload.</p>`);
+
+  const actionControls = action === 'confirmed_published'
+    ? `<div class="form-group" style="margin-top:12px;">
+         <label for="reconcile-url-input">URL video trên YouTube ${receipt ? '(đã khóa theo Video ID trong receipt)' : '(bắt buộc)'}:</label>
+         <input type="url" id="reconcile-url-input" value="${receipt ? escapeHtml(receipt.video_url) : ''}" ${receipt ? 'readonly' : ''} placeholder="https://youtu.be/..." required />
+       </div>
+       ${!receipt && cycle.hasCycleAttempts
+         ? `<label style="display:flex;gap:8px;align-items:flex-start;margin-top:10px;font-size:13px;">
+              <input type="checkbox" id="reconcile-legacy-ack" />
+              <span>Lượt upload này không có receipt tự động; tôi đã tự kiểm tra đúng kênh và video trên YouTube Studio.</span>
+            </label>`
+         : ''}`
+    : `<label style="display:flex;gap:8px;align-items:flex-start;margin-top:12px;font-size:13px;">
+         <input type="checkbox" id="reconcile-not-published-ack" />
+         <span>${isReview
+           ? 'Tôi đã kiểm tra YouTube Studio và xác nhận lượt trước CHƯA đăng video này (tránh đăng trùng).'
+           : 'Tôi xác nhận cho phép đăng lại riêng video này (có thể tạo bản đăng mới trên kênh).'}</span>
+       </label>`;
+
+  dialog.innerHTML = `
+    <div class="upload-preview-header" style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+      <h2 id="reconcile-dialog-title" style="margin:0;font-size:18px;">${escapeHtml(titleText)}</h2>
+      <button type="button" class="btn btn-outline btn-sm" data-reconcile-close>Đóng</button>
+    </div>
+    <form data-reconcile-form style="margin-top:12px;">
+      <p style="margin:0 0 10px;font-weight:600;">${escapeHtml(item.title || 'Chưa có tiêu đề')}</p>
+      ${receiptNotice}
+      ${actionControls}
+      <div class="form-group" style="margin-top:12px;">
+        <label for="reconcile-reason-input">Lý do / ghi chú đối soát (bắt buộc, tối thiểu 5 ký tự):</label>
+        <textarea id="reconcile-reason-input" rows="3" minlength="5" maxlength="1000" required placeholder="Ghi rõ căn cứ đối soát trên YouTube Studio hoặc API..."></textarea>
+      </div>
+      <p data-reconcile-error role="alert" class="uq-detail-error" hidden></p>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">
+        <button type="button" class="btn btn-outline" data-reconcile-cancel>Hủy</button>
+        <button type="submit" class="btn ${action === 'confirmed_published' ? 'btn-success' : 'btn-primary'}" data-reconcile-submit>
+          ${action === 'confirmed_published' ? 'Xác nhận đã đăng' : 'Cho phép đăng lại'}
+        </button>
+      </div>
+    </form>`;
+
+  let busy = false;
+  const closeDialog = () => { if (!busy) dialog.close(); };
+  dialog.querySelector('[data-reconcile-close]').addEventListener('click', closeDialog);
+  dialog.querySelector('[data-reconcile-cancel]').addEventListener('click', closeDialog);
+  dialog.addEventListener('cancel', event => { if (busy) event.preventDefault(); });
+  dialog.addEventListener('close', () => {
+    dialog.remove();
+    if (opener?.isConnected) opener.focus({ preventScroll: true });
+  }, { once: true });
+
+  const recheckBtn = dialog.querySelector('[data-recheck-receipt]');
+  if (recheckBtn) {
+    recheckBtn.addEventListener('click', async () => {
+      if (busy) return;
+      const statusNode = dialog.querySelector('[data-recheck-status]');
+      recheckBtn.disabled = true;
+      statusNode.hidden = false;
+      statusNode.textContent = 'Đang đọc lại trạng thái video trực tiếp từ YouTube API (chỉ đọc, không gửi lại file)…';
+      try {
+        const res = await apiFetch(`/api/queue/${Number(itemId)}/recheck-receipt`, { method: 'POST', body: '{}' });
+        if (!res.found) {
+          statusNode.textContent = `Không tìm thấy video ${res.video_id} trên YouTube API. Không xác nhận đã đăng nếu chưa kiểm tra Studio.`;
+        } else {
+          const privacy = res.observed?.privacy_status || 'chưa rõ';
+          const aiNote = res.ai_omitted_when_false ? ' · API lược bỏ trường nhãn AI (đang tắt)' : '';
+          statusNode.textContent = res.matches_expected
+            ? `Đọc lại khớp yêu cầu: trạng thái=${res.upload_state}, hiển thị=${privacy}, kênh=${res.observed?.youtube_channel_id || 'khớp'}${aiNote}.`
+            : `Đọc lại có trường chưa khớp (${(res.mismatches || []).join(', ')}): trạng thái=${res.upload_state}, hiển thị=${privacy}.`;
+          const reasonInput = dialog.querySelector('#reconcile-reason-input');
+          if (reasonInput && !reasonInput.value.trim() && res.matches_expected) {
+            reasonInput.value = `Đã đối chiếu read-only YouTube API cho ${res.video_id}: ${res.upload_state}, hiển thị ${privacy}${aiNote}; không upload lại.`;
+          }
+        }
+      } catch (err) {
+        statusNode.textContent = 'Không đọc lại được từ YouTube API: ' + (err?.message || err);
+      } finally {
+        recheckBtn.disabled = false;
+      }
+    });
+  }
+
+  dialog.querySelector('[data-reconcile-form]').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (busy) return;
+    const errorNode = dialog.querySelector('[data-reconcile-error]');
+    errorNode.hidden = true;
+    const reason = (dialog.querySelector('#reconcile-reason-input')?.value || '').trim();
+    if (reason.length < 5) {
+      errorNode.textContent = 'Hãy nhập lý do đối soát tối thiểu 5 ký tự.';
+      errorNode.hidden = false;
       return;
     }
-  } else {
-    const url = prompt('Dán URL video đã xác minh trên YouTube:');
-    if (!url || !url.trim()) return;
-    payload.published_url = url.trim();
-  }
+    const payload = { action, reason };
+    if (action === 'reupload') {
+      const ack = dialog.querySelector('#reconcile-not-published-ack');
+      if (!ack?.checked) {
+        errorNode.textContent = 'Hãy tích xác nhận trước khi cho phép đăng lại.';
+        errorNode.hidden = false;
+        return;
+      }
+      if (isReview) payload.confirm_not_published = true;
+    } else {
+      const urlVal = (dialog.querySelector('#reconcile-url-input')?.value || '').trim();
+      if (!urlVal) {
+        errorNode.textContent = 'Hãy nhập URL video trên YouTube.';
+        errorNode.hidden = false;
+        return;
+      }
+      payload.published_url = urlVal;
+      const legacyAck = dialog.querySelector('#reconcile-legacy-ack');
+      if (legacyAck) {
+        if (!legacyAck.checked) {
+          errorNode.textContent = 'Hãy tích xác nhận đã tự đối chiếu thủ công vì lượt này không có receipt tự động.';
+          errorNode.hidden = false;
+          return;
+        }
+        payload.acknowledge_legacy_no_receipt = true;
+      }
+    }
+    busy = true;
+    const submitBtn = dialog.querySelector('[data-reconcile-submit]');
+    submitBtn.disabled = true;
+    try {
+      const result = await apiFetch(`/api/queue/${Number(itemId)}/manual-reupload`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      busy = false;
+      dialog.close();
+      showToast(result.message || 'Đã lưu quyết định cho video.', 'success');
+      await loadQueue(true);
+    } catch (err) {
+      busy = false;
+      submitBtn.disabled = false;
+      errorNode.textContent = 'Không thể lưu quyết định: ' + (err?.message || err);
+      errorNode.hidden = false;
+    }
+  });
 
-  try {
-    const result = await apiFetch(`/api/queue/${itemId}/manual-reupload`, {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
-    showToast(result.message || 'Đã lưu quyết định cho video.', 'success');
-    await loadQueue(true);
-  } catch (e) {
-    alert('Không thể lưu quyết định: ' + e.message);
-  }
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  (dialog.querySelector('#reconcile-reason-input') || dialog.querySelector('[data-reconcile-close]'))?.focus();
 }
 
 function exportExcel() {

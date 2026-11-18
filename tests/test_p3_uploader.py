@@ -24,8 +24,9 @@ class _Response:
 
 
 class _ResumableSession:
-    def __init__(self, put_steps):
+    def __init__(self, put_steps, *, channel_id=CHANNEL_ID):
         self.put_steps = list(put_steps)
+        self.channel_id = channel_id
         self.put_calls = []
         self.get_calls = []
         self.post_calls = []
@@ -55,7 +56,10 @@ class _ResumableSession:
             body={
                 "items": [{
                     "id": VIDEO_ID,
-                    "snippet": {"categoryId": getattr(self, 'upload_snippet', {}).get('categoryId', '22')},
+                    "snippet": {
+                        "categoryId": getattr(self, 'upload_snippet', {}).get('categoryId', '22'),
+                        "channelId": self.channel_id,
+                    },
                     "status": {
                         "uploadStatus": "processed",
                         "privacyStatus": "private",

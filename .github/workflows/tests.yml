@@ -20,7 +20,8 @@ jobs:
           python -m py_compile
           app.py api_security.py antidetect_client.py pipeline_manager.py
           youtube_uploader.py database.py render_engine.py scanner_downloader.py
-          ai_engine.py config.py check_status.py
+          ai_engine.py config.py check_status.py upload_evidence.py
+          scheduled_uploads.py scheduled_upload_runner.py scheduled_upload_task.py
       - name: Check frontend syntax
         run: Get-ChildItem static/*.js | ForEach-Object { node --check $_.FullName; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
       - name: Run unit tests

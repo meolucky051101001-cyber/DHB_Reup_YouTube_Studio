@@ -17,6 +17,8 @@ import requests
 from app_instance_lock import acquire_app_instance_lock
 from audit_upload_capabilities import environment_manifest
 from runtime_identity import APPLICATION_ID, git_environment, git_output, source_fingerprint
+from scheduled_upload_runner import release_pin as build_schedule_release_pin
+from scheduled_uploads import load_json as load_schedule_json, save_json as save_schedule_json, validate_manifest as validate_schedule_manifest, validate_state as validate_schedule_state
 from validate_review_release import backup, rehearse, sha256_file, snapshot, verify_transition
 
 
@@ -91,6 +93,19 @@ def server_interpreter(process):
         require(launcher.is_file(), 'The previous virtualenv launcher is missing.')
         return launcher
     return executable
+
+
+def verify_idle_schedule(schedule_dir):
+    if schedule_dir is None or not (schedule_dir / 'manifest.json').is_file():
+        return None
+    manifest = load_schedule_json(schedule_dir / 'manifest.json')
+    validate_schedule_manifest(manifest)
+    state = load_schedule_json(schedule_dir / 'state.json')
+    validate_schedule_state(state, manifest)
+    require(state.get('inflight_queue_id') is None and state.get('submission_state') not in ('submitting', 'started'),
+            'Scheduled upload has an active or uncertain inflight job.')
+    release_path = schedule_dir / 'release.json'
+    return load_schedule_json(release_path) if release_path.is_file() else None
 
 
 def verify_idle_db(path):
@@ -334,6 +349,8 @@ def rollout(args):
     require(branch and not git(root, 'status', '--porcelain'), 'Runtime checkout must be clean and on a branch.')
     git(root, 'check-ref-format', '--branch', args.branch)
     db = root / 'data' / 'dhb_youtube.sqlite'
+    schedule_dir = (args.schedule_state_dir.resolve() if getattr(args, 'schedule_state_dir', None)
+                    else (root / 'data' / 'scheduled_uploads' / 'default'))
     base = f'http://127.0.0.1:{args.port}'
     with requests.Session() as session:
         session.trust_env = False
@@ -341,12 +358,14 @@ def rollout(args):
         if process is not None:
             http_state(session, base, root, previous)
         verify_idle_db(db)
+        previous_schedule_release = verify_idle_schedule(schedule_dir)
         rehearsal = rehearse(db)
         previous_python = server_interpreter(process) if process is not None else python
         recovery, recovery_before = rehearse_recovery(root, previous, previous_python, db)
         if not args.apply:
             return {'mode': 'dry-run', 'revision': revision, 'previous_revision': previous,
                     'running_pid': process.pid if process is not None else None,
+                    'schedule_configured': previous_schedule_release is not None,
                     'rehearsal': rehearsal, 'recovery': recovery}
 
         require(args.acceptance is not None, 'A completed acceptance report is required.')
@@ -368,7 +387,9 @@ def rollout(args):
         if process is not None:
             http_state(session, base, root, previous)
         verify_idle_db(db)
-        stopped, switched, launched = False, False, None
+        previous_schedule_release = verify_idle_schedule(schedule_dir)
+        schedule_backup = evidence / f'before-schedule-release-{revision[:12]}.json'
+        stopped, switched, schedule_updated, launched = False, False, False, None
         try:
             if process is not None:
                 process.terminate()
@@ -378,9 +399,12 @@ def rollout(args):
             lock = acquire_app_instance_lock(root / 'data' / 'app_instance.lock')
             try:
                 verify_idle_db(db)
+                previous_schedule_release = verify_idle_schedule(schedule_dir)
                 require(git(root, 'rev-parse', 'HEAD') == previous and not git(root, 'status', '--porcelain'),
                         'Runtime checkout changed during preflight.')
                 backup(db, backup_path)
+                if previous_schedule_release is not None:
+                    save_schedule_json(schedule_backup, previous_schedule_release)
                 before = snapshot(backup_path)
                 rehearsal = rehearse(backup_path)
                 # Mark the prior result unusable before testing the locked snapshot.
@@ -389,6 +413,10 @@ def rollout(args):
                 require(snapshot(db) == before, 'Runtime DB changed following backup.')
                 git(root, 'switch', '-c', args.branch, revision)
                 switched = True
+                if (schedule_dir / 'manifest.json').is_file():
+                    save_schedule_json(schedule_dir / 'release.json',
+                                       build_schedule_release_pin(root, revision, expected_build))
+                    schedule_updated = True
             finally:
                 lock.release()
             launched = launch(root, python, args.port, runtime_log)
@@ -409,6 +437,11 @@ def rollout(args):
                 json.dump(report, handle, indent=2)
             return report
         except BaseException:
+            if schedule_updated and previous_schedule_release is not None:
+                try:
+                    save_schedule_json(schedule_dir / 'release.json', previous_schedule_release)
+                except Exception:
+                    pass
             if launched is not None:
                 stop_owned_launch(launched)
                 raise RuntimeError('Post-start verification failed. Runtime stopped and current DB retained.') from None
@@ -428,6 +461,7 @@ if __name__ == '__main__':
     parser.add_argument('--evidence', type=Path, required=True)
     parser.add_argument('--python', type=Path, required=True)
     parser.add_argument('--port', type=int, default=8686)
+    parser.add_argument('--schedule-state-dir', type=Path)
     parser.add_argument('--acceptance', type=Path)
     parser.add_argument('--apply', action='store_true')
     print(json.dumps(rollout(parser.parse_args()), indent=2))

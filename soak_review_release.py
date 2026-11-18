@@ -189,18 +189,30 @@ class Soak:
                 self.violations.append('Prepare/render job attempted to upload.')
                 raise RuntimeError('Wrong lane reached mock provider.')
             video_id = f'Fixture{order:04}'
-            evidence = {'backend': 'youtube_api', 'video_id': video_id, 'expected': {'category_id': '22'}}
+            expected = self.pm.api_expected_metadata(
+                self.pm.validate_upload_preflight(video_item, channel, None),
+                channel.get('channel_id'),
+            )
+            evidence = {'version': 2, 'backend': 'youtube_api', 'video_id': video_id, 'expected': expected}
             with closing(self.db.get_conn()) as conn:
                 slot = conn.execute('SELECT state,queue_id,attempt_id FROM upload_slot').fetchone()
                 if slot['state'] != 'active' or slot['queue_id'] != video_item['id'] or not slot['attempt_id']:
                     self.violations.append('Mock uploader entered without its durable slot.')
-            evidence_sink({**evidence, 'verification_state': 'received'})
+            evidence_sink({**evidence, 'verification_state': 'received', 'field_states': {}})
             time.sleep(.25)
+            verified_observed = {
+                **expected,
+                'upload_status': 'processed',
+                'processing_status': 'succeeded',
+            }
+            field_states = {key: ('missing' if val is None else 'present') for key, val in verified_observed.items()}
             if order:
-                evidence_sink({**evidence, 'verification_state': 'mismatch', 'observed': {'category_id': '24'},
-                               'code': 'CATEGORY_MISMATCH'})
+                evidence_sink({**evidence, 'verification_state': 'mismatch',
+                               'observed': {**verified_observed, 'category_id': '24'},
+                               'field_states': field_states, 'code': 'CATEGORY_MISMATCH'})
                 raise RuntimeError('Synthetic readback mismatch.')
-            evidence_sink({**evidence, 'verification_state': 'verified', 'observed': {'category_id': '22'}})
+            evidence_sink({**evidence, 'verification_state': 'verified',
+                           'observed': verified_observed, 'field_states': field_states})
             return {'url': f'https://youtu.be/{video_id}',
                     'warnings': [{'step': 'thumbnail', 'code': 'HTTP_403', 'message': 'Fixture warning'}]}
         finally:

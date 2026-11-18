@@ -310,7 +310,7 @@ class CapabilityIntegrationTests(unittest.TestCase):
         metadata = yu.build_final_metadata({'title': 'Fixture', 'visibility': 'private'}, channel,
                                            {'category_id': '27', 'language': 'vi', 'disable_shorts_remix': 0})
         session = uploader_fixtures._ResumableSession([
-            uploader_fixtures._Response(200, body={'id': uploader_fixtures.VIDEO_ID})])
+            uploader_fixtures._Response(200, body={'id': uploader_fixtures.VIDEO_ID})], channel_id=CHANNEL_ID)
         with mock.patch.object(yu, '_refresh_google_access_token', return_value='fixture'), \
                 mock.patch.object(yu, '_fetch_oauth_channel_identity', return_value={'channel_id': CHANNEL_ID, 'name': 'Fixture'}), \
                 mock.patch.object(yu, 'get_settings', return_value={}), \

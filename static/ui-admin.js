@@ -438,6 +438,16 @@
       ['Cần đối soát', data.needs_review_count ?? '—', 'Mở hàng đợi để xem bằng chứng từng video'],
       ['Dung lượng trống', typeof window.storageFormatBytes === 'function' && data.storage?.free_bytes != null ? window.storageFormatBytes(data.storage.free_bytes) : 'Chưa rõ', data.database?.available ? 'Database sẵn có' : 'Chưa xác nhận database'],
     ];
+    if (data.scheduled_uploads?.configured) {
+      const sched = data.scheduled_uploads;
+      const prog = Number.isInteger(sched.completed_count) && Number.isInteger(sched.total_count)
+        ? `${sched.completed_count}/${sched.total_count} video · ${sched.status}`
+        : String(sched.status || 'Đã cấu hình');
+      const nextText = sched.next_due_at
+        ? `Kế tiếp: ${new Date(sched.next_due_at).toLocaleString('vi-VN')}`
+        : (sched.message || 'Xem trong Quy trình đăng tự động');
+      values.push(['Lịch đăng Private', prog, sched.action_required ? `Cần kiểm tra: ${sched.message || sched.status}` : nextText]);
+    }
     host.replaceChildren();
     values.forEach(([label, value, description]) => {
       const card = node('div', 'admin-metric');

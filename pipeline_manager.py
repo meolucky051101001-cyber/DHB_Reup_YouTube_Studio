@@ -21,7 +21,8 @@ from scanner_downloader import download_video, scan_social_urls, MAX_SCAN_ITEMS
 from render_engine import render_video, generate_thumbnail_from_video
 from ai_engine import ai_optimize_youtube_metadata
 from youtube_uploader import (
-    UploadNotSent, upload_video_to_youtube, validate_upload_preflight, normalize_published_video_url,
+    UploadNotSent, UploadVerificationError, api_expected_metadata, upload_video_to_youtube,
+    validate_upload_preflight, normalize_published_video_url,
 )
 from upload_capabilities import UploadCapabilityError, normalize_mode
 from metadata_resolution import resolve_metadata
@@ -1890,8 +1891,10 @@ class PipelineManager:
                 # same guard as preview and both direct upload adapters.
                 approved_upload_metadata = validate_upload_preflight(fresh_item, channel, option_group)
                 evidence_backend = normalize_mode(channel.get('upload_mode'))
-                evidence_expected = {'category_id': approved_upload_metadata['category_id']}
-                if approved_upload_metadata.get('video_language'):
+                evidence_expected = (api_expected_metadata(approved_upload_metadata, channel.get('channel_id'))
+                                     if evidence_backend == 'youtube_api' else
+                                     {'category_id': approved_upload_metadata['category_id']})
+                if evidence_backend != 'youtube_api' and approved_upload_metadata.get('video_language'):
                     evidence_expected['video_language'] = approved_upload_metadata['video_language']
 
                 reservation_key, reservation_result = _acquire_content_reservation(
@@ -2203,6 +2206,7 @@ class PipelineManager:
                     f"Lỗi sau khi bắt đầu upload '{title}'; giữ reservation để đối soát: {err_msg}",
                     "ERROR",
                     video_title=title,
+                    error_code=e.code if isinstance(e, UploadVerificationError) else "ERR_UPLOAD_UNCERTAIN",
                 )
                 return
             if se.is_set():

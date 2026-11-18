@@ -122,12 +122,21 @@ class UploadEvidencePipelineTests(unittest.TestCase):
         session = api_fixtures.MetadataSession(readbacks=[
             api_fixtures.JsonResponse(api_fixtures.video_payload(category='24'))])
         persisted = self.process_api_session(session)
+        expected_v2 = {
+            'category_id': '22',
+            'privacy_status': 'private',
+            'made_for_kids': False,
+            'altered_content': False,
+            'publish_at': None,
+            'youtube_channel_id': api_fixtures.CHANNEL_ID,
+        }
         self.assertEqual([item['verification_state'] for item in persisted], ['received', 'mismatch'])
-        self.assertTrue(all(item['backend'] == 'youtube_api' for item in persisted))
-        self.assertTrue(all(item['expected'] == {'category_id': '22'} for item in persisted))
+        self.assertTrue(all(item['backend'] == 'youtube_api' and item['version'] == 2 for item in persisted))
+        self.assertTrue(all(item['expected'] == expected_v2 for item in persisted))
         self.assertEqual(persisted[0]['observed'], {})
-        self.assertEqual(persisted[-1]['observed'], {'category_id': '24'})
+        self.assertEqual(persisted[-1]['observed']['category_id'], '24')
         self.assertEqual(persisted[-1]['code'], 'API_VIDEO_CATEGORY_MISMATCH')
+        self.assertEqual(persisted[-1]['metadata_state'], 'mismatch')
         self.assert_held('mismatch')
         self.restart_without_retry()
         self.assert_held('mismatch')
@@ -143,8 +152,13 @@ class UploadEvidencePipelineTests(unittest.TestCase):
         evidence = json.loads(attempt['evidence_json'])
         self.assertEqual(evidence, persisted[-1])
         self.assertEqual(evidence['backend'], 'youtube_api')
-        self.assertEqual(evidence['expected'], {'category_id': '22'})
-        self.assertEqual(evidence['observed'], {'category_id': '22'})
+        self.assertEqual(evidence['version'], 2)
+        self.assertEqual(evidence['expected']['category_id'], '22')
+        self.assertEqual(evidence['expected']['youtube_channel_id'], api_fixtures.CHANNEL_ID)
+        self.assertEqual(evidence['observed']['category_id'], '22')
+        self.assertEqual(evidence['observed']['privacy_status'], 'private')
+        self.assertEqual(evidence['upload_state'], 'processed')
+        self.assertEqual(evidence['metadata_state'], 'verified')
         self.assertEqual((evidence['queue_id'], evidence['attempt_id'], evidence['channel_id']),
                          (901, attempt['id'], 901))
         with closing(database.get_conn()) as conn:

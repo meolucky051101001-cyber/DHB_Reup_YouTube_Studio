@@ -11,13 +11,18 @@ import upload_capabilities
 from test_p3_uploader import CHANNEL_ID, VIDEO_ID, _Response, _ResumableSession
 
 
-def video_payload(category='22', language=None):
+def video_payload(category='22', language=None, channel_id=CHANNEL_ID, synthetic=False):
     snippet = {'categoryId': category}
+    if channel_id is not None:
+        snippet['channelId'] = channel_id
     if language is not None:
         snippet['defaultAudioLanguage'] = language
+    status = {'uploadStatus': 'processed', 'privacyStatus': 'private',
+              'selfDeclaredMadeForKids': False}
+    if synthetic != 'OMIT':
+        status['containsSyntheticMedia'] = synthetic
     return {'items': [{'id': VIDEO_ID, 'snippet': snippet,
-                       'status': {'uploadStatus': 'processed', 'privacyStatus': 'private',
-                                  'selfDeclaredMadeForKids': False, 'containsSyntheticMedia': False},
+                       'status': status,
                        'processingDetails': {'processingStatus': 'succeeded'}}]}
 
 
@@ -103,10 +108,22 @@ class ApiMetadataEvidenceTests(unittest.TestCase):
                                           'progress-after-id', 'readback', 'verified'])
         self.assertEqual(session.get_calls[0][1]['params'], {'part': 'snippet', 'id': '22'})
         self.assertEqual(session.get_calls[1][1]['params'], {'part': 'snippet,status,processingDetails', 'id': VIDEO_ID})
-        self.assertEqual(evidence[0], {'backend': 'youtube_api', 'video_id': VIDEO_ID,
-            'verification_state': 'received', 'expected': {'category_id': '22'},
-            'observed': {}, 'code': 'API_VIDEO_ID_RECEIVED'})
-        self.assertEqual(evidence[-1]['observed'], {'category_id': '22'})
+        expected_v2 = {
+            'category_id': '22',
+            'privacy_status': 'private',
+            'made_for_kids': False,
+            'altered_content': False,
+            'publish_at': None,
+            'youtube_channel_id': CHANNEL_ID,
+        }
+        self.assertEqual(evidence[0], {'version': 2, 'backend': 'youtube_api', 'video_id': VIDEO_ID,
+            'verification_state': 'received', 'expected': expected_v2,
+            'observed': {}, 'code': 'API_VIDEO_ID_RECEIVED', 'field_states': {}})
+        self.assertEqual(evidence[-1]['observed']['category_id'], '22')
+        self.assertEqual(evidence[-1]['observed']['youtube_channel_id'], CHANNEL_ID)
+        self.assertEqual(evidence[-1]['observed']['privacy_status'], 'private')
+        self.assertEqual(evidence[-1]['observed']['made_for_kids'], False)
+        self.assertEqual(evidence[-1]['observed']['altered_content'], False)
         self.assert_one_upload(session)
 
     def test_resumable_status_id_also_persists_before_return_or_readback(self):

@@ -76,7 +76,9 @@ from youtube_uploader import (
     get_oauth_token_local_status,
     check_oauth_token_status,
     normalize_published_video_url,
+    recheck_api_video_receipt,
 )
+from scheduled_uploads import read_schedule_status
 from pipeline_manager import pipeline_manager, upload_slot_recovery_status, acknowledge_upload_slot_recovery
 from group_distribution import target_group_names
 from phase4_rules import (
@@ -385,7 +387,12 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.17-publish"
+APP_BUILD_VERSION = "2026.11.18-hardening"
+
+
+def get_schedule_state_dir() -> Path:
+    custom = os.environ.get("DHB_SCHEDULE_STATE_DIR", "").strip()
+    return Path(custom) if custom else (APP_DATA_DIR / "scheduled_uploads" / "default")
 RUNTIME_IDENTITY = capture_runtime(APP_ROOT)
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
@@ -509,6 +516,13 @@ async def guard_local_api(request: Request, call_next):
 
 @app.exception_handler(HTTPException)
 async def safe_http_exception_handler(request: Request, exc: HTTPException):
+    if isinstance(exc.detail, dict):
+        code = str(exc.detail.get("code") or "").strip()
+        message = redact_secrets(str(exc.detail.get("message") or "Yêu cầu không hợp lệ."))
+        body: Dict[str, Any] = {"detail": message}
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", code):
+            body["code"] = code
+        return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
     detail = exc.detail if isinstance(exc.detail, (str, int, float, bool)) or exc.detail is None else str(exc.detail)
     return JSONResponse(
         {"detail": redact_secrets(detail)},
@@ -675,12 +689,18 @@ def api_diagnostics():
         "needs_review_count": needs_review,
         "storage": storage_summary,
         "heartbeat": heartbeat,
+        "scheduled_uploads": read_schedule_status(get_schedule_state_dir()),
         "tools": [
             _probe_local_tool("FFmpeg", FFMPEG_EXE, ["-version"]),
             _probe_local_tool("FFprobe", FFPROBE_EXE, ["-version"]),
             _probe_local_tool("yt-dlp", YTDL_EXE, ["--version"]),
         ],
     }
+
+
+@app.get("/api/scheduled-uploads/status")
+def api_scheduled_uploads_status():
+    return read_schedule_status(get_schedule_state_dir())
 
 
 @app.post("/api/sync-dhb")
@@ -3417,6 +3437,74 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
 # ==========================================================
 # ĐIỀU KHIỂN PIPELINE (DOWNLOAD -> RENDER -> UPLOAD)
 # ==========================================================
+def _validated_upload_receipt_and_cycle(conn, item_id: int):
+    """Return (receipt, has_cycle_attempts) for the current upload cycle, or reject ambiguous evidence.
+
+    An explicit reupload authorization begins a new cycle. Older upload IDs
+    remain in the audit trail without binding a newly authorized upload.
+    """
+    attempts = conn.execute(
+        "SELECT id,attempt_type,outcome,channel_id,evidence_json FROM upload_attempts "
+        "WHERE queue_id=? ORDER BY id DESC", (item_id,),
+    ).fetchall()
+    boundary = next((row["id"] for row in attempts
+                     if row["attempt_type"] == "manual_reupload" and row["outcome"] == "Authorized"), 0)
+    receipts = []
+    has_cycle_attempts = False
+    for attempt in attempts:
+        if attempt["id"] <= boundary:
+            break
+        has_cycle_attempts = True
+        if attempt["evidence_json"] == "{}":
+            continue  # Exact legacy/manual sentinel; malformed documents are not legacy.
+        try:
+            receipt = read_evidence(attempt["evidence_json"], item_id, attempt["id"], attempt["channel_id"])
+        except EvidenceError:
+            raise HTTPException(409, {"code": "UPLOAD_RECEIPT_INVALID", "message":
+                "Bằng chứng upload không hợp lệ; giữ video để đối soát, chưa thể xác nhận đã đăng."})
+        if receipt is None:
+            continue
+        receipts.append(receipt)
+    if not receipts:
+        return None, has_cycle_attempts
+    if len({(row["video_id"], row["channel_id"]) for row in receipts}) != 1:
+        raise HTTPException(409, {"code": "UPLOAD_RECEIPT_CONFLICT", "message":
+            "Có nhiều Video ID hoặc kênh trong cùng lượt đối soát; cần kiểm tra bằng chứng trước khi xác nhận."})
+    return receipts[0], has_cycle_attempts
+
+
+def validated_upload_receipt(conn, item_id: int):
+    return _validated_upload_receipt_and_cycle(conn, item_id)[0]
+
+
+@app.post("/api/queue/{item_id}/recheck-receipt")
+def api_recheck_upload_receipt(item_id: int):
+    """Read-only exact-ID YouTube API recheck on the stored upload receipt."""
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT id, status, claim_token FROM video_queue WHERE id = ?", (item_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Không tìm thấy video trong hàng đợi.")
+        if str(row["claim_token"] or "").strip():
+            raise HTTPException(409, "Video đang được worker xử lý; hãy chờ worker kết thúc.")
+        receipt, _ = _validated_upload_receipt_and_cycle(conn, item_id)
+        if receipt is None:
+            raise HTTPException(409, {"code": "UPLOAD_RECEIPT_MISSING", "message":
+                "Lượt này chưa có Video ID trong bằng chứng upload để đọc lại tự động."})
+        if receipt["backend"] != "youtube_api":
+            raise HTTPException(409, {"code": "RECEIPT_RECHECK_UNSUPPORTED_BACKEND", "message":
+                "Đọc lại tự động qua API chỉ hỗ trợ lượt đăng bằng YouTube Data API."})
+        channel_row = conn.execute("SELECT * FROM youtube_channels WHERE id = ?", (receipt["channel_id"],)).fetchone()
+        if not channel_row:
+            raise HTTPException(409, {"code": "UPLOAD_RECEIPT_CHANNEL_MISSING", "message":
+                "Không tìm thấy kênh đích gắn với receipt này."})
+        channel = dict(channel_row)
+    try:
+        report = recheck_api_video_receipt(channel, receipt["video_id"], receipt["expected"])
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(502, {"code": "RECEIPT_RECHECK_FAILED", "message": redact_secrets(str(exc))}) from None
+    return {"ok": True, "queue_id": item_id, "receipt_channel_id": receipt["channel_id"], **report}
+
+
 @app.post("/api/queue/{item_id}/manual-reupload")
 def api_manual_reupload(item_id: int, data: Dict[str, Any] = Body(...)):
     """Ghi nhận quyết định đối soát hoặc cho phép đăng lại đúng một item."""
@@ -3455,9 +3543,48 @@ def api_manual_reupload(item_id: int, data: Dict[str, Any] = Body(...)):
             conn.rollback()
             raise HTTPException(409, "Reservation vẫn đang hoạt động; chưa thể thay đổi kết quả upload.")
 
+        receipt, has_cycle_attempts = (
+            _validated_upload_receipt_and_cycle(conn, item_id)
+            if action == "confirmed_published"
+            else (None, False)
+        )
+        if receipt and published_url != receipt["video_url"]:
+            conn.rollback()
+            raise HTTPException(409, {"code": "UPLOAD_RECEIPT_URL_MISMATCH", "message":
+                "URL xác nhận không khớp Video ID đã nhận từ YouTube. Hãy dùng đúng URL trong bằng chứng upload."})
+        if action == "confirmed_published" and item.get("status") == "Completed":
+            latest = conn.execute(
+                "SELECT id,attempt_type,outcome,published_url,channel_id FROM upload_attempts "
+                "WHERE queue_id=? ORDER BY id DESC LIMIT 1", (item_id,),
+            ).fetchone()
+            if (latest and latest["attempt_type"] == "manual_review" and latest["outcome"] == "ConfirmedPublished"
+                    and item.get("last_attempt_id") == latest["id"]
+                    and normalize_published_video_url(item.get("published_url") or "") == published_url
+                    and normalize_published_video_url(latest["published_url"] or "") == published_url
+                    and (not receipt or latest["channel_id"] == receipt["channel_id"])
+                    and not reservations):
+                conn.rollback()
+                return {"ok": True, "replayed": True, "id": item_id,
+                        "message": "Quyết định xác nhận này đã được ghi nhận; không tạo thêm lượt đăng hoặc lịch sử."}
+        if (action == "confirmed_published" and receipt is None and has_cycle_attempts
+                and data.get("acknowledge_legacy_no_receipt") is not True):
+            conn.rollback()
+            raise HTTPException(400, {"code": "LEGACY_RECEIPT_ACK_REQUIRED", "message":
+                "Lượt upload này chưa có receipt Video ID tự động. Hãy kiểm tra đúng video/kênh trên Studio và xác nhận rõ đối soát thủ công."})
+
         channel_id = next((int(r["channel_id"]) for r in reservations), None)
         if channel_id is None and item.get("target_channel_id"):
             channel_id = int(item["target_channel_id"])
+        if channel_id is None and item.get("assigned_channel_id"):
+            channel_id = int(item["assigned_channel_id"])
+        if receipt:
+            reserved_channels = {int(row["channel_id"]) for row in reservations}
+            if ((reserved_channels and reserved_channels != {receipt["channel_id"]})
+                    or (channel_id is not None and channel_id != receipt["channel_id"])):
+                conn.rollback()
+                raise HTTPException(409, {"code": "UPLOAD_RECEIPT_CHANNEL_MISMATCH", "message":
+                    "Kênh đối soát không khớp kênh đã nhận video; hãy kiểm tra lại assignment và receipt."})
+            channel_id = receipt["channel_id"]
         source_post_id = str(item.get("post_id") or "").strip()
         if not source_post_id:
             normalized_url = normalize_source_url(item.get("source_url"))
@@ -3582,6 +3709,8 @@ def api_manual_reupload(item_id: int, data: Dict[str, Any] = Body(...)):
         conn.commit()
         return {"ok": True, "message": "Đã ghi nhận video đã đăng và giữ lịch sử chống trùng.", "id": item_id}
     except HTTPException:
+        if conn.in_transaction:
+            conn.rollback()
         raise
     except Exception:
         conn.rollback()
