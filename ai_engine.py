@@ -7,12 +7,41 @@ import requests
 from database import get_settings, add_log
 
 
+_GEMINI_FALLBACK_ORDER = (
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-flash-latest",
+)
+
+
 def _normalize_gemini_model(model_name: str) -> str:
-    """Đảm bảo luôn sử dụng tên model Gemini hợp lệ trên Google Generative Language API."""
-    m = (model_name or "").strip().lower()
-    if not m or "3.8" in m or "3 flash" in m or "preview" in m:
-        return "gemini-2.5-flash"
-    return model_name.strip()
+    """Chuẩn hóa tên model Gemini hợp lệ (hỗ trợ đầy đủ dòng Gemini 3.x mới nhất)."""
+    raw = str(model_name or "").strip().strip('"').strip("'")
+    if raw.startswith("models/"):
+        raw = raw[len("models/"):]
+    return raw or "gemini-3-flash-preview"
+
+
+def _gemini_model_candidates(model_name: str) -> list[str]:
+    primary = _normalize_gemini_model(model_name)
+    seen: list[str] = []
+    for candidate in (primary, *_GEMINI_FALLBACK_ORDER):
+        if candidate and candidate not in seen:
+            seen.append(candidate)
+    return seen
+
+
+def _extract_gemini_text(payload: Dict[str, Any]) -> str:
+    candidates = payload.get("candidates") or []
+    if not candidates or not isinstance(candidates[0], dict):
+        return ""
+    parts = ((candidates[0].get("content") or {}).get("parts")) or []
+    visible = [str(p.get("text") or "") for p in parts if isinstance(p, dict) and p.get("text") and not p.get("thought")]
+    if visible:
+        return "".join(visible).strip()
+    any_text = [str(p.get("text") or "") for p in parts if isinstance(p, dict) and p.get("text")]
+    return "".join(any_text).strip()
 
 
 def translate_google_free(text: str, target_lang: str = "vi") -> str:
@@ -66,54 +95,42 @@ def call_llm(
         return translate_google_free(prompt, "vi")
 
     if prov == "gemini":
-        api_key = settings.get("gemini_api_key", "").strip()
-        model = _normalize_gemini_model(settings.get("gemini_model", "gemini-2.5-flash"))
+        api_key = str(settings.get("gemini_api_key") or "").strip().strip('"')
+        configured_model = settings.get("gemini_model", "gemini-3-flash-preview")
         if not api_key:
             raise ValueError("Chưa cấu hình Gemini API Key.")
 
-        # Ưu tiên sử dụng google-genai SDK nếu có
-        try:
-            from google import genai
-            from google.genai import types
-
-            client = genai.Client(api_key=api_key)
-            resp = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.7,
-                ),
-            )
-            if resp and resp.text:
-                return resp.text.strip()
-        except Exception as sdk_err:
-            # Fallback sang REST API chuẩn của Google Generative Language
-            add_log("AI", f"google-genai SDK lỗi, chuyển sang REST API: {sdk_err}", "WARNING")
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-            payload = {
-                "systemInstruction": {
-                    "parts": [{"text": system_instruction}]
-                },
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [{"text": prompt}],
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": 0.7,
-                },
-            }
-            r = requests.post(
-                url,
-                headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-                json=payload,
-                timeout=30,
-            )
-            r.raise_for_status()
-            j = r.json()
-            return j["candidates"][0]["content"]["parts"][0]["text"].strip()
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.7},
+        }
+        last_error: Exception | None = None
+        for candidate in _gemini_model_candidates(configured_model):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate}:generateContent"
+            try:
+                r = requests.post(
+                    url,
+                    headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                    json=payload,
+                    timeout=30,
+                )
+                if r.status_code in (404, 429, 500, 502, 503, 504):
+                    last_error = RuntimeError(f"Gemini {candidate} HTTP {r.status_code}")
+                    add_log("AI", f"Model {candidate} trả HTTP {r.status_code}, thử model dự phòng kế tiếp...", "WARNING")
+                    continue
+                r.raise_for_status()
+                text = _extract_gemini_text(r.json())
+                if text:
+                    return text
+                last_error = RuntimeError(f"Gemini {candidate} trả phản hồi rỗng.")
+            except requests.RequestException as req_err:
+                last_error = req_err
+                add_log("AI", f"Lỗi kết nối Gemini ({candidate}): {req_err}", "WARNING")
+                continue
+        if last_error:
+            raise last_error
+        raise RuntimeError("Không nhận được phản hồi hợp lệ từ Gemini API.")
 
     if prov in ("openai", "chatgpt"):
         api_key = settings.get("openai_api_key", "").strip()
