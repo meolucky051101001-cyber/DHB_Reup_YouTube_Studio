@@ -509,25 +509,24 @@ class UploaderAntidetectTests(unittest.TestCase):
             "ad-9",
         )
 
-    def test_api_upload_is_blocked_for_antidetect_profile(self):
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-            video_path = f.name
-        try:
-            with self.assertRaises(RuntimeError) as ctx:
-                yu.upload_video_to_youtube(
-                    {"title": "Video test", "output_video_path": video_path},
-                    {
-                        "name": "Kênh A",
-                        "handle": "@kenha",
-                        "channel_id": "UC1234567890abcdefghijkl",
-                        "upload_mode": "youtube_api",
-                        "antidetect_profile_id": "ad-1",
-                    },
-                )
-            self.assertIn("Antidetect", str(ctx.exception))
-            self.assertIn("YouTube Data API", str(ctx.exception))
-        finally:
-            os.remove(video_path)
+    def test_api_upload_uses_oauth_with_saved_antidetect_binding(self):
+        channel = {
+            "name": "Kênh A",
+            "channel_id": "UC1234567890abcdefghijkl",
+            "upload_mode": "youtube_api",
+            "antidetect_profile_id": "ad-1",
+        }
+        item = {"title": "Video test", "output_video_path": "fixture.mp4"}
+        with self.assertRaisesRegex(RuntimeError, "OAuth"):
+            yu.validate_upload_preflight(item, channel)
+        channel["oauth_token_json"] = '{"client_id":"client","client_secret":"secret","refresh_token":"refresh"}'
+        with mock.patch.object(yu.os.path, "isfile", return_value=True), \
+                mock.patch.object(yu, "probe_video_info"), \
+                mock.patch.object(yu, "upload_via_youtube_api", return_value="api-video") as api, \
+                mock.patch.object(yu, "upload_via_playwright_studio") as studio:
+            self.assertEqual(yu.upload_video_to_youtube(item, channel), "api-video")
+        api.assert_called_once()
+        studio.assert_not_called()
 
     def test_browser_session_uses_lease_and_never_local_chrome(self):
         created = {}

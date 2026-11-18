@@ -96,7 +96,8 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                 render_config_json TEXT, resolution TEXT, render_mode TEXT,
                 cut_start TEXT, cut_end TEXT, project_name TEXT DEFAULT 'Default',
                 content_key TEXT DEFAULT '', manual_reupload_authorized INTEGER DEFAULT 0,
-                manual_reupload_reason TEXT DEFAULT '', last_attempt_id INTEGER DEFAULT NULL
+                manual_reupload_reason TEXT DEFAULT '', last_attempt_id INTEGER DEFAULT NULL,
+                post_upload_warnings_json TEXT DEFAULT '[]'
             );
             CREATE TABLE youtube_channels (
                 id INTEGER PRIMARY KEY, name TEXT, channel_id TEXT, handle TEXT,
@@ -126,6 +127,8 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                 source_post_id TEXT DEFAULT '', content_key TEXT DEFAULT '', channel_id INTEGER,
                 phase TEXT DEFAULT 'Queued', outcome TEXT DEFAULT 'InProgress', reason TEXT DEFAULT '',
                 published_url TEXT DEFAULT '', error_message TEXT DEFAULT '',
+                post_upload_warnings_json TEXT DEFAULT '[]',
+                evidence_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(queue_id, attempt_no)
             );
@@ -164,7 +167,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                     mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
                     mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
                     mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
-                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123", "studio_category_mode": "keep"}), \
                     mock.patch.object(
                         pipeline_manager, "upload_video_to_youtube",
                         return_value={"url": "https://youtu.be/dQw4w9WgXcQ"},
@@ -199,7 +202,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                     mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
                     mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
                     mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
-                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123", "studio_category_mode": "keep"}), \
                     mock.patch.object(
                         pipeline_manager, "upload_video_to_youtube",
                         return_value={"url": "https://example.com/watch?v=dQw4w9WgXcQ"},
@@ -234,7 +237,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                     mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
                     mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
                     mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
-                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123", "studio_category_mode": "keep"}), \
                     mock.patch.object(
                         pipeline_manager,
                         "upload_video_to_youtube",
@@ -270,7 +273,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                 mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
                 mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
                     mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
-                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123", "studio_category_mode": "keep"}), \
                 mock.patch.object(
                     pipeline_manager, "upload_video_to_youtube", return_value=upload_result
                 ) as upload, \
@@ -365,7 +368,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                     mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
                     mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
                     mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
-                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123", "studio_category_mode": "keep"}), \
                     mock.patch.object(
                         pipeline_manager, "upload_video_to_youtube", side_effect=RuntimeError("connection lost")
                     ), \
@@ -416,7 +419,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
                     mock.patch.object(pipeline_manager, "read_upload_gap_remaining", return_value=0), \
                     mock.patch.object(pipeline_manager, "reserve_upload_slot", return_value="test-slot"), \
                     mock.patch.object(pipeline_manager, "_mark_slot_entered"), \
-                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123"}), \
+                    mock.patch.object(manager, "_resolve_target_channel", return_value={"id": 7, "name": "Kênh A", "channel_id": "UC123", "studio_category_mode": "keep"}), \
                     mock.patch.object(
                         pipeline_manager, "upload_video_to_youtube",
                         return_value={"url": "https://youtu.be/9bZkp7q19f0"},
@@ -443,9 +446,7 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
             conn.commit()
             conn.close()
             with mock.patch.object(pipeline_manager, "get_conn", side_effect=self._connect(db_path)):
-                recorded = pipeline_manager.PipelineManager._record_published_history_for_item(
-                    1, {"id": 7}
-                )
+                recorded = pipeline_manager.PipelineManager._monitor_upload_completed(1)
             conn = sqlite3.connect(db_path)
             count = conn.execute("SELECT COUNT(*) FROM published_history").fetchone()[0]
             conn.close()
@@ -457,14 +458,22 @@ class PublishedHistoryWritePathTests(unittest.TestCase):
             db_path = self._make_db(td)
             conn = sqlite3.connect(db_path)
             conn.execute(
-                "UPDATE video_queue SET post_id = '', status = 'Completed', "
-                "published_url = 'https://youtu.be/abc123' WHERE id = 1"
+                "UPDATE video_queue SET post_id = '', status = 'Uploading', "
+                "claim_token='history-fixture',content_key='fixture-content' WHERE id = 1"
             )
+            conn.execute("INSERT INTO content_reservations(content_key,channel_id,queue_id,claim_token) "
+                         "VALUES('fixture-content',7,1,'history-fixture')")
             conn.commit()
             conn.close()
             with mock.patch.object(pipeline_manager, "get_conn", side_effect=self._connect(db_path)):
-                first = pipeline_manager.PipelineManager._record_published_history_for_item(1, {"id": 7})
-                second = pipeline_manager.PipelineManager._record_published_history_for_item(1, {"id": 7})
+                attempt_id = pipeline_manager._start_upload_attempt(
+                    1, 'history-fixture', {'post_id': '', 'source_url': 'https://src.example/v',
+                                           'content_key': 'fixture-content'}, 7)
+                pipeline_manager._complete_upload_attempt(
+                    1, 'history-fixture', attempt_id, {'id': 7}, 'https://youtu.be/dQw4w9WgXcQ', [],
+                    backend='playwright', expected_metadata={})
+                first = pipeline_manager.PipelineManager._monitor_upload_completed(1)
+                second = pipeline_manager.PipelineManager._monitor_upload_completed(1)
             conn = sqlite3.connect(db_path)
             rows = conn.execute("SELECT source_post_id FROM published_history").fetchall()
             conn.close()

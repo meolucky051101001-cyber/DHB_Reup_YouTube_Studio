@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Synthetic category contract fixture</title>
+<body>
+<p>This authored fixture is not captured YouTube Studio DOM.</p>
+<button data-action="show-more" onclick="setTimeout(() => document.querySelector('[data-details]').hidden=false, 25)">Show more</button>
+<div data-details hidden>
+  <section data-studio-section="audience"><label>Category</label><select data-semantic="unrelated"><option value="entertainment">Entertainment</option></select></section>
+  <section data-studio-section="category">
+    <label for="category">Category</label>
+    <select id="category" data-semantic="category" onchange="if (this.dataset.noChange) this.value='people-blogs'">
+      <option value="people-blogs">People &amp; Blogs</option><option value="entertainment">Entertainment</option>
+    </select>
+  </section>
+</div>
+</body></html>

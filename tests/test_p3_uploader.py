@@ -24,14 +24,17 @@ class _Response:
 
 
 class _ResumableSession:
-    def __init__(self, put_steps):
+    def __init__(self, put_steps, *, channel_id=CHANNEL_ID):
         self.put_steps = list(put_steps)
+        self.channel_id = channel_id
         self.put_calls = []
         self.get_calls = []
         self.post_calls = []
 
     def post(self, url, **kwargs):
         self.post_calls.append((url, kwargs))
+        if 'uploadType=resumable' in url:
+            self.upload_snippet = kwargs.get('json', {}).get('snippet', {})
         return _Response(
             200,
             headers={"Location": "https://www.googleapis.com/upload/youtube/v3/videos/session"},
@@ -46,11 +49,17 @@ class _ResumableSession:
 
     def get(self, url, **kwargs):
         self.get_calls.append((url, kwargs))
+        if "videoCategories" in url:
+            return _Response(200, body={"items": [{"id": kwargs['params']['id'], "snippet": {"assignable": True}}]})
         return _Response(
             200,
             body={
                 "items": [{
                     "id": VIDEO_ID,
+                    "snippet": {
+                        "categoryId": getattr(self, 'upload_snippet', {}).get('categoryId', '22'),
+                        "channelId": self.channel_id,
+                    },
                     "status": {
                         "uploadStatus": "processed",
                         "privacyStatus": "private",
@@ -165,7 +174,7 @@ class UrlAndChecksTests(unittest.TestCase):
         page = mock.Mock(url="https://studio.youtube.com/")
         page.locator.return_value.first.count.return_value = 0
         session = mock.Mock(page=page)
-        metadata = {"title": "Pilot", "upload_to": "Video"}
+        metadata = {"title": "Pilot", "upload_to": "Video", "studio_category_mode": "keep"}
         with mock.patch.object(yu, "get_settings", return_value={}), \
                 mock.patch.object(yu, "_channel_antidetect_id", return_value="test-profile"), \
                 mock.patch.object(yu, "_StudioBrowserSession") as browser, \
@@ -961,14 +970,16 @@ class ResumableUploadTests(unittest.TestCase):
             path.write_bytes(b"0123456789")
             result = self._run(session, path)
 
-        self.assertEqual(result, f"https://youtu.be/{VIDEO_ID}")
+        self.assertEqual(result["url"], f"https://youtu.be/{VIDEO_ID}")
+        self.assertEqual(result["warnings"], [])
         media_ranges = [
             kwargs["headers"].get("Content-Range")
             for _url, kwargs in session.put_calls
             if kwargs["headers"].get("Content-Range") != "bytes */10"
         ]
         self.assertEqual(media_ranges, ["bytes 0-3/10", "bytes 4-7/10", "bytes 6-9/10"])
-        self.assertEqual(session.get_calls[0][1]["params"]["id"], VIDEO_ID)
+        readback = [call for call in session.get_calls if call[0].endswith('/videos')]
+        self.assertEqual(readback[0][1]["params"]["id"], VIDEO_ID)
 
     def test_lost_final_chunk_response_uses_status_query_without_resending(self):
         session = _ResumableSession([
@@ -980,7 +991,8 @@ class ResumableUploadTests(unittest.TestCase):
             path.write_bytes(b"data")
             result = self._run(session, path)
 
-        self.assertEqual(result, f"https://youtu.be/{VIDEO_ID}")
+        self.assertEqual(result["url"], f"https://youtu.be/{VIDEO_ID}")
+        self.assertEqual(result["warnings"], [])
         self.assertEqual(len(session.put_calls), 2)
         self.assertEqual(session.put_calls[0][1]["headers"]["Content-Range"], "bytes 0-3/4")
         self.assertEqual(session.put_calls[1][1]["headers"]["Content-Range"], "bytes */4")

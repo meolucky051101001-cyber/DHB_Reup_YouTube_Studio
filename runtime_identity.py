@@ -1,5 +1,6 @@
 """Identify the source snapshot served by this process."""
 import hashlib
+import os
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -7,6 +8,30 @@ from pathlib import Path
 
 
 APPLICATION_ID = "dhb-reup-youtube-studio"
+
+
+def git_environment(root: Path, *, trust_root=False) -> dict:
+    """Scope child Git to this checkout without changing global configuration."""
+    env = os.environ.copy()
+    for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE'):
+        env.pop(key, None)
+    if trust_root:
+        count = int(env.get('GIT_CONFIG_COUNT', '0'))
+        if count < 0:
+            raise ValueError('Invalid Git environment configuration count.')
+        env[f'GIT_CONFIG_KEY_{count}'] = 'safe.directory'
+        env[f'GIT_CONFIG_VALUE_{count}'] = Path(root).resolve().as_posix()
+        env['GIT_CONFIG_COUNT'] = str(count + 1)
+    return env
+
+
+def git_output(root: Path, *args, timeout=2) -> str:
+    root = Path(root).resolve()
+    return subprocess.check_output(
+        ['git', '-c', f'safe.directory={root.as_posix()}', '-C', str(root), *args],
+        cwd=root, env=git_environment(root), stderr=subprocess.DEVNULL,
+        timeout=timeout, encoding='utf-8',
+    ).strip()
 
 
 def source_fingerprint(root: Path) -> str:
@@ -21,11 +46,9 @@ def source_fingerprint(root: Path) -> str:
 
 
 def capture_runtime(root: Path) -> dict:
+    root = Path(root).resolve()
     try:
-        revision = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=root, stderr=subprocess.DEVNULL,
-            timeout=2, encoding="ascii",
-        ).strip()
+        revision = git_output(root, 'rev-parse', 'HEAD')
     except (OSError, subprocess.SubprocessError, UnicodeError):
         revision = ""
     return {

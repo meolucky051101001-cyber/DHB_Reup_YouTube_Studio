@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from phase4_rules import normalize_group_names, validate_metadata_fields, validate_queue_fields, validate_source_url
+from csv_safety import ENCODING_COLUMN, decode_csv_cell
 
 
 _ALIASES = {
@@ -59,6 +60,10 @@ def preview_csv_import(
     except StopIteration as exc:
         raise ValueError("CSV cần có dòng tiêu đề và dữ liệu.") from exc
     lookup: Dict[int, str] = {}
+    encoding_indexes = [index for index, header in enumerate(headers) if header == ENCODING_COLUMN]
+    if len(encoding_indexes) > 1:
+        raise ValueError('CSV có nhiều cột định dạng escape trùng nhau.')
+    encoding_index = encoding_indexes[0] if encoding_indexes else None
     aliases = {alias: field for field, values in _ALIASES.items() for alias in values}
     for index, header in enumerate(headers):
         field = aliases.get(_header_key(header))
@@ -74,7 +79,11 @@ def preview_csv_import(
     for line_no, raw in enumerate(reader, start=2):
         if not raw or not any(str(value or "").strip() for value in raw):
             continue
-        values = {field: (raw[index] if index < len(raw) else "") for index, field in lookup.items()}
+        encoding = raw[encoding_index] if encoding_index is not None and encoding_index < len(raw) else ''
+        values = {
+            field: decode_csv_cell(raw[index] if index < len(raw) else "", encoding)
+            for index, field in lookup.items()
+        }
         item: Dict[str, Any] = {"line": line_no, "state": "valid", "title": "", "reasons": []}
         try:
             source_url = validate_source_url(values.get("source_url"))

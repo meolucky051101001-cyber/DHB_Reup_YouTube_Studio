@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Synthetic spoken language contract fixture</title>
+<body>
+<p>This authored fixture is not captured YouTube Studio DOM.</p>
+<button data-action="show-more" onclick="setTimeout(() => document.querySelector('[data-details]').hidden=false, 25)">Show more</button>
+<div data-details hidden>
+  <section data-studio-section="caption_certification"><label>Video language</label><select data-semantic="caption-certification"><option value="not-applicable">Not applicable</option></select></section>
+  <section data-studio-section="title_language"><label>Video language</label><select data-semantic="title-language"><option value="title-language-en">English</option></select></section>
+  <section data-studio-section="video_language">
+    <label for="video-language">Video language</label>
+    <select id="video-language" data-semantic="video-language" onchange="if (this.dataset.noChange) this.value='spoken-en'">
+      <option value="spoken-en">English</option><option value="spoken-en-us">English (United States)</option><option value="spoken-vi">Vietnamese</option>
+    </select>
+  </section>
+</div>
+</body></html>

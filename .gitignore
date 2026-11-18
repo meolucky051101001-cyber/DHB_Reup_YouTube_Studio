@@ -18,5 +18,6 @@ logs/
 
 # Bản backup code theo phiên
 _backup_*/
-# Runtime singleton lock file
+# Runtime singleton lock file and scheduled upload operational state
 data/app_instance.lock
+data/scheduled_uploads/

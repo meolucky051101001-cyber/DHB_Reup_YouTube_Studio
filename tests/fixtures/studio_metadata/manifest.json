@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "synthetic": true,
+  "live_verified": false,
+  "locales": [
+    "en",
+    "vi"
+  ],
+  "selector_provenance": "authored synthetic fixture; not observed YouTube Studio DOM",
+  "semantic_values": {
+    "22": "people-blogs",
+    "24": "entertainment"
+  },
+  "sha256": {
+    "category_en.html": "cda19af8e490d72ba8e083e8cf71cb9f5c02efc648405478fcbe9b747b8453d7",
+    "category_vi.html": "ab0b875d23706ae882d8b98b4abc3bc7a3b1eedc77089185205178266ea74efe",
+    "language_en.html": "b59bbdf9d124a42bb054073f95de545a4a4f4e1751f3c52659e8b2269cd63e86",
+    "language_vi.html": "35e5c972300fd9f46da3c1951683bb826ea30d68451a88f6a08831e4030a6891"
+  },
+  "hash_normalization": "UTF-8 bytes with LF line endings",
+  "language_semantic_values": {
+    "vi": "spoken-vi",
+    "en": "spoken-en",
+    "en-US": "spoken-en-us"
+  }
+}

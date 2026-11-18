@@ -4,40 +4,45 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DHB Reup YouTube Studio — Hệ Thống Tự Động Hóa Reup & Đăng YouTube</title>
-  <link rel="stylesheet" href="/static/styles.css?v=upload-preview" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui-20261117" />
+  <link rel="stylesheet" href="/static/ui-shell.css?v=ui-20261117" />
+  <link rel="stylesheet" href="/static/ui-queue.css?v=ui-20261117" />
+  <link rel="stylesheet" href="/static/ui-content.css?v=ui-20261117" />
+  <link rel="stylesheet" href="/static/ui-admin.css?v=ui-20261117" />
+  <link rel="stylesheet" href="/static/ui-publish.css?v=hardening-20261118" />
 </head>
 <body>
-  <!-- TOP HEADER -->
+  <a class="skip-link" href="#main-content">Đi đến nội dung</a>
+  <aside id="app-navigation" class="app-sidebar" aria-label="Thanh điều hướng">
+    <div class="sidebar-brand"><span class="sidebar-monogram">D</span><div class="sidebar-brand-copy"><strong>DHB Studio</strong><small>Không gian làm việc</small></div></div>
+    <div class="sidebar-label">LÀM VIỆC</div>
+    <nav class="nav-tabs" aria-label="Điều hướng chính">
+      <a class="nav-tab active" href="#tab-workspace" data-tab="tab-workspace" onclick="switchTab('tab-workspace', this); return false;" aria-current="page" title="Video & dự án"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m10 9 5 3-5 3z"/></svg><span class="nav-label">Video & dự án</span></a>
+      <a class="nav-tab" href="#tab-ai" data-tab="tab-ai" onclick="switchTab('tab-ai', this); return false;"  title="AI & nội dung"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2 6 6 3-6 2-2 7-2-7-6-2 6-3z"/></svg><span class="nav-label">AI & nội dung</span></a>
+      <a class="nav-tab" href="#tab-render" data-tab="tab-render" onclick="switchTab('tab-render', this); return false;"  title="Render & preset"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg><span class="nav-label">Render & preset</span></a>
+      <a class="nav-tab" href="#tab-channels" data-tab="tab-channels" onclick="switchTab('tab-channels', this); return false;"  title="Kênh & profile"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="13" rx="2"/><path d="M8 21h8m-4-5v5"/></svg><span class="nav-label">Kênh & profile</span></a>
+      <a class="nav-tab" href="#tab-monitor" data-tab="tab-monitor" onclick="switchTab('tab-monitor', this); return false;"  title="Theo dõi nguồn"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="2"/><path d="M6 6a8 8 0 0 0 0 12m12-12a8 8 0 0 1 0 12M9 9a4 4 0 0 0 0 6m6-6a4 4 0 0 1 0 6"/></svg><span class="nav-label">Theo dõi nguồn</span></a>
+      <a class="nav-tab" href="#tab-settings" data-tab="tab-settings" onclick="switchTab('tab-settings', this); return false;"  title="Hệ thống"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg><span class="nav-label">Hệ thống</span></a>
+    </nav>
+    <div class="sidebar-foot"><span>Ứng dụng cục bộ</span><span>Giao diện tiếng Việt</span></div>
+  </aside>
   <header class="top-header">
-    <div class="brand">
-      <div class="brand-logo">YT</div>
-      <div class="brand-title">
-        <h1>DHB Reup YouTube Studio</h1>
-        <span>Hệ Thống Quét Nguồn • Lách Bản Quyền FFmpeg • AI SEO • Đăng YouTube Shorts & Video Chuẩn</span>
-      </div>
+    <div class="header-context">
+      <button id="navigation-toggle" type="button" class="btn btn-outline" aria-expanded="false" aria-controls="app-navigation" aria-label="Mở điều hướng">☰</button>
+      <div><p>DỰ ÁN ĐANG LÀM VIỆC</p><strong id="studio-project-context">Đang tải dự án…</strong><p id="studio-update-status" role="status">Đang kết nối dữ liệu…</p></div>
     </div>
-    <div class="top-stats">
-      <div class="stat-pill"><span class="dot-online"></span> Engine: <b id="st-dhb">Sẵn sàng</b></div>
-      <div class="stat-pill">📺 Kênh YT: <b id="st-channels">0</b></div>
-      <div class="stat-pill">🎬 Tổng Video: <b id="st-videos">0</b></div>
-      <div class="stat-pill">✅ Đã Đăng: <b id="st-completed">0</b></div>
-      <div class="stat-pill">📡 Monitor 24/7: <b id="st-monitors">0</b></div>
-      <button class="btn btn-outline btn-sm" onclick="syncFromDHB()" title="Đồng bộ API Keys và Profile Chrome">🔄 Nạp Cài Đặt & Profile</button>
+    <div class="top-stats" aria-label="Thống kê toàn hệ thống">
+      <div class="stat-pill"><span class="dot-online" aria-hidden="true"></span> Kết nối: <b id="st-dhb">Đang kiểm tra</b></div>
+      <div class="stat-pill">Kênh: <b id="st-channels">—</b></div>
+      <div class="stat-pill">Video toàn hệ thống: <b id="st-videos">—</b></div>
+      <div class="stat-pill">Đã đăng: <b id="st-completed">—</b></div>
+      <div class="stat-pill">Monitor: <b id="st-monitors">—</b></div>
+      <button class="btn btn-outline btn-sm" onclick="syncFromDHB()" title="Đồng bộ cài đặt và profile">Đồng bộ DHB</button>
     </div>
   </header>
 
-  <!-- NAVIGATION TABS -->
-  <nav class="nav-tabs">
-    <button class="nav-tab active" data-tab="tab-workspace" onclick="switchTab('tab-workspace', this)">🎬 1. Bảng Điều Khiển & Dự Án</button>
-    <button class="nav-tab" data-tab="tab-ai" onclick="switchTab('tab-ai', this)">🤖 2. AI Dịch & Viết Lại SEO</button>
-    <button class="nav-tab" data-tab="tab-render" onclick="switchTab('tab-render', this)">🎨 3. Render & Lách Bản Quyền FFmpeg</button>
-    <button class="nav-tab" data-tab="tab-channels" onclick="switchTab('tab-channels', this)">📺 4. Quản Lý Kênh & Profile Chrome</button>
-    <button class="nav-tab" data-tab="tab-monitor" onclick="switchTab('tab-monitor', this)">📡 5. Theo Dõi Kênh Tự Động 24/7</button>
-    <button class="nav-tab" data-tab="tab-settings" onclick="switchTab('tab-settings', this)">⚙️ 6. Cài Đặt & Nhật Ký Hệ Thống</button>
-  </nav>
-
   <!-- MAIN CONTAINER -->
-  <main class="main-container">
+  <main id="main-content" class="main-container" tabindex="-1">
 
     <!-- ==========================================
          TAB 1: WORKSPACE & QUẢN LÝ DỰ ÁN YOUTUBE
@@ -56,6 +61,7 @@
               <div style="display:flex; align-items:center; gap:6px; flex:1;">
                 <select id="sel-project" onchange="loadQueue()" style="font-weight:600; padding:5px 8px; font-size:12.5px;"></select>
                 <button class="btn btn-outline btn-sm" onclick="createNewProject()" title="Tạo dự án mới">+ Mới</button>
+                <button class="btn btn-outline btn-sm" onclick="renameCurrentProject()" title="Đổi tên dự án">Đổi tên</button>
                 <button class="btn btn-outline btn-sm" onclick="deleteCurrentProject()" title="Xóa dự án này" style="color:#f87171; border-color:rgba(248,113,113,0.3);">🗑️</button>
               </div>
             </div>
@@ -143,13 +149,13 @@
 
               <div class="row-inline form-group">
                 <div>
-                  <label>Chế độ Lách FFmpeg:</label>
+                  <label>Chế độ Render:</label>
                   <select id="scan-render-mode">
                     <option value="shorts_9_16">Render Dọc 9:16 Blur (Shorts)</option>
-                    <option value="pip_thu_nho">Lách Thu Nhỏ (Video Nền DHB)</option>
-                    <option value="full_16_9">Lách Full Màn 16:9</option>
+                    <option value="pip_thu_nho">Thu nhỏ (Video Nền DHB)</option>
+                    <option value="full_16_9">Full màn 16:9</option>
                     <option value="square_1_1">Render Vuông 1:1</option>
-                    <option value="audio_effect">Lách Âm Thanh + Đổi Pitch</option>
+                    <option value="audio_effect">Xử lý âm thanh + Đổi Pitch</option>
                     <option value="md5_cut">Đổi MD5 & Xóa Tag (Siêu tốc)</option>
                     <option value="none">Giữ nguyên Video gốc</option>
                   </select>
@@ -328,10 +334,10 @@
                   <select id="bulk-render">
                     <option value="">-- Giữ nguyên --</option>
                     <option value="shorts_9_16">Render Dọc 9:16 Blur (Shorts)</option>
-                    <option value="pip_thu_nho">Lách Thu Nhỏ (Video Nền DHB)</option>
-                    <option value="full_16_9">Lách Full Màn 16:9</option>
+                    <option value="pip_thu_nho">Thu nhỏ (Video Nền DHB)</option>
+                    <option value="full_16_9">Full màn 16:9</option>
                     <option value="square_1_1">Render Vuông 1:1</option>
-                    <option value="audio_effect">Lách Âm Thanh</option>
+                    <option value="audio_effect">Xử lý âm thanh</option>
                     <option value="md5_cut">Đổi MD5 & Xóa Tag</option>
                     <option value="none">Không Render</option>
                   </select>
@@ -451,8 +457,8 @@
                   <button class="btn btn-outline btn-sm" onclick="previewSelectedDistribution()" title="Xem kênh, chế độ đăng, lịch và cảnh báo trước khi chạy">🔎 Preview Phân Phối</button>
                   <button class="btn btn-outline btn-sm" onclick="reviewUploadSlot()">Kiểm tra lượt upload</button>
                   <button class="btn btn-accent btn-sm" onclick="startPipeline(true, false, false)" title="Chỉ tải video về máy">⬇️ Chỉ Tải</button>
-                  <button class="btn btn-purple btn-sm" onclick="startPipeline(false, true, false)" title="Chỉ render lách bản quyền FFmpeg">🎬 Chỉ Render</button>
-                  <button class="btn btn-warning btn-sm" onclick="stopPipeline()" title="Dừng toàn bộ luồng xử lý">⏹️ Dừng</button>
+                  <button class="btn btn-purple btn-sm" onclick="startPipeline(false, true, false)" title="Chỉ render xử lý video FFmpeg">🎬 Chỉ Render</button>
+                  <button class="btn btn-warning btn-sm" onclick="stopPipeline()" title="Dừng lô hiện tại; nguồn tự động cần dừng riêng">⏹️ Dừng lô hiện tại</button>
                 </div>
                 <div>
                   <button type="button" class="btn btn-outline btn-sm" id="btn-toggle-sidebar" onclick="toggleSidebar()" title="Ẩn/Hiện cột thiết lập bên trái để mở rộng bảng video tối đa">
@@ -532,7 +538,7 @@
             <label>Chế Độ Xử Lý AI:</label>
             <select id="ai-mode">
               <option value="rewrite_seo">✨ Viết lại Tiêu đề kích thích Click (CTR cao) + Mô tả SEO + Bộ từ khóa Tags</option>
-              <option value="shorts_hook">🔥 Viết lại Tiêu Đề Giật Tít Chuẩn Shorts (&lt; 55 ký tự + Hook Tò Mò + #shorts)</option>
+              <option value="shorts_hook">🔥 Viết lại Tiêu Đề Giật Tít Shorts (&lt; 55 ký tự + Hook Tò Mò + #shorts)</option>
               <option value="translate">🌐 Dịch nguyên nghĩa Tiêu đề & Mô tả sang ngôn ngữ đích</option>
             </select>
           </div>
@@ -563,7 +569,7 @@
             <textarea id="ai-prompt" rows="4" placeholder="Ví dụ: Viết tiêu đề gây tò mò cho ngách Unbox / Đồ chơi / Handmade, độ dài dưới 90 ký tự, kèm hashtag #shorts #unbox ở cuối tiêu đề..."></textarea>
           </div>
           <button class="btn btn-purple" style="width:100%" onclick="runAIProcess('ai')">
-            🚀 Chạy AI Tối Ưu Hàng Loạt Cho Các Video Đang Chọn (Hoặc Toàn Bộ Dự Án)
+            🚀 Chạy AI Tối Ưu Hàng Loạt Cho Các Video Đang Chọn (Hoặc Các Dòng Đang Hiển Thị)
           </button>
         </div>
 
@@ -614,17 +620,17 @@
       <div class="grid-2">
         <div class="card">
           <div class="card-header">
-            <div class="card-title">🎛️ Thiết Lập Thông Số Render & Lách Bản Quyền FFmpeg</div>
+            <div class="card-title">🎛️ Thiết Lập Thông Số Render & Render video</div>
           </div>
           <div class="row-inline form-group">
             <div>
               <label>Chế Độ Render Áp Dụng:</label>
               <select id="rc-mode">
                 <option value="shorts_9_16">1. Render Dọc 9:16 (1080x1920) Nền Blur Mờ (Chuẩn Shorts)</option>
-                <option value="pip_thu_nho">2. Lách Thu Nhỏ Đặt Trên Video Nền Chuyển Động</option>
-                <option value="full_16_9">3. Lách Full Màn Hình Ngang 16:9 (1280x720 / 1920x1080)</option>
+                <option value="pip_thu_nho">2. Thu nhỏ Đặt Trên Video Nền Chuyển Động</option>
+                <option value="full_16_9">3. Full màn Hình Ngang 16:9 (1280x720 / 1920x1080)</option>
                 <option value="square_1_1">4. Render Vuông 1:1 (1080x1080)</option>
-                <option value="audio_effect">5. Lách Âm Thanh (Đổi tần số Pitch + Lọc âm)</option>
+                <option value="audio_effect">5. Xử lý âm thanh (Đổi tần số Pitch + Lọc âm)</option>
                 <option value="md5_cut">6. Cắt Đầu/Cuối + Xóa Metadata + Đổi MD5</option>
                 <option value="custom_ffmpeg">7. Chạy Lệnh Custom FFmpeg Trực Tiếp</option>
               </select>
@@ -659,7 +665,7 @@
               <label><input type="checkbox" id="rc-hflip" checked /> Lật ngang gương (Horizontal Flip)</label>
             </div>
             <div>
-              <label><input type="checkbox" id="rc-pitch" checked /> Biến đổi tần số âm thanh lách bản quyền (Audio Pitch Shift)</label>
+              <label><input type="checkbox" id="rc-pitch" checked /> Biến đổi tần số âm thanh xử lý video (Audio Pitch Shift)</label>
             </div>
           </div>
           <div class="row-inline form-group">
@@ -821,7 +827,7 @@
               </div>
               <div>
                 <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:18px;">
-                  <input type="checkbox" id="rc-bg-random" /> 🎲 Chọn video nền NGẪU NHIÊN (chế độ Lách Thu Nhỏ)
+                  <input type="checkbox" id="rc-bg-random" /> 🎲 Chọn video nền NGẪU NHIÊN (chế độ Thu nhỏ)
                 </label>
               </div>
             </div>
@@ -855,7 +861,8 @@
             <input type="text" id="rp-name" placeholder="VD: Shorts Clay Chuẩn - Logo Xanh + Chữ Chạy" />
           </div>
           <div style="display:flex; align-items:flex-end; gap:8px;">
-            <button class="btn btn-success btn-sm" onclick="saveRenderPreset()">💾 Lưu Cấu Hình Hiện Tại Thành Preset</button>
+            <button class="btn btn-success btn-sm" onclick="saveRenderPreset()">💾 Lưu thành preset mới</button>
+            <button class="btn btn-accent btn-sm" onclick="saveRenderPreset(true)">Cập nhật preset đã nạp</button>
           </div>
         </div>
         <div class="row-inline form-group">
@@ -868,6 +875,8 @@
             <button class="btn btn-outline btn-sm" style="color:#f87171; border-color:rgba(248,113,113,0.3);" onclick="deleteRenderPreset()">🗑️ Xóa Preset</button>
           </div>
         </div>
+        <div class="form-group"><label>Ghi chú preset:</label><input type="text" id="rp-note" /></div>
+        <div id="rp-editing" style="font-size:12px; color:var(--text-muted);">Nạp một preset để cập nhật.</div>
         <div style="font-size:11.5px; color:var(--text-muted); margin-top:6px;">
           💡 Quy trình giống tool DHB gốc: chỉnh mọi thông số ở khung bên trên → đặt tên → Lưu. Lần sau chỉ cần chọn preset → "Nạp Vào Form" → "Áp Dụng Cho Video Đang Chọn".
         </div>
@@ -938,6 +947,14 @@
                 <option value="10">10 - Music (Âm nhạc)</option>
               </select>
             </div>
+          </div>
+          <div class="form-group">
+            <label for="ch-studio-category">Danh mục khi đăng qua Studio:</label>
+            <select id="ch-studio-category">
+              <option value="legacy_unconfirmed">Chưa xác nhận — cần xem lại trước khi đăng Studio</option>
+              <option value="keep">Giữ danh mục hiện có bên YouTube</option>
+              <option value="apply">Yêu cầu áp dụng danh mục — hiện chặn đăng do chưa hỗ trợ</option>
+            </select>
           </div>
           <div class="form-group">
             <label>OAuth2 Token JSON / Access Token (Chỉ cần nếu chọn chế độ YouTube Data API v3):</label>
@@ -1018,7 +1035,7 @@
             <div class="form-group">
               <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
                 <input type="checkbox" id="opt-pin-enabled" />
-                Ghim bình luận đầu tiên
+                Yêu cầu ghim bình luận (chưa hỗ trợ — bật sẽ chặn đăng)
               </label>
             </div>
             <div class="form-group">
@@ -1061,6 +1078,33 @@
                 🤖 Gắn nhãn nội dung AI mặc định
               </label>
             </div>
+            <div class="form-group">
+              <p id="opt-metadata-state" role="status">Metadata chưa xác nhận; lưu tên không tự áp dụng lựa chọn mới.</p>
+              <label><input type="checkbox" id="opt-metadata-confirm" onchange="toggleOptionMetadataIntent()" /> Xác nhận lưu các lựa chọn metadata bên dưới</label>
+              <fieldset id="opt-metadata-fields" disabled style="border:1px solid var(--border); padding:10px;">
+                <legend>Ý định áp dụng khi đăng</legend>
+                <label for="opt-studio-category">Danh mục Studio:</label>
+                <select id="opt-studio-category">
+                  <option value="inherit">Kế thừa lựa chọn danh mục Studio của kênh</option>
+                  <option value="keep">Giữ danh mục hiện có bên YouTube</option>
+                  <option value="apply">Yêu cầu áp dụng danh mục — chưa hỗ trợ, sẽ chặn đăng</option>
+                </select>
+                <label for="opt-video-language-mode">Ngôn ngữ nói trong video:</label>
+                <select id="opt-video-language-mode">
+                  <option value="keep">Giữ thiết lập hiện có bên YouTube</option>
+                  <option value="apply">Yêu cầu đặt ngôn ngữ — chưa bật, sẽ chặn đăng</option>
+                </select>
+                <label for="opt-video-language">Mã ngôn ngữ khi yêu cầu đặt:</label>
+                <input id="opt-video-language" type="text" placeholder="vi, en hoặc en-US" maxlength="64" aria-describedby="opt-video-language-help" />
+                <p id="opt-video-language-help" style="font-size:11.5px; color:var(--text-muted)">Áp dụng cho ngôn ngữ nói trong video. Ngôn ngữ tiêu đề/mô tả và chứng nhận phụ đề là các thiết lập riêng. Mã có vùng như en-US được giữ nguyên.</p>
+                <label for="opt-remix">Quyền remix:</label>
+                <select id="opt-remix">
+                  <option value="keep">Giữ thiết lập hiện có bên YouTube</option>
+                  <option value="disable">Cấm remix âm thanh và hình ảnh (hiện chặn đăng)</option>
+                </select>
+                <p style="font-size:11.5px; color:var(--text-muted)">Chọn giữ nguyên để dùng thiết lập của YouTube. Để bỏ yêu cầu cấm đã lưu, chọn giữ nguyên, xác nhận rồi xem trước lại.</p>
+              </fieldset>
+            </div>
             <button class="btn btn-success" style="width:100%" onclick="saveOptionGroup()">💾 Lưu Bộ Tùy Chọn</button>
           </div>
           <div class="table-wrap" style="max-height:420px;">
@@ -1080,9 +1124,30 @@
           </div>
         </div>
         <div style="font-size:11.5px; color:var(--text-muted); margin-top:8px; line-height:1.55;">
-          💡 Bộ tùy chọn được gán cho video ở khung quét nguồn, cấu hình hàng loạt hoặc luồng Auto Monitor. Khi đăng, tool tự chèn hashtag vào tiêu đề, link Shopee vào mô tả và ghim bình luận (nếu bật).
+          💡 Bộ tùy chọn được gán cho video ở khung quét nguồn, cấu hình hàng loạt hoặc luồng Auto Monitor. Tool hỗ trợ chèn hashtag và link Shopee. Ghim bình luận chưa được hỗ trợ ở cả API và Studio; yêu cầu cũ vẫn được giữ để bạn xem lại và tắt trước khi đăng.
         </div>
       </div>
+
+      <section class="card" style="margin-top:12px;" aria-labelledby="upload-capabilities-title">
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+          <h3 class="card-title" id="upload-capabilities-title">Khả năng đăng theo phương thức</h3>
+          <button class="btn btn-outline btn-sm" type="button" onclick="loadUploadCapabilities()">Tải lại khả năng đăng</button>
+        </div>
+        <p style="font-size:12px; line-height:1.6; color:var(--text-muted)">
+          Cấu hình đã lưu có thể chưa được áp dụng khi đăng. Kiểm thử offline chưa xác nhận thao tác trên YouTube thực tế.
+          Các giới hạn đăng không ngăn bước chỉ tải hoặc render video.
+        </p>
+        <p id="upload-capabilities-status" role="status" aria-live="polite">Chưa tải thông tin khả năng đăng.</p>
+        <details>
+          <summary style="cursor:pointer; margin-bottom:10px;">Xem danh mục, ngôn ngữ, remix và các giới hạn đăng</summary>
+          <div class="table-wrap">
+            <table aria-label="Khả năng đăng của YouTube API và YouTube Studio">
+              <thead><tr><th scope="col">Tính năng</th><th scope="col">YouTube API</th><th scope="col">YouTube Studio</th></tr></thead>
+              <tbody id="upload-capabilities-tbody"></tbody>
+            </table>
+          </div>
+        </details>
+      </section>
 
       <!-- QUẢN LÝ PROFILE CHROME & TRẠNG THÁI ĐĂNG NHẬP GOOGLE -->
       <div class="card" style="margin-top:12px;">
@@ -1090,6 +1155,7 @@
           <div class="card-title">👤 Quản Lý Profile Chrome & Trạng Thái Đăng Nhập Google</div>
           <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
             <span id="antidetect-status" style="font-size:11px; color:var(--text-muted);">Antidetect: chưa kiểm tra</span>
+            <button class="btn btn-outline btn-sm" onclick="createLocalProfile()">+ Tạo Profile local</button>
             <button class="btn btn-accent btn-sm" onclick="syncAntidetectProfiles()" title="Kéo Profile từ Antidetect về tool (không lấy mật khẩu proxy)">🔗 Đồng Bộ Antidetect</button>
             <button class="btn btn-sm" onclick="syncAntidetectChannels()" title="Mở từng Profile Antidetect đọc kênh YouTube Studio (đăng nhập, email, Channel ID) và đưa về Quản Lý Kênh — khoảng 15-30 giây mỗi profile">🧲 Quét Kênh Studio</button>
             <button class="btn btn-outline btn-sm" onclick="loadProfiles()">🔄 Làm Mới Danh Sách</button>
@@ -1148,18 +1214,25 @@
             </div>
           </div>
           <div class="form-group">
+            <label>Hiển thị monitor:</label>
+            <select id="mon-visibility"><option value="inherit">Kế thừa kênh</option><option value="private">Riêng tư</option><option value="unlisted">Không công khai</option><option value="public">Công khai</option></select>
+            <label>Dành cho trẻ em:</label>
+            <select id="mon-kids"><option value="inherit">Kế thừa tùy chọn / kênh</option><option value="true">Có</option><option value="false">Không</option></select>
+            <label>Nội dung AI / đã chỉnh sửa:</label>
+            <select id="mon-altered"><option value="inherit">Kế thừa tùy chọn / kênh</option><option value="true">Có</option><option value="false">Không</option></select>
+            <small>Khi dùng bộ tùy chọn, giá trị Không trong bộ tùy chọn được ưu tiên hơn mặc định kênh.</small>
             <label>Bộ Tùy Chọn Đăng (Affiliate Shopee / Pin Comment / Hashtags):</label>
             <select id="mon-option-group">
               <option value="">-- Không dùng bộ tùy chọn --</option>
             </select>
           </div>
           <div class="form-group">
-            <label>Chế Độ Render Lách Bản Quyền:</label>
+            <label>Chế độ render:</label>
             <select id="mon-render">
               <option value="shorts_9_16">Render Dọc 9:16 Blur (Shorts)</option>
-              <option value="pip_thu_nho">Lách Thu Nhỏ (Video Nền DHB)</option>
-              <option value="full_16_9">Lách Full Màn 16:9</option>
-              <option value="audio_effect">Lách Âm Thanh</option>
+              <option value="pip_thu_nho">Thu nhỏ (Video Nền DHB)</option>
+              <option value="full_16_9">Full màn 16:9</option>
+              <option value="audio_effect">Xử lý âm thanh</option>
               <option value="md5_cut">Đổi MD5 & Xóa Tag</option>
             </select>
           </div>
@@ -1180,11 +1253,11 @@
           <div class="row-inline form-group">
             <div>
               <label>Chu Kỳ Quét Lặp Lại (Phút):</label>
-              <input type="number" id="mon-interval" value="30" min="5" />
+              <input type="number" id="mon-interval" value="30" min="5" max="10080" step="1" />
             </div>
             <div>
               <label>Số Video Mới Tối Đa / Lần Quét:</label>
-              <input type="number" id="mon-max" value="3" min="1" max="20" />
+              <input type="number" id="mon-max" value="3" min="1" max="1000" step="1" />
             </div>
           </div>
           <button class="btn btn-success" style="width:100%" onclick="addMonitor()">
@@ -1519,13 +1592,13 @@
             </select>
           </div>
           <div>
-            <label>Chế Độ Render Lách Bản Quyền:</label>
+            <label>Chế độ render:</label>
             <select id="ed-vid-render">
               <option value="shorts_9_16">Render Dọc 9:16 Blur (Shorts)</option>
-              <option value="pip_thu_nho">Lách Thu Nhỏ (Video Nền DHB)</option>
-              <option value="full_16_9">Lách Full Màn 16:9</option>
+              <option value="pip_thu_nho">Thu nhỏ (Video Nền DHB)</option>
+              <option value="full_16_9">Full màn 16:9</option>
               <option value="square_1_1">Render Vuông 1:1</option>
-              <option value="audio_effect">Lách Âm Thanh</option>
+              <option value="audio_effect">Xử lý âm thanh</option>
               <option value="md5_cut">Đổi MD5 & Xóa Tag</option>
               <option value="none">Không Render</option>
             </select>
@@ -1692,7 +1765,7 @@
         </div>
         <div id="as-summary" style="background:rgba(56,189,248,0.07); border:1px dashed #38bdf8; border-radius:8px; padding:10px 12px; font-size:12.5px; line-height:1.7; color:#e2e8f0;"></div>
         <div style="font-size:11.5px; color:var(--text-muted); margin-top:8px; line-height:1.55;">
-          🛡️ An toàn tài khoản: hệ thống ép giãn cách <b>tối thiểu 30 phút/video</b> (chống spam). Mặc định bắt đầu sau 60 phút để kịp upload trước giờ phát hành.
+          Đây là <b>giờ YouTube phát hành</b>, không tự bắt đầu lô upload. Lưu lịch xong vẫn cần xem trước và xác nhận chạy. Upload dùng chung khoảng nghỉ ít nhất 30 phút sau khi lượt trước kết thúc; cần dự trù cả thời gian tải, render và upload trước giờ phát hành.
           Đối tượng tuổi (trên/dưới 18, trẻ em), nhãn AI và chất lượng HD đặt ở khung "⚡ Gán Cấu Hình Nhanh" trước khi lên lịch.
         </div>
       </div>
@@ -1777,6 +1850,16 @@
         </div>
         <div class="row-inline form-group">
           <div>
+            <label for="ec-studio-category">Danh mục khi đăng qua Studio:</label>
+            <select id="ec-studio-category">
+              <option value="legacy_unconfirmed">Chưa xác nhận — cần xem lại trước khi đăng Studio</option>
+              <option value="keep">Giữ danh mục hiện có bên YouTube</option>
+              <option value="apply">Yêu cầu áp dụng danh mục — hiện chặn đăng do chưa hỗ trợ</option>
+            </select>
+          </div>
+        </div>
+        <div class="row-inline form-group">
+          <div>
             <label>Chế Độ Hiển Thị Mặc Định:</label>
             <select id="ec-privacy">
               <option value="public">🚀 Công khai</option>
@@ -1809,7 +1892,7 @@
           <label>Tuỳ Chọn Trình Duyệt:</label>
           <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:6px;">
             <input type="checkbox" id="ec-emulate-mobile" />
-            📱 Giả lập Mobile (KHÔNG khuyến nghị — nguy cơ Checkpoint)
+            📱 Giả lập Mobile (cấu hình cũ)
           </label>
           <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:4px;">
             <input type="checkbox" id="ec-hidden" />
@@ -1846,6 +1929,12 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=upload-preview"></script>
+  <script src="/static/app.js?v=hardening-20261118"></script>
+  <script src="/static/ui-shared.js?v=publish-20261117"></script>
+  <script src="/static/ui-queue.js?v=publish-20261117"></script>
+  <script src="/static/ui-content.js?v=ui-20261117"></script>
+  <script src="/static/ui-admin.js?v=hardening-20261118"></script>
+  <script src="/static/ui-publish.js?v=hardening-20261118"></script>
 </body>
 </html>
+

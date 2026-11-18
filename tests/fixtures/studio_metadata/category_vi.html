@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="vi"><meta charset="utf-8"><title>Fixture tổng hợp cho hợp đồng danh mục</title>
+<body>
+<p>Fixture tự viết, không phải DOM thu thập từ YouTube Studio.</p>
+<button data-action="show-more" onclick="setTimeout(() => document.querySelector('[data-details]').hidden=false, 25)">Hiện thêm</button>
+<div data-details hidden>
+  <section data-studio-section="audience"><label>Danh mục</label><select data-semantic="unrelated"><option value="entertainment">Giải trí</option></select></section>
+  <section data-studio-section="category">
+    <label for="category">Danh mục</label>
+    <select id="category" data-semantic="category" onchange="if (this.dataset.noChange) this.value='people-blogs'">
+      <option value="people-blogs">Mọi người &amp; Blog</option><option value="entertainment">Giải trí</option>
+    </select>
+  </section>
+</div>
+</body></html>

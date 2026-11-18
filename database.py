@@ -12,6 +12,8 @@ from urllib.parse import urlsplit
 from content_identity import normalize_source_url
 from phase4_rules import GROUP_SCHEMA_VERSION, normalize_group_names, serialize_group_names
 from upload_approval import init_approval_schema
+from metadata_intent_schema import preflight_metadata_intent_schema, migrate_metadata_intent_schema
+from upload_evidence_schema import preflight_upload_evidence_schema, migrate_upload_evidence_schema
 
 from config import (
     APP_DATA_DIR,
@@ -27,11 +29,22 @@ class SecretCollectionError(RuntimeError):
     """Không đọc được nguồn bí mật — thà che toàn bộ còn hơn lộ dữ liệu thật."""
 
 
+def queue_requires_review(conn, queue_id: int) -> bool:
+    """The reservation is durable evidence even if a legacy worker changed status."""
+    return bool(conn.execute(
+        "SELECT 1 FROM video_queue q WHERE q.id = ? AND (q.status = 'NeedsReview' OR EXISTS "
+        "(SELECT 1 FROM content_reservations r WHERE r.queue_id = q.id AND r.state = 'NeedsReview'))",
+        (queue_id,),
+    ).fetchone())
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(APP_DB_PATH), timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("PRAGMA journal_mode=WAL;")
+        journal_mode = conn.execute("PRAGMA journal_mode;").fetchone()
+        if not journal_mode or str(journal_mode[0]).casefold() != "wal":
+            conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
     except Exception:
         pass
@@ -120,6 +133,12 @@ def _fix_video_queue_emulate_default(conn, cur) -> bool:
 
 def init_db():
     conn = get_conn()
+    try:
+        preflight_metadata_intent_schema(conn)
+        preflight_upload_evidence_schema(conn)
+    except Exception:
+        conn.close()
+        raise
     cur = conn.cursor()
 
     # 1. Bảng Nhóm Kênh (Channel Groups)
@@ -437,6 +456,30 @@ def init_db():
     """)
     conn.execute("INSERT OR IGNORE INTO upload_slot (id, state) VALUES (1, 'idle')")
     _add_col_if_missing("monitors", "last_heartbeat_at", "TEXT DEFAULT ''")
+    _add_col_if_missing("monitors", "metadata_policy_json", "TEXT DEFAULT ''")
+    _add_col_if_missing("monitors", "metadata_revision", "TEXT DEFAULT ''")
+    _add_col_if_missing("video_queue", "monitor_metadata_policy_json", "TEXT DEFAULT ''")
+    _add_col_if_missing("video_queue", "post_upload_warnings_json", "TEXT DEFAULT '[]'")
+    _add_col_if_missing("upload_attempts", "post_upload_warnings_json", "TEXT DEFAULT '[]'")
+    required_review_columns = {
+        'monitors': {'metadata_policy_json', 'metadata_revision'},
+        'video_queue': {'monitor_metadata_policy_json', 'post_upload_warnings_json'},
+        'upload_attempts': {'post_upload_warnings_json'},
+    }
+    for table, required in required_review_columns.items():
+        actual = {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
+        if not required <= actual:
+            conn.rollback()
+            conn.close()
+            raise RuntimeError(f'Migration review không đầy đủ ở bảng {table}; dừng khởi động để giữ dữ liệu.')
+    schema = conn.execute("SELECT version FROM app_schema_versions WHERE schema_key='review_metadata'").fetchone()
+    if schema and schema[0] > 1:
+        conn.rollback()
+        conn.close()
+        raise RuntimeError('Schema review_metadata mới hơn ứng dụng; không tự hạ phiên bản.')
+    conn.execute("INSERT OR IGNORE INTO app_schema_versions(schema_key,version) VALUES('review_metadata',1)")
+    conn.execute("UPDATE monitors SET is_running=0, status='Cần xác nhận metadata' "
+                 "WHERE COALESCE(metadata_policy_json,'')='' OR COALESCE(metadata_revision,'')=''")
     _add_col_if_missing("system_logs", "run_id", "TEXT DEFAULT ''")
     _add_col_if_missing("system_logs", "queue_id", "INTEGER DEFAULT NULL")
     _add_col_if_missing("system_logs", "attempt_id", "INTEGER DEFAULT NULL")
@@ -454,6 +497,18 @@ def init_db():
 
     # Sửa default legacy 1 -> 0 (Monitor và mọi INSERT thiếu cột phải chạy Desktop)
     emulate_default_fixed = _fix_video_queue_emulate_default(conn, cur)
+    try:
+        migrate_metadata_intent_schema(conn)
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    try:
+        migrate_upload_evidence_schema(conn)
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
     init_approval_schema(conn)
     conn.execute("INSERT OR IGNORE INTO app_schema_versions (schema_key, version) VALUES ('upload_hardening', 1)")
 
@@ -517,11 +572,8 @@ def init_db():
     except Exception:
         pass
 
-    # Dọn nhật ký cũ: chỉ giữ 5000 dòng gần nhất để DB không phình to vô hạn
-    try:
-        cur.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 5000)")
-    except Exception:
-        pass
+    # Retention belongs to scheduled housekeeping, never schema initialization.
+    # Startup/rehearsal must preserve every existing log and upload evidence row.
 
     conn.commit()
     conn.close()
@@ -578,6 +630,8 @@ def export_all_tables_csv(target_dir: str, keep: int = 10) -> Dict[str, Any]:
 
     Dùng cho backup ngoài ổ tool; giữ tối đa `keep` bản export gần nhất.
     """
+    from csv_safety import ENCODING_VERSION, encode_csv_cell
+
     raw_target = str(target_dir or "").strip()
     if not raw_target:
         raise ValueError("Chưa cấu hình thư mục export CSV.")
@@ -621,7 +675,7 @@ def export_all_tables_csv(target_dir: str, keep: int = 10) -> Dict[str, Any]:
                             value = ""
                         elif isinstance(value, str):
                             value = redact_secrets(value, secret_values)
-                        out_row.append(value)
+                        out_row.append(encode_csv_cell(value))
                     writer.writerow(out_row)
             table_rows[table] = len(rows)
             total_rows += len(rows)
@@ -632,6 +686,7 @@ def export_all_tables_csv(target_dir: str, keep: int = 10) -> Dict[str, Any]:
         "exported_at": datetime.now().isoformat(timespec="seconds"),
         "database": str(APP_DB_PATH),
         "tables": table_rows,
+        "cell_encoding": ENCODING_VERSION,
     }
     (dest / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1300,8 +1355,9 @@ def migrate_phase4_group_schema(conn, cur=None) -> Dict[str, int]:
 
     cur.execute(
         "INSERT INTO app_schema_versions (schema_key, version, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
-        "ON CONFLICT(schema_key) DO UPDATE SET version = excluded.version, updated_at = CURRENT_TIMESTAMP",
-        ("channel_group_memberships", GROUP_SCHEMA_VERSION),
+        "ON CONFLICT(schema_key) DO UPDATE SET version = excluded.version, updated_at = CURRENT_TIMESTAMP "
+        "WHERE app_schema_versions.version IS NOT excluded.version OR ?",
+        ("channel_group_memberships", GROUP_SCHEMA_VERSION, any(stats.values())),
     )
     return stats
 

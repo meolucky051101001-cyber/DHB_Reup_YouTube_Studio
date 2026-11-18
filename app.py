@@ -5,8 +5,11 @@ import csv
 import io
 import json
 import hashlib
+import monitor_policy
 import threading
 import subprocess
+import sqlite3
+from contextlib import closing
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -62,9 +65,10 @@ from database import (
     content_identity_migration_report,
     set_channel_group_memberships,
     register_managed_artifact,
+    queue_requires_review,
 )
 from antidetect_client import AntidetectClient, AntidetectError
-from scanner_downloader import scan_social_urls, probe_video_info, probe_video_infos, VIDEO_EXTENSIONS, VideoProbeError
+from scanner_downloader import scan_social_urls, probe_video_info, probe_video_infos, VIDEO_EXTENSIONS, VideoProbeError, ScanSourceError
 from ai_engine import ai_optimize_youtube_metadata, apply_batch_text_edit, SourceLinksTooLongError
 from youtube_uploader import (
     open_profile_for_login,
@@ -72,7 +76,9 @@ from youtube_uploader import (
     get_oauth_token_local_status,
     check_oauth_token_status,
     normalize_published_video_url,
+    recheck_api_video_receipt,
 )
+from scheduled_uploads import read_schedule_status
 from pipeline_manager import pipeline_manager, upload_slot_recovery_status, acknowledge_upload_slot_recovery
 from group_distribution import target_group_names
 from phase4_rules import (
@@ -83,6 +89,12 @@ from queue_import import preview_csv_import
 from app_instance_lock import AppInstanceAlreadyRunning, acquire_app_instance_lock
 from render_engine import normalize_render_speed
 from runtime_identity import capture_runtime, runtime_status
+from upload_evidence import EvidenceError, read_evidence
+from config_validation import parse_config_input, validate_config, validate_option_state
+from metadata_intent import MetadataIntentConflict, metadata_revision, prepare_channel_update, prepare_option_update
+from profile_crud import ProfileCreate, ProfileUpdate, binding_references
+from render_preset_validation import PresetCreate, PresetUpdate, validate_render_config, public_preset, preset_revision
+from monitor_validation import validate_monitor_create
 from storage_manager import (
     DEFAULT_RETENTION_DAYS,
     cleanup_managed_artifacts,
@@ -171,6 +183,17 @@ def _queue_target_updates(conn, updates: Dict[str, Any], current: Dict[str, Any]
     if not destination_changed:
         return target
 
+    try:
+        aliases = [normalize_group_names(updates[key]) for key in ('target_group_names', 'target_group_names_json') if key in updates]
+        if len(aliases) == 2 and aliases[0] != aliases[1]:
+            raise ValueError('Các trường nhóm kênh có giá trị mâu thuẫn.')
+        if aliases and 'target_group_name' in updates:
+            legacy = normalize_group_names(updates['target_group_name'])
+            if legacy and legacy != aliases[0][:1]:
+                raise ValueError('Tên nhóm cũ không khớp danh sách nhóm.')
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
     channel_id = target.get("target_channel_id", current.get("target_channel_id"))
     profile_name = str(target.get("target_profile_name", current.get("target_profile_name")) or "").strip()
     raw_groups = target.get("target_group_names", target.get("target_group_names_json"))
@@ -182,6 +205,13 @@ def _queue_target_updates(conn, updates: Dict[str, Any], current: Dict[str, Any]
         has_groups = raw_groups is not None and bool(normalize_group_names(raw_groups))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    requested_type = str(updates.get('target_type') or '').upper()
+    if has_groups and (explicit_channel or explicit_profile or requested_type in ('CHANNEL', 'PROFILE')):
+        raise HTTPException(400, 'Chỉ chọn kênh/profile hoặc nhóm; không chọn đồng thời.')
+    if requested_type == 'GROUP' and (explicit_channel or explicit_profile):
+        raise HTTPException(400, 'Đích GROUP không được kèm kênh/profile cụ thể.')
+    if explicit_profile and not explicit_channel:
+        channel_id = None
     if not explicit_channel and not explicit_profile and (has_groups or (raw_groups is not None and str(target.get("target_type") or "").upper() == "GROUP")):
         groups = _validated_group_names(conn, raw_groups, default="Mặc định")
         target["target_group_names_json"] = serialize_group_names(groups)
@@ -220,6 +250,7 @@ def _queue_target_updates(conn, updates: Dict[str, Any], current: Dict[str, Any]
     # Editing a destination is explicit confirmation; stale assignments must be cleared.
     target["assigned_channel_id"] = None
     target["assigned_group_names_json"] = ""
+    target.pop('target_group_names', None)
     return target
 
 
@@ -288,6 +319,55 @@ def _ensure_queue_items_idle(conn, ids, action: str):
         )
 
 
+def _validate_project_name(value: Any) -> str:
+    """Validate a project label before it becomes a cross-table reference."""
+    if not isinstance(value, str):
+        raise HTTPException(400, "Tên dự án phải là chuỗi văn bản.")
+    name = value.strip()
+    if not name:
+        raise HTTPException(400, "Tên dự án không được để trống.")
+    if "\x00" in name:
+        raise HTTPException(400, "Tên dự án không được chứa ký tự NUL.")
+    if len(name) > 200:
+        raise HTTPException(400, "Tên dự án không được vượt quá 200 ký tự.")
+    if name == 'Default' or name.startswith('Monitor - '):
+        raise HTTPException(400, "Tên dự án này dành riêng cho hệ thống. Hãy chọn tên khác.")
+    return name
+
+
+def _project_monitor_name(conn, project_name: str) -> bool:
+    """Return whether a project is owned by an existing Monitor."""
+    prefix = "Monitor - "
+    if not project_name.startswith(prefix):
+        return False
+    monitor_name = project_name[len(prefix):].strip()
+    if not monitor_name:
+        return False
+    return conn.execute("SELECT 1 FROM monitors WHERE name = ? LIMIT 1", (monitor_name,)).fetchone() is not None
+
+
+def _capture_import_project(conn, name):
+    """Capture identity before slow probing; imports may create a new project."""
+    if not isinstance(name, str):
+        raise HTTPException(400, 'Tên dự án phải là chuỗi văn bản.')
+    name = name.strip()
+    row = conn.execute('SELECT id, name FROM projects WHERE name=?', (name,)).fetchone()
+    if row is None and name == 'Default':
+        row = conn.execute('SELECT id, name FROM projects ORDER BY id LIMIT 1').fetchone()
+    if row is None:
+        name = _validate_project_name(name)
+        conn.execute('INSERT INTO projects(name) VALUES(?)', (name,))
+        row = conn.execute('SELECT id, name FROM projects WHERE name=?', (name,)).fetchone()
+    return int(row['id']), row['name']
+
+
+def _current_import_project(conn, project_id):
+    row = conn.execute('SELECT name FROM projects WHERE id=?', (project_id,)).fetchone()
+    if row is None:
+        raise HTTPException(409, 'Dự án đã bị xóa trong lúc nhập video. Hãy chọn lại dự án và thử lại.')
+    return row['name']
+
+
 # Kiểm tra trùng + ghi queue phải liền mạch, trong khi ffprobe được chạy song song bên ngoài lock
 _import_insert_lock = threading.Lock()
 
@@ -307,7 +387,12 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.04-p7-fix2"
+APP_BUILD_VERSION = "2026.11.18-hardening"
+
+
+def get_schedule_state_dir() -> Path:
+    custom = os.environ.get("DHB_SCHEDULE_STATE_DIR", "").strip()
+    return Path(custom) if custom else (APP_DATA_DIR / "scheduled_uploads" / "default")
 RUNTIME_IDENTITY = capture_runtime(APP_ROOT)
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
@@ -328,6 +413,7 @@ _JSON_SECRET_KEYS = {
     "oauthtoken", "oauthtokenjson", "apikey", "clientsecret", "secret",
     "password", "passwd", "cookie", "authorization",
 }
+_JSON_OAUTH_PRESENCE_KEYS = {"hasoauthtoken", "hasaccesstoken", "hasrefreshtoken"}
 
 
 def _redact_json_value(value: Any, secrets: List[str]) -> Any:
@@ -336,6 +422,9 @@ def _redact_json_value(value: Any, secrets: List[str]) -> Any:
         safe = {}
         for key, child in value.items():
             normalized_key = re.sub(r"[^a-z0-9]+", "", str(key).lower())
+            if isinstance(child, bool) and normalized_key in _JSON_OAUTH_PRESENCE_KEYS:
+                safe[key] = child
+                continue
             is_secret = (
                 normalized_key in _JSON_SECRET_KEYS
                 or normalized_key.endswith(("apikey", "clientsecret", "password", "passwd", "token"))
@@ -427,6 +516,13 @@ async def guard_local_api(request: Request, call_next):
 
 @app.exception_handler(HTTPException)
 async def safe_http_exception_handler(request: Request, exc: HTTPException):
+    if isinstance(exc.detail, dict):
+        code = str(exc.detail.get("code") or "").strip()
+        message = redact_secrets(str(exc.detail.get("message") or "Yêu cầu không hợp lệ."))
+        body: Dict[str, Any] = {"detail": message}
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", code):
+            body["code"] = code
+        return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
     detail = exc.detail if isinstance(exc.detail, (str, int, float, bool)) or exc.detail is None else str(exc.detail)
     return JSONResponse(
         {"detail": redact_secrets(detail)},
@@ -593,12 +689,18 @@ def api_diagnostics():
         "needs_review_count": needs_review,
         "storage": storage_summary,
         "heartbeat": heartbeat,
+        "scheduled_uploads": read_schedule_status(get_schedule_state_dir()),
         "tools": [
             _probe_local_tool("FFmpeg", FFMPEG_EXE, ["-version"]),
             _probe_local_tool("FFprobe", FFPROBE_EXE, ["-version"]),
             _probe_local_tool("yt-dlp", YTDL_EXE, ["--version"]),
         ],
     }
+
+
+@app.get("/api/scheduled-uploads/status")
+def api_scheduled_uploads_status():
+    return read_schedule_status(get_schedule_state_dir())
 
 
 @app.post("/api/sync-dhb")
@@ -623,40 +725,50 @@ def api_list_projects():
 
 @app.post("/api/projects")
 def api_create_project(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Tên dự án không được để trống.")
-    conn = get_conn()
-    conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (name,))
-    conn.commit()
-    conn.close()
+    name = _validate_project_name(data.get('name'))
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if conn.execute('SELECT 1 FROM projects WHERE name=?', (name,)).fetchone():
+            raise HTTPException(409, 'Tên dự án đã tồn tại. Hãy chọn tên khác.')
+        conn.execute('INSERT INTO projects(name) VALUES(?)', (name,))
     return {"ok": True, "name": name}
 
 
-@app.delete("/api/projects/{name}")
+@app.put('/api/projects/{name:path}')
+def api_rename_project(name: str, data: Dict[str, Any] = Body(...)):
+    new_name = _validate_project_name(data.get('name'))
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if not conn.execute('SELECT 1 FROM projects WHERE name=?', (name,)).fetchone():
+            raise HTTPException(404, 'Không tìm thấy dự án này.')
+        if _project_monitor_name(conn, name):
+            raise HTTPException(409, 'Dự án thuộc Monitor. Hãy quản lý liên kết trong Monitor trước.')
+        if new_name == name:
+            return {'ok': True, 'name': name}
+        if (conn.execute('SELECT 1 FROM projects WHERE name=?', (new_name,)).fetchone()
+                or conn.execute('SELECT 1 FROM video_queue WHERE project_name=?', (new_name,)).fetchone()):
+            raise HTTPException(409, 'Tên mới đã có dự án hoặc hàng đợi. Không thể gộp dữ liệu khi đổi tên.')
+        ids = [r[0] for r in conn.execute('SELECT id FROM video_queue WHERE project_name=?', (name,))]
+        _ensure_queue_items_idle(conn, ids, 'đổi tên dự án')
+        conn.execute('UPDATE projects SET name=?,updated_at=CURRENT_TIMESTAMP WHERE name=?', (new_name, name))
+        conn.execute('UPDATE video_queue SET project_name=? WHERE project_name=?', (new_name, name))
+    return {'ok': True, 'name': new_name}
+
+
+@app.delete("/api/projects/{name:path}")
 def api_delete_project(name: str):
-    conn = get_conn()
-    try:
+    with closing(get_conn()) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute('SELECT 1 FROM projects WHERE name=?', (name,)).fetchone():
+            raise HTTPException(404, 'Không tìm thấy dự án này.')
+        if _project_monitor_name(conn, name):
+            raise HTTPException(409, 'Dự án thuộc Monitor. Hãy quản lý liên kết trong Monitor trước.')
         total_projects = conn.execute("SELECT COUNT(*) as c FROM projects").fetchone()["c"]
         if total_projects <= 1:
-            raise HTTPException(400, "Cần giữ lại ít nhất 1 dự án để làm việc.")
-        queue_ids = [
-            int(row["id"])
-            for row in conn.execute("SELECT id FROM video_queue WHERE project_name = ?", (name,)).fetchall()
-        ]
-        _ensure_queue_items_idle(conn, queue_ids, f"xóa dự án [{name}]")
-        conn.execute("DELETE FROM video_queue WHERE project_name = ?", (name,))
+            raise HTTPException(409, "Cần giữ lại ít nhất 1 dự án để làm việc.")
+        if conn.execute('SELECT 1 FROM video_queue WHERE project_name=? LIMIT 1', (name,)).fetchone():
+            raise HTTPException(409, 'Dự án còn video. Hãy quản lý hàng đợi trước; chỉ xóa được dự án rỗng.')
         conn.execute("DELETE FROM projects WHERE name = ?", (name,))
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
     return {"ok": True}
 
 
@@ -667,7 +779,9 @@ def api_get_queue(project: str = ""):
         p_row = conn.execute("SELECT name FROM projects ORDER BY id ASC LIMIT 1").fetchone()
         project = p_row["name"] if p_row else "Dự án YouTube #1"
     rows = conn.execute(
-        "SELECT *, COALESCE(claim_token, '') <> '' AS is_claimed "
+        "SELECT *, COALESCE(claim_token, '') <> '' AS is_claimed, "
+        "(status = 'NeedsReview' OR EXISTS (SELECT 1 FROM content_reservations r "
+        "WHERE r.queue_id = video_queue.id AND r.state = 'NeedsReview')) AS requires_review "
         "FROM video_queue WHERE project_name = ? ORDER BY id DESC",
         (project,),
     ).fetchall()
@@ -679,6 +793,36 @@ def api_get_queue(project: str = ""):
 def api_content_identity_report():
     """Read-only summary for legacy queue/history rows without fingerprints."""
     return content_identity_migration_report()
+
+
+@app.get("/api/queue/{item_id}/upload-evidence")
+def api_upload_evidence(item_id: int):
+    """Return only validated evidence, without changing reconciliation state."""
+    with closing(get_conn()) as conn:
+        if not conn.execute('SELECT 1 FROM video_queue WHERE id=?', (item_id,)).fetchone():
+            raise HTTPException(404, 'Không tìm thấy video này trong hàng đợi.')
+        rows = conn.execute(
+            'SELECT id,attempt_no,channel_id,outcome,evidence_json FROM upload_attempts '
+            'WHERE queue_id=? ORDER BY attempt_no DESC,id DESC', (item_id,)
+        ).fetchall()
+    attempts = []
+    public_outcomes = {'InProgress', 'NeedsReview', 'Completed', 'Error', 'NotSent',
+                       'Cancelled', 'Warning', 'Authorized', 'ConfirmedPublished'}
+    # Old/manual attempts can have no evidence. Never return arbitrary stored
+    # response bodies, error text, or URLs from an invalid evidence document.
+    for row in rows:
+        invalid = False
+        try:
+            if row['channel_id'] is None and row['evidence_json'] == '{}':
+                evidence = None  # Historical attempts can lack a bound channel.
+            else:
+                evidence = read_evidence(row['evidence_json'], item_id, row['id'], row['channel_id'])
+        except EvidenceError:
+            evidence, invalid = None, True
+        attempts.append({'id': row['id'], 'attempt_no': row['attempt_no'],
+                         'outcome': row['outcome'] if row['outcome'] in public_outcomes else 'Unknown', 'evidence': evidence,
+                         'evidence_error': invalid})
+    return {'queue_id': item_id, 'attempts': attempts}
 
 
 @app.post("/api/queue/scan")
@@ -699,7 +843,15 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
             raise HTTPException(400, str(exc)) from exc
     urls = normalized_sources
 
-    max_items = int(data.get("max_items", 20) or 20)
+    try:
+        raw_max_items = data.get("max_items", 20)
+        if isinstance(raw_max_items, bool) or not re.fullmatch(r"[0-9]+", str(raw_max_items).strip()):
+            raise ValueError()
+        max_items = int(raw_max_items)
+        if not 1 <= max_items <= 1000:
+            raise ValueError()
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(400, 'Số video mỗi nguồn phải là số nguyên từ 1 đến 1000.')
     min_views = int(data.get("min_views", 0) or 0)
     min_likes = int(data.get("min_likes", 0) or 0)
     min_comments = int(data.get("min_comments", 0) or 0)
@@ -758,6 +910,9 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
         start_dt = datetime.fromisoformat(base_schedule_time)
         schedule_interval_minutes = max(30, schedule_interval_minutes)
 
+    with closing(get_conn()) as project_conn, project_conn:
+        project_conn.execute('BEGIN IMMEDIATE')
+        project_id, project_name = _capture_import_project(project_conn, project_name)
     try:
         scanned = scan_social_urls(
             urls=urls,
@@ -770,10 +925,14 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
         )
     except VideoProbeError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(504, str(exc)) from exc
+    except ScanSourceError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
-    conn = get_conn()
-    with _import_insert_lock:
-        conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (project_name,))
+    with closing(get_conn()) as conn, conn, _import_insert_lock:
+        conn.execute('BEGIN IMMEDIATE')
+        project_name = _current_import_project(conn, project_id)
         added_count = 0
         skipped_count = 0
         seen_post_ids = set()
@@ -835,8 +994,6 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
                 ),
             )
             added_count += 1
-        conn.commit()
-    conn.close()
     log_msg = f"Đã quét và thêm {added_count} video vào dự án [{project_name}] (Chế độ: {visibility})."
     if skipped_count:
         log_msg += f" Bỏ qua {skipped_count} video đã có trong dự án."
@@ -892,9 +1049,10 @@ def api_upload_video_files(
         group_names = _validated_group_names(validation_conn, target_group_names, default="Mặc định")
     finally:
         validation_conn.close()
+    with closing(get_conn()) as project_conn, project_conn:
+        project_conn.execute('BEGIN IMMEDIATE')
+        project_id, project_name = _capture_import_project(project_conn, project_name)
     conn = get_conn()
-    conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (project_name,))
-
     added_count = 0
     skipped_count = 0
     added_titles = []
@@ -960,6 +1118,7 @@ def api_upload_video_files(
         try:
             with _import_insert_lock:
                 conn.execute("BEGIN IMMEDIATE")
+                project_name = _current_import_project(conn, project_id)
                 if not _is_duplicate_content_key(conn, project_name, content_key):
                     insert_cursor = conn.execute(
                         """
@@ -1178,9 +1337,10 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
     skipped_count = 0
     seen_post_ids = set()
 
+    with closing(get_conn()) as project_conn, project_conn:
+        project_conn.execute('BEGIN IMMEDIATE')
+        project_id, project_name = _capture_import_project(project_conn, project_name)
     conn = get_conn()
-    conn.execute("INSERT OR IGNORE INTO projects (name) VALUES (?)", (project_name,))
-    conn.commit()
     try:
         for p_str in paths:
             p = Path(p_str)
@@ -1221,6 +1381,8 @@ def api_add_local_paths(data: Dict[str, Any] = Body(...)):
     conn = get_conn()
     try:
         with _import_insert_lock:
+            conn.execute('BEGIN IMMEDIATE')
+            project_name = _current_import_project(conn, project_id)
             for f in pending_files:
                 post_id = hashlib.md5(str(f).encode("utf-8")).hexdigest()[:16].upper()
                 if _is_duplicate_post_id(conn, project_name, post_id):
@@ -1365,14 +1527,11 @@ def api_bulk_update_queue(data: Dict[str, Any] = Body(...)):
             render_config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, "Cấu hình render phải là JSON hợp lệ.") from exc
-        if not isinstance(render_config, dict):
-            raise HTTPException(400, "Cấu hình render phải là một object JSON.")
-        if "speed" in render_config:
-            try:
-                render_config["speed"] = normalize_render_speed(render_config["speed"])
-            except ValueError as exc:
-                raise HTTPException(400, str(exc)) from exc
-        filtered["render_config_json"] = json.dumps(render_config, ensure_ascii=False)
+        try:
+            render_config = validate_render_config(render_config, filtered.get('render_mode'))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        filtered['render_config_json'] = json.dumps(render_config, ensure_ascii=False, allow_nan=False)
 
     try:
         interval = int(updates.get("schedule_interval_minutes") or 0)
@@ -1385,10 +1544,13 @@ def api_bulk_update_queue(data: Dict[str, Any] = Body(...)):
     try:
         conn.execute("BEGIN IMMEDIATE")
         marks = ",".join("?" for _ in ids)
+        _ensure_queue_items_idle(conn, ids, "sửa hàng loạt")
         rows = conn.execute(f"SELECT * FROM video_queue WHERE id IN ({marks})", ids).fetchall()
         current_by_id = {int(row["id"]): dict(row) for row in rows}
         existing_ids = set(current_by_id)
         missing_ids = [item_id for item_id in ids if item_id not in existing_ids]
+        if missing_ids:
+            raise HTTPException(404, f'Video không còn tồn tại: {missing_ids}')
         target_keys = {
             "target_type", "target_channel_id", "target_group_name", "target_group_names",
             "target_group_names_json", "target_profile_name",
@@ -1434,11 +1596,7 @@ def api_bulk_update_queue(data: Dict[str, Any] = Body(...)):
                 continue
             item_updates = dict(filtered)
             item_updates.pop("schedule_time", None)
-            if "target_group_names" in item_updates or "target_group_names_json" in item_updates:
-                raw_groups = item_updates.pop("target_group_names", item_updates.get("target_group_names_json"))
-                item_updates.update(_queue_target_updates(conn, {"target_group_names": raw_groups}, current))
-                item_updates.pop("target_group_names_json", None)
-            elif dest_changed:
+            if dest_changed:
                 item_updates = _queue_target_updates(conn, item_updates, current)
 
             if base_dt:
@@ -1480,6 +1638,7 @@ def api_bulk_update_queue(data: Dict[str, Any] = Body(...)):
             safe = {key: value for key, value in item_updates.items() if key in allowed or key in {
                 "target_group_names_json", "assigned_channel_id", "assigned_group_names_json"
             }}
+            monitor_policy.manual_override(current_by_id[item_id], safe)
             changed = {key: value for key, value in safe.items() if current_by_id[item_id].get(key) != value}
             if not changed:
                 continue
@@ -1591,6 +1750,7 @@ def api_edit_queue_metadata(data: Dict[str, Any] = Body(...)):
         row = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
         if not row:
             raise HTTPException(404, f"Không tìm thấy video #{item_id} trong hàng đợi.")
+        _ensure_queue_items_idle(conn, [item_id], "sửa metadata")
         current = dict(row)
         updates: Dict[str, Any] = {
             "title": (data.get("title") or "").strip(),
@@ -1677,6 +1837,7 @@ def api_edit_queue_metadata(data: Dict[str, Any] = Body(...)):
             "target_channel_id", "target_group_name", "target_group_names_json", "target_type",
             "target_profile_name", "assigned_channel_id", "assigned_group_names_json", "group_schema_version",
         }}
+        monitor_policy.manual_override(current, safe)
         changed = {key: value for key, value in safe.items() if current.get(key) != value}
         if changed:
             columns = ", ".join(f"{key} = ?" for key in changed)
@@ -1779,7 +1940,7 @@ def api_auto_schedule(data: Dict[str, Any] = Body(...)):
         for item_id in normalized:
             curr_str = curr.strftime("%Y-%m-%d %H:%M:%S")
             conn.execute(
-                "UPDATE video_queue SET schedule_time = ?, visibility = 'schedule', is_premiere = ? "
+                "UPDATE video_queue SET monitor_metadata_policy_json='', schedule_time = ?, visibility = 'schedule', is_premiere = ? "
                 "WHERE id = ? AND COALESCE(claim_token, '') = ''",
                 (curr_str, is_premiere, item_id),
             )
@@ -1814,6 +1975,7 @@ def api_auto_schedule(data: Dict[str, Any] = Body(...)):
 def api_export_csv(project: str = "Default"):
     import csv
     import io
+    from csv_safety import ENCODING_COLUMN, ENCODING_VERSION, encode_csv_cell
     from fastapi.responses import Response
 
     conn = get_conn()
@@ -1834,14 +1996,15 @@ def api_export_csv(project: str = "Default"):
         "ID", "Platform", "Title", "Description", "Tags", "Duration", "Source_URL",
         "Render_Mode", "Upload_To", "Status", "Published_URL",
         "Visibility", "Schedule_Time", "Made_For_Kids", "Age_Restriction", "Altered_Content",
+        ENCODING_COLUMN,
     ])
     for r in rows:
-        writer.writerow([
+        writer.writerow([encode_csv_cell(value) for value in [
             r["id"], r["platform"], r["title"], r["description"], r["tags"], r["duration"],
             r["source_url"], r["render_mode"], r["upload_to"], r["status"], r["published_url"],
             r["visibility"] or "public", r["schedule_time"] or "",
             r["made_for_kids"] or 0, r["age_restriction"] or 0, r["altered_content"] or 0,
-        ])
+        ]] + [ENCODING_VERSION])
 
     csv_data = "\ufeff" + output.getvalue()
     from urllib.parse import quote
@@ -2255,6 +2418,7 @@ def api_export_excel(project: str = "Default", ids: str = ""):
     ws.freeze_panes = "A2"
 
     for row_idx, item in enumerate(rows, start=2):
+        item = dict(item)
         ch = channels.get(int(item["target_channel_id"])) if item["target_channel_id"] else None
         values = {
             "id": item["id"],
@@ -2517,6 +2681,9 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int],
                 _row_warnings.append(message)
                 warn(f"Dòng {_row['row']} (#{_item_id}): {message}")
 
+            if _blocked_queue_rows(conn, [item_id]):
+                row_error("Video đang được giữ hoặc cần đối soát; không thể sửa bằng Excel.")
+
             title = values.get("title")
             if title is not None and str(title).strip() != "":
                 title_text = str(title).strip()
@@ -2741,6 +2908,7 @@ def _excel_import_worker(raw: bytes, project_name: str, selected_ids: List[int],
             ))
             current = current_by_id[item_id]
             _ensure_destination_not_active(current, destination_changed)
+            monitor_policy.manual_override(current, safe_updates)
             changed = {k: v for k, v in safe_updates.items() if current.get(k) != v}
             if not changed:
                 continue
@@ -3090,9 +3258,69 @@ async def api_import_excel(
 # ==========================================================
 # AI DỊCH THUẬT, VIẾT LẠI SEO & BIÊN TẬP HÀNG LOẠT
 # ==========================================================
+_AI_EDIT_QUEUE_FIELDS = (
+    "id", "created_at", "project_name", "source_type", "platform", "source_url", "post_id",
+    "target_type", "target_channel_id", "target_profile_name", "target_group_name",
+    "target_group_names_json", "group_schema_version", "assigned_channel_id", "assigned_group_names_json",
+    "title", "description", "tags", "upload_to", "visibility", "schedule_time", "option_group_id",
+    "made_for_kids", "altered_content", "age_restriction", "is_premiere", "render_mode", "render_config_json",
+    "cut_start", "cut_end", "resolution", "emulate_mobile", "manual_reupload_authorized",
+    "manual_reupload_reason", "monitor_metadata_policy_json", "input_video_path", "output_video_path",
+    "thumbnail_path", "content_key", "status", "claim_token", "published_url", "last_attempt_id", "error_message",
+)
+
+
+def _ai_edit_snapshot(conn, item):
+    """Compare semantic state, including reused attempts; this is not a lifecycle epoch."""
+    attempt = conn.execute(
+        "SELECT * FROM upload_attempts WHERE queue_id=? ORDER BY attempt_no DESC,id DESC LIMIT 1",
+        (item["id"],),
+    ).fetchone()
+    return ({field: item[field] for field in _AI_EDIT_QUEUE_FIELDS}, dict(attempt) if attempt else None)
+
+
+def _ai_edit_failure(item_id, code, message):
+    return {"id": int(item_id), "code": code, "error": message}
+
+
+def _commit_ai_edit(item, snapshot, metadata, fields):
+    """Check ownership and compare the original read in the same short write transaction."""
+    with closing(get_conn()) as conn:
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM video_queue WHERE id=?", (item["id"],)).fetchone()
+            if row is None:
+                return _ai_edit_failure(item["id"], "item_missing", "Video không còn trong hàng đợi.")
+            try:
+                _ensure_queue_items_idle(conn, [item["id"]], "biên tập AI")
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
+                return _ai_edit_failure(item["id"], "item_guarded", "Video đang xử lý hoặc cần đối soát; kết quả lần này không được ghi.")
+            if _ai_edit_snapshot(conn, row) != snapshot:
+                return _ai_edit_failure(item["id"], "stale_snapshot", "Dữ liệu video đã thay đổi; hãy tải lại trước khi biên tập tiếp.")
+            # fields comes only from the fixed title/description/tags allowlist below.
+            assignments = ", ".join(f"{field}=?" for field in fields)
+            cur = conn.execute(f"UPDATE video_queue SET {assignments} WHERE id=?",
+                               (*[metadata[field] for field in fields], item["id"]))
+            if cur.rowcount != 1:
+                raise RuntimeError("AI edit lost its locked queue row.")
+            conn.commit()
+            return None
+        except sqlite3.OperationalError as exc:
+            # Do not hide disk/schema/corruption errors as ordinary item conflicts.
+            if str(exc).lower() not in {"database is locked", "database table is locked", "database is busy"}:
+                raise
+            return _ai_edit_failure(item["id"], "db_write_failed", "Cơ sở dữ liệu đang bận; kết quả lần này không được ghi.")
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
+
+
 @app.post("/api/queue/ai-process")
 def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
-    ids = data.get("ids") or []
+    ids = data.get("ids", [])
     mode = data.get("mode") or "rewrite_seo"  # 'translate' | 'rewrite_seo' | 'batch_edit'
     provider = data.get("provider") or "gemini"
     target_lang = data.get("target_lang") or "Tiếng Việt"
@@ -3107,6 +3335,7 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
         raise HTTPException(400, "Prompt tùy chỉnh không được vượt quá 4000 ký tự.")
     if not isinstance(ids, list) or len(ids) > 5000 or any(type(item_id) is not int or item_id <= 0 for item_id in ids):
         raise HTTPException(400, "Danh sách video phải là mảng ID nguyên dương, tối đa 5000 mục.")
+    ids = list(dict.fromkeys(ids))
 
     # Tham số cho batch_edit
     edit_field = data.get("edit_field") or "title"
@@ -3125,63 +3354,69 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
     fallback_count = 0
     links_preserved = 0
     failed_items = []
-    conn = get_conn()
-    try:
+    # Fetch rows and attempt snapshots in one consistent read, then release it before provider work.
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
         if ids:
             placeholders = ",".join("?" for _ in ids)
-            rows = conn.execute(f"SELECT * FROM video_queue WHERE id IN ({placeholders})", ids).fetchall()
+            rows = conn.execute(f"SELECT * FROM video_queue WHERE id IN ({placeholders}) ORDER BY id", ids).fetchall()
         else:
-            project_name = data.get("project_name") or "Default"
-            rows = conn.execute("SELECT * FROM video_queue WHERE project_name = ?", (project_name,)).fetchall()
-
+            project_name = data.get("project_name", "Default")
+            if project_name is None or project_name == "":
+                project_name = "Default"
+            if not isinstance(project_name, str) or len(project_name) > 200 or "\x00" in project_name:
+                raise HTTPException(400, "Tên dự án phải là văn bản tối đa 200 ký tự và không chứa NUL.")
+            rows = conn.execute("SELECT * FROM video_queue WHERE project_name = ? ORDER BY id", (project_name,)).fetchall()
         _ensure_queue_items_idle(conn, [int(r["id"]) for r in rows], "biên tập AI")
+        items = [(dict(row), _ai_edit_snapshot(conn, row)) for row in rows]
+    found = {item["id"] for item, _ in items}
+    failed_items.extend(_ai_edit_failure(item_id, "item_missing", "Video không còn trong hàng đợi.")
+                        for item_id in ids if item_id not in found)
 
-        for r in rows:
-            item = dict(r)
-            if mode == "batch_edit":
-                old_val = item.get(edit_field) or ""
-                new_val = apply_batch_text_edit(old_val, edit_op, find_str, replace_str)
-                cur = conn.execute(
-                    f"UPDATE video_queue SET {edit_field} = ? WHERE id = ? AND COALESCE(claim_token, '') = ''",
-                    (new_val, item["id"]),
+    for item, snapshot in items:
+        fields = (edit_field,) if mode == "batch_edit" else ("title", "description", "tags")
+        if mode == "batch_edit":
+            res = {field: item[field] or "" for field in ("title", "description", "tags")}
+            res[edit_field] = apply_batch_text_edit(res[edit_field], edit_op, find_str, replace_str)
+        else:
+            try:
+                res = ai_optimize_youtube_metadata(
+                    title=item.get("title") or "", description=item.get("description") or "",
+                    action=mode, provider=provider, target_lang=target_lang, custom_prompt=custom_prompt,
                 )
-                if cur.rowcount != 1:
-                    failed_items.append({"id": int(item["id"]), "error": "Video đã được worker giữ trong lúc xử lý; bỏ qua."})
-                    continue
-                updated += 1
-            else:
-                try:
-                    res = ai_optimize_youtube_metadata(
-                        title=item.get("title") or "",
-                        description=item.get("description") or "",
-                        action=mode,
-                        provider=provider,
-                        target_lang=target_lang,
-                        custom_prompt=custom_prompt,
-                    )
-                except SourceLinksTooLongError as exc:
-                    failed_items.append({"id": int(item["id"]), "error": str(exc)})
-                    continue
-                cur = conn.execute(
-                    "UPDATE video_queue SET title = ?, description = ?, tags = ? "
-                    "WHERE id = ? AND COALESCE(claim_token, '') = ''",
-                    (res["title"], res["description"], res["tags"], item["id"]),
-                )
-                if cur.rowcount != 1:
-                    failed_items.append({"id": int(item["id"]), "error": "Video đã được worker giữ trong lúc xử lý; bỏ qua."})
-                    continue
-                actual_provider = str(res.get("provider_used") or provider)
-                provider_counts[actual_provider] = provider_counts.get(actual_provider, 0) + 1
-                fallback_count += int(bool(res.get("fallback")))
-                links_preserved += int(res.get("links_preserved") or 0)
-                updated += 1
-
-        conn.commit()
-    finally:
-        conn.close()
+            except SourceLinksTooLongError:
+                failed_items.append(_ai_edit_failure(item["id"], "source_links_too_long", "Không thể giữ đủ link nguồn trong giới hạn mô tả."))
+                continue
+            except (sqlite3.Error, AssertionError):
+                raise
+            except Exception:
+                # Provider errors can contain URLs/credentials; keep them out of API responses and logs.
+                failed_items.append(_ai_edit_failure(item["id"], "provider_failed", "Nhà cung cấp không xử lý được video; kết quả lần này không được ghi."))
+                continue
+        try:
+            if not isinstance(res, dict) or any(not isinstance(res.get(field), str) for field in ("title", "description", "tags")):
+                raise ValueError("Kết quả phải có tiêu đề, mô tả và tags dạng văn bản.")
+            metadata = validate_metadata_fields(res)
+        except ValueError as exc:
+            failed_items.append(_ai_edit_failure(item["id"], "invalid_metadata", str(exc)))
+            continue
+        failure = _commit_ai_edit(item, snapshot, metadata, fields)
+        if failure:
+            failed_items.append(failure)
+            continue
+        updated += 1
+        if mode != "batch_edit":
+            actual_provider = res.get("provider_used")
+            if actual_provider not in ("gemini", "openai", "deepseek", "google_translate"):
+                actual_provider = provider
+            provider_counts[actual_provider] = provider_counts.get(actual_provider, 0) + 1
+            fallback_count += int(bool(res.get("fallback")))
+            count = res.get("links_preserved")
+            links_preserved += count if type(count) is int and count >= 0 else 0
     if mode == "batch_edit":
-        add_log("AI", f"Đã biên tập thủ công {updated} video.", "SUCCESS")
-        return {"ok": True, "updated": updated}
+        add_log("AI", f"Đã biên tập thủ công {updated} video; không cập nhật {len(failed_items)} video.",
+                "WARNING" if failed_items else "SUCCESS")
+        return {"ok": not failed_items, "updated": updated, "failed": failed_items}
     summary = ", ".join(f"{name}: {count}" for name, count in sorted(provider_counts.items())) or "không có video"
     add_log(
         "AI",
@@ -3202,6 +3437,74 @@ def api_ai_process_queue(data: Dict[str, Any] = Body(...)):
 # ==========================================================
 # ĐIỀU KHIỂN PIPELINE (DOWNLOAD -> RENDER -> UPLOAD)
 # ==========================================================
+def _validated_upload_receipt_and_cycle(conn, item_id: int):
+    """Return (receipt, has_cycle_attempts) for the current upload cycle, or reject ambiguous evidence.
+
+    An explicit reupload authorization begins a new cycle. Older upload IDs
+    remain in the audit trail without binding a newly authorized upload.
+    """
+    attempts = conn.execute(
+        "SELECT id,attempt_type,outcome,channel_id,evidence_json FROM upload_attempts "
+        "WHERE queue_id=? ORDER BY id DESC", (item_id,),
+    ).fetchall()
+    boundary = next((row["id"] for row in attempts
+                     if row["attempt_type"] == "manual_reupload" and row["outcome"] == "Authorized"), 0)
+    receipts = []
+    has_cycle_attempts = False
+    for attempt in attempts:
+        if attempt["id"] <= boundary:
+            break
+        has_cycle_attempts = True
+        if attempt["evidence_json"] == "{}":
+            continue  # Exact legacy/manual sentinel; malformed documents are not legacy.
+        try:
+            receipt = read_evidence(attempt["evidence_json"], item_id, attempt["id"], attempt["channel_id"])
+        except EvidenceError:
+            raise HTTPException(409, {"code": "UPLOAD_RECEIPT_INVALID", "message":
+                "Bằng chứng upload không hợp lệ; giữ video để đối soát, chưa thể xác nhận đã đăng."})
+        if receipt is None:
+            continue
+        receipts.append(receipt)
+    if not receipts:
+        return None, has_cycle_attempts
+    if len({(row["video_id"], row["channel_id"]) for row in receipts}) != 1:
+        raise HTTPException(409, {"code": "UPLOAD_RECEIPT_CONFLICT", "message":
+            "Có nhiều Video ID hoặc kênh trong cùng lượt đối soát; cần kiểm tra bằng chứng trước khi xác nhận."})
+    return receipts[0], has_cycle_attempts
+
+
+def validated_upload_receipt(conn, item_id: int):
+    return _validated_upload_receipt_and_cycle(conn, item_id)[0]
+
+
+@app.post("/api/queue/{item_id}/recheck-receipt")
+def api_recheck_upload_receipt(item_id: int):
+    """Read-only exact-ID YouTube API recheck on the stored upload receipt."""
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT id, status, claim_token FROM video_queue WHERE id = ?", (item_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Không tìm thấy video trong hàng đợi.")
+        if str(row["claim_token"] or "").strip():
+            raise HTTPException(409, "Video đang được worker xử lý; hãy chờ worker kết thúc.")
+        receipt, _ = _validated_upload_receipt_and_cycle(conn, item_id)
+        if receipt is None:
+            raise HTTPException(409, {"code": "UPLOAD_RECEIPT_MISSING", "message":
+                "Lượt này chưa có Video ID trong bằng chứng upload để đọc lại tự động."})
+        if receipt["backend"] != "youtube_api":
+            raise HTTPException(409, {"code": "RECEIPT_RECHECK_UNSUPPORTED_BACKEND", "message":
+                "Đọc lại tự động qua API chỉ hỗ trợ lượt đăng bằng YouTube Data API."})
+        channel_row = conn.execute("SELECT * FROM youtube_channels WHERE id = ?", (receipt["channel_id"],)).fetchone()
+        if not channel_row:
+            raise HTTPException(409, {"code": "UPLOAD_RECEIPT_CHANNEL_MISSING", "message":
+                "Không tìm thấy kênh đích gắn với receipt này."})
+        channel = dict(channel_row)
+    try:
+        report = recheck_api_video_receipt(channel, receipt["video_id"], receipt["expected"])
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(502, {"code": "RECEIPT_RECHECK_FAILED", "message": redact_secrets(str(exc))}) from None
+    return {"ok": True, "queue_id": item_id, "receipt_channel_id": receipt["channel_id"], **report}
+
+
 @app.post("/api/queue/{item_id}/manual-reupload")
 def api_manual_reupload(item_id: int, data: Dict[str, Any] = Body(...)):
     """Ghi nhận quyết định đối soát hoặc cho phép đăng lại đúng một item."""
@@ -3234,13 +3537,54 @@ def api_manual_reupload(item_id: int, data: Dict[str, Any] = Body(...)):
             "SELECT content_key, channel_id, state FROM content_reservations WHERE queue_id = ?",
             (item_id,),
         ).fetchall()
+        if queue_requires_review(conn, item_id):
+            status = "NeedsReview"
         if any(str(reservation["state"] or "") == "Active" for reservation in reservations):
             conn.rollback()
             raise HTTPException(409, "Reservation vẫn đang hoạt động; chưa thể thay đổi kết quả upload.")
 
+        receipt, has_cycle_attempts = (
+            _validated_upload_receipt_and_cycle(conn, item_id)
+            if action == "confirmed_published"
+            else (None, False)
+        )
+        if receipt and published_url != receipt["video_url"]:
+            conn.rollback()
+            raise HTTPException(409, {"code": "UPLOAD_RECEIPT_URL_MISMATCH", "message":
+                "URL xác nhận không khớp Video ID đã nhận từ YouTube. Hãy dùng đúng URL trong bằng chứng upload."})
+        if action == "confirmed_published" and item.get("status") == "Completed":
+            latest = conn.execute(
+                "SELECT id,attempt_type,outcome,published_url,channel_id FROM upload_attempts "
+                "WHERE queue_id=? ORDER BY id DESC LIMIT 1", (item_id,),
+            ).fetchone()
+            if (latest and latest["attempt_type"] == "manual_review" and latest["outcome"] == "ConfirmedPublished"
+                    and item.get("last_attempt_id") == latest["id"]
+                    and normalize_published_video_url(item.get("published_url") or "") == published_url
+                    and normalize_published_video_url(latest["published_url"] or "") == published_url
+                    and (not receipt or latest["channel_id"] == receipt["channel_id"])
+                    and not reservations):
+                conn.rollback()
+                return {"ok": True, "replayed": True, "id": item_id,
+                        "message": "Quyết định xác nhận này đã được ghi nhận; không tạo thêm lượt đăng hoặc lịch sử."}
+        if (action == "confirmed_published" and receipt is None and has_cycle_attempts
+                and data.get("acknowledge_legacy_no_receipt") is not True):
+            conn.rollback()
+            raise HTTPException(400, {"code": "LEGACY_RECEIPT_ACK_REQUIRED", "message":
+                "Lượt upload này chưa có receipt Video ID tự động. Hãy kiểm tra đúng video/kênh trên Studio và xác nhận rõ đối soát thủ công."})
+
         channel_id = next((int(r["channel_id"]) for r in reservations), None)
         if channel_id is None and item.get("target_channel_id"):
             channel_id = int(item["target_channel_id"])
+        if channel_id is None and item.get("assigned_channel_id"):
+            channel_id = int(item["assigned_channel_id"])
+        if receipt:
+            reserved_channels = {int(row["channel_id"]) for row in reservations}
+            if ((reserved_channels and reserved_channels != {receipt["channel_id"]})
+                    or (channel_id is not None and channel_id != receipt["channel_id"])):
+                conn.rollback()
+                raise HTTPException(409, {"code": "UPLOAD_RECEIPT_CHANNEL_MISMATCH", "message":
+                    "Kênh đối soát không khớp kênh đã nhận video; hãy kiểm tra lại assignment và receipt."})
+            channel_id = receipt["channel_id"]
         source_post_id = str(item.get("post_id") or "").strip()
         if not source_post_id:
             normalized_url = normalize_source_url(item.get("source_url"))
@@ -3365,6 +3709,8 @@ def api_manual_reupload(item_id: int, data: Dict[str, Any] = Body(...)):
         conn.commit()
         return {"ok": True, "message": "Đã ghi nhận video đã đăng và giữ lịch sử chống trùng.", "id": item_id}
     except HTTPException:
+        if conn.in_transaction:
+            conn.rollback()
         raise
     except Exception:
         conn.rollback()
@@ -3390,6 +3736,9 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
     conn = get_conn()
     try:
         placeholders = ",".join("?" * len(ids))
+        held = [item_id for item_id in ids if queue_requires_review(conn, item_id)]
+        if held:
+            raise HTTPException(409, f"Video cần đối soát trước khi chạy: {held}")
         rows = conn.execute(
             f"SELECT id, title, status, published_url FROM video_queue WHERE id IN ({placeholders})",
             ids,
@@ -3414,7 +3763,7 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
         result = pipeline_manager.start_batch(
             ids, do_dl, do_rd, do_up, preview_token=preview_token if isinstance(preview_token, str) else "",
         )
-        if result.get("code") == "PREVIEW_STALE":
+        if result.get("code") in {"PREVIEW_STALE", "REVIEW_REQUIRED"}:
             return JSONResponse({**result, "detail": result["message"]}, status_code=409)
         return result
 
@@ -3447,6 +3796,8 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
         )
 
     result = pipeline_manager.start_batch(run_ids, do_dl, do_rd, do_up, force_reupload=False)
+    if result.get("code") == "REVIEW_REQUIRED":
+        return JSONResponse({**result, "detail": result["message"]}, status_code=409)
     if skipped:
         result["skipped"] = skipped
         result["message"] = (result.get("message") or "") + f" Bỏ qua {len(skipped)} video đã đăng/đang upload dở."
@@ -3622,123 +3973,127 @@ def api_list_profiles():
     return get_all_profiles()
 
 
-@app.get("/api/profiles/{profile_name}/channels")
+@app.get("/api/profiles/{profile_name:path}/channels")
 def api_get_profile_channels(profile_name: str):
     return get_channels_by_profile(profile_name)
 
 
-@app.post("/api/profiles")
+def _validated_crud_input(schema, data, *, partial=False):
+    try:
+        return parse_config_input(schema, data, partial=partial)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _binding_references(conn, channel_ids, profile_name=''):
+    try:
+        return binding_references(conn, channel_ids, profile_name)
+    except ValueError as exc:
+        raise HTTPException(409, 'Liên kết nhóm không hợp lệ. Hãy kiểm tra đích trong hàng đợi trước.') from exc
+
+
+def _ensure_binding_deletable(conn, channel_ids, profile_name=''):
+    queue_ids, monitors, evidence = _binding_references(conn, channel_ids, profile_name)
+    if queue_ids or monitors or evidence:
+        details = []
+        if queue_ids:
+            details.append('video ' + ', '.join(f'#{i}' for i in queue_ids[:5]))
+        if monitors:
+            details.append('Monitor ' + ', '.join(f"#{m['id']}" for m in monitors[:5]))
+        if evidence:
+            details.append('lịch sử đăng hoặc lượt duyệt')
+        raise HTTPException(409, 'Không thể xóa vì còn liên kết: ' + '; '.join(details) + '. Hãy đối soát hoặc đổi đích trước.')
+
+
+@app.post('/api/profiles')
 def api_create_profile(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Tên Profile không được để trống.")
-
-    check_conn = get_conn()
-    existing = check_conn.execute(
-        "SELECT source, antidetect_profile_id FROM chrome_profiles WHERE name = ?",
-        (name,),
-    ).fetchone()
-    check_conn.close()
-    if existing and (
-        str(existing["source"] or "") == "Antidetect"
-        or str(existing["antidetect_profile_id"] or "").strip()
-    ):
-        raise HTTPException(
-            409,
-            "Tên này đang thuộc Profile đồng bộ từ Antidetect. "
-            "Không thể ghi đè bằng Profile Chrome cục bộ — hãy chọn tên khác.",
-        )
-
+    values = _validated_crud_input(ProfileCreate, data)
+    name, proxy, note = values['name'], values['proxy'], values['note']
     from config import APP_PROFILES_DIR
-    p_path = str(APP_PROFILES_DIR / name)
-    Path(p_path).mkdir(parents=True, exist_ok=True)
-    proxy = (data.get("proxy") or "").strip()
-    note = (data.get("note") or "").strip()
+    root = APP_PROFILES_DIR.resolve()
+    candidate = root / name
+    if candidate.resolve().parent != root:
+        raise HTTPException(400, 'Thư mục Profile phải nằm trực tiếp trong thư mục Profile của ứng dụng.')
+    created_directory = False
+    try:
+        with closing(get_conn()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            known_names = [r[0] for r in conn.execute('SELECT name FROM chrome_profiles UNION SELECT profile_name FROM youtube_channels')]
+            if any(str(known).casefold() == name.casefold() for known in known_names):
+                raise HTTPException(409, 'Tên Profile đã có cấu hình hoặc kênh liên kết. Hãy dùng chức năng sửa hoặc chọn tên khác.')
+            known_paths = [r[0] for r in conn.execute('SELECT path FROM chrome_profiles UNION SELECT profile_path FROM youtube_channels')]
+            if any(path and not str(path).startswith('antidetect://') and
+                   str(Path(path).resolve()).casefold() == str(candidate).casefold() for path in known_paths):
+                raise HTTPException(409, 'Thư mục này đã có Profile hoặc kênh sử dụng.')
+            root.mkdir(parents=True, exist_ok=True)
+            if any(child.name.casefold() == name.casefold() for child in root.iterdir()):
+                raise HTTPException(409, 'Thư mục Profile đã tồn tại trên đĩa. Hãy chọn tên khác để bảo toàn phiên Chrome cũ.')
+            try:
+                candidate.mkdir()
+            except FileExistsError as exc:
+                raise HTTPException(409, 'Thư mục Profile đã tồn tại trên đĩa.') from exc
+            created_directory = True
+            conn.execute("INSERT INTO chrome_profiles(name,path,proxy,source,note,antidetect_profile_id) VALUES(?,?,?,'Local',?,'')",
+                         (name, str(candidate), proxy, note))
+            cursor = conn.execute("""
+                INSERT INTO youtube_channels(name,handle,group_name,upload_mode,profile_name,profile_path,proxy,emulate_mobile,status,note)
+                VALUES(?,?,'Mặc định','playwright',?,?,?,0,'Ready','Kênh chính theo Profile')
+                """, (f'YT - {name}', f"@{name.lower().replace(' ', '')}", name, str(candidate), proxy))
+            set_channel_group_memberships(conn, int(cursor.lastrowid), ['Mặc định'])
+    except BaseException:
+        if created_directory:
+            try:
+                candidate.rmdir()  # Only the empty directory created by this request.
+            except OSError:
+                pass
+        raise
+    return {'ok': True, 'name': name, 'path': str(candidate)}
 
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO chrome_profiles
-            (name, path, proxy, source, note, antidetect_profile_id)
-        VALUES (?, ?, ?, 'Local', ?, '')
-        ON CONFLICT(name) DO UPDATE SET path=excluded.path, proxy=excluded.proxy,
-            source=excluded.source, note=excluded.note, antidetect_profile_id=excluded.antidetect_profile_id
-        """,
-        (name, p_path, proxy, note),
-    )
-    chk = conn.execute("SELECT id FROM youtube_channels WHERE profile_name = ?", (name,)).fetchone()
-    if not chk:
-        cur = conn.execute(
-            """
-            INSERT INTO youtube_channels (name, handle, group_name, upload_mode, profile_name, profile_path, proxy, emulate_mobile, status, note)
-            VALUES (?, ?, 'Default', 'playwright', ?, ?, ?, 0, 'Ready', 'Kênh chính theo Profile')
-            """,
-            (f"YT - {name}", f"@{name.lower().replace(' ', '')}", name, p_path, proxy),
-        )
-        set_channel_group_memberships(conn, int(cur.lastrowid), ["Mặc định"])
-    conn.commit()
-    conn.close()
-    return {"ok": True, "name": name, "path": p_path}
 
-
-@app.put("/api/profiles/{profile_name}")
+@app.put('/api/profiles/{profile_name:path}')
 def api_update_profile(profile_name: str, data: Dict[str, Any] = Body(...)):
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT name, source, antidetect_profile_id FROM chrome_profiles WHERE name = ?",
-        (profile_name,),
-    ).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "Không tìm thấy Profile Chrome này.")
-    is_antidetect = (
-        str(row["source"] or "") == "Antidetect"
-        or bool(str(row["antidetect_profile_id"] or "").strip())
-    )
-    if "proxy" in data and is_antidetect:
-        conn.close()
-        raise HTTPException(
-            400,
-            "Proxy của Profile Antidetect do Antidetect quản lý — hãy sửa trong Antidetect.",
-        )
-    if "proxy" in data and "***" not in str(data.get("proxy") or ""):
-        proxy = (data.get("proxy") or "").strip()
-        conn.execute("UPDATE chrome_profiles SET proxy = ? WHERE name = ?", (proxy, profile_name))
-        # Quy tắc an toàn: kênh thuộc Profile phải đi cùng Proxy với lúc đăng nhập thủ công
-        conn.execute("UPDATE youtube_channels SET proxy = ? WHERE profile_name = ?", (proxy, profile_name))
-    if "note" in data:
-        conn.execute(
-            "UPDATE chrome_profiles SET note = ? WHERE name = ?",
-            ((data.get("note") or "").strip(), profile_name),
-        )
-    conn.commit()
-    conn.close()
-    add_log("Profile", f"Đã cập nhật cấu hình Profile Chrome '{profile_name}'.", "INFO")
-    return {"ok": True}
+    values = _validated_crud_input(ProfileUpdate, data, partial=True)
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM chrome_profiles WHERE name=?', (profile_name,)).fetchone()
+        if row is None:
+            raise HTTPException(404, 'Không tìm thấy Profile Chrome này.')
+        is_antidetect = str(row['source'] or '').casefold() == 'antidetect' or bool(row['antidetect_profile_id'])
+        if 'proxy' in values and is_antidetect:
+            raise HTTPException(400, 'Proxy của Profile Antidetect do Antidetect quản lý — hãy sửa trong Antidetect.')
+        if 'proxy' in values and '***' not in values['proxy']:
+            channel_ids = [r[0] for r in conn.execute('SELECT id FROM youtube_channels WHERE profile_name=?', (profile_name,))]
+            queue_ids, monitors, evidence = _binding_references(conn, channel_ids, profile_name)
+            _ensure_queue_items_idle(conn, queue_ids, 'đổi proxy Profile')
+            if 'content_reservations' in evidence:
+                raise HTTPException(409, 'Profile còn reservation cần đối soát trước khi đổi proxy.')
+            if any(m['is_running'] or pipeline_manager._monitor_handles_alive(m['id']) for m in monitors):
+                raise HTTPException(409, 'Hãy dừng Monitor đang sử dụng Profile trước khi đổi proxy.')
+            conn.execute('UPDATE chrome_profiles SET proxy=? WHERE name=?', (values['proxy'], profile_name))
+            conn.execute('UPDATE youtube_channels SET proxy=? WHERE profile_name=?', (values['proxy'], profile_name))
+        if 'note' in values:
+            conn.execute('UPDATE chrome_profiles SET note=? WHERE name=?', (values['note'], profile_name))
+    add_log('Profile', f"Đã cập nhật cấu hình Profile Chrome '{profile_name}'.", 'INFO')
+    return {'ok': True}
 
 
-@app.delete("/api/profiles/{profile_name}")
+@app.delete('/api/profiles/{profile_name:path}')
 def api_delete_profile(profile_name: str):
-    """Xóa Profile khỏi hệ thống (CHỈ xóa bản ghi database, tuyệt đối không xóa thư mục Chrome trên ổ đĩa)."""
-    conn = get_conn()
-    row = conn.execute("SELECT path FROM chrome_profiles WHERE name = ?", (profile_name,)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "Không tìm thấy Profile Chrome này.")
-    conn.execute(
-        "DELETE FROM channel_group_memberships WHERE channel_id IN "
-        "(SELECT id FROM youtube_channels WHERE profile_name = ?)",
-        (profile_name,),
-    )
-    conn.execute("DELETE FROM youtube_channels WHERE profile_name = ?", (profile_name,))
-    conn.execute("DELETE FROM chrome_profiles WHERE name = ?", (profile_name,))
-    conn.commit()
-    conn.close()
-    add_log("Profile", f"Đã xóa Profile Chrome '{profile_name}' khỏi hệ thống (giữ nguyên thư mục trên đĩa).", "WARNING")
-    return {"ok": True}
+    """Delete unused DB bindings atomically; retain all Chrome files."""
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if not conn.execute('SELECT 1 FROM chrome_profiles WHERE name=?', (profile_name,)).fetchone():
+            raise HTTPException(404, 'Không tìm thấy Profile Chrome này.')
+        channel_ids = [r[0] for r in conn.execute('SELECT id FROM youtube_channels WHERE profile_name=?', (profile_name,))]
+        _ensure_binding_deletable(conn, channel_ids, profile_name)
+        conn.execute('DELETE FROM channel_group_memberships WHERE channel_id IN (SELECT id FROM youtube_channels WHERE profile_name=?)', (profile_name,))
+        conn.execute('DELETE FROM youtube_channels WHERE profile_name=?', (profile_name,))
+        conn.execute('DELETE FROM chrome_profiles WHERE name=?', (profile_name,))
+    add_log('Profile', f"Đã xóa Profile Chrome '{profile_name}' khỏi hệ thống (giữ nguyên thư mục trên đĩa).", 'WARNING')
+    return {'ok': True}
 
 
-@app.post("/api/profiles/{profile_name}/open-browser")
+@app.post("/api/profiles/{profile_name:path}/open-browser")
 def api_open_profile_browser(profile_name: str):
     prof = get_profile_binding(profile_name)
     if not prof:
@@ -3759,7 +4114,14 @@ def api_open_profile_browser(profile_name: str):
         raise HTTPException(500, f"Lỗi khi mở Profile: {e}")
 
 
-@app.post("/api/profiles/{profile_name}/check-login")
+def _check_profile_probe_binding(conn, profile_name, before):
+    current = conn.execute('SELECT * FROM chrome_profiles WHERE name=?', (profile_name,)).fetchone()
+    fields = ('path', 'proxy', 'source', 'antidetect_profile_id')
+    if current is None or any((current[key] or '') != (before.get(key) or '') for key in fields):
+        raise HTTPException(409, 'Profile đã bị xóa hoặc thay đổi trong lúc kiểm tra. Hãy tải lại và thử lại.')
+
+
+@app.post("/api/profiles/{profile_name:path}/check-login")
 def api_check_profile_login(profile_name: str):
     """Mở Chrome Profile ở vị trí khuất để kiểm tra phiên đăng nhập Google (kèm Proxy nếu có)."""
     prof = get_profile_binding(profile_name)
@@ -3777,14 +4139,14 @@ def api_check_profile_login(profile_name: str):
         raise HTTPException(500, f"Lỗi khi mở Profile để kiểm tra: {e}")
 
     new_status = "Đã đăng nhập" if probe.get("logged_in") else "Chưa đăng nhập"
-    conn = get_conn()
-    conn.execute(
-        "UPDATE chrome_profiles SET login_status = ?, last_login_check = ? WHERE name = ?",
-        (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), profile_name),
-    )
-    conn.execute("UPDATE youtube_channels SET status = ? WHERE profile_name = ?", (new_status, profile_name))
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        _check_profile_probe_binding(conn, profile_name, prof)
+        conn.execute(
+            "UPDATE chrome_profiles SET login_status = ?, last_login_check = ? WHERE name = ?",
+            (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), profile_name),
+        )
+        conn.execute("UPDATE youtube_channels SET status = ? WHERE profile_name = ?", (new_status, profile_name))
     add_log(
         "Profile",
         f"Kiểm tra đăng nhập Profile '{profile_name}': {new_status}. {probe.get('message', '')}",
@@ -3804,6 +4166,9 @@ def _upsert_profile_channels(
     """Đồng bộ danh sách kênh quét được từ YouTube Studio của một Profile vào
     youtube_channels: khớp theo channel_id → handle → tên; trả về (added, updated).
     Dùng chung cho refresh-channels (Profile Chrome) và sync Antidetect."""
+    current = conn.execute('SELECT path,proxy FROM chrome_profiles WHERE name=?', (profile_name,)).fetchone()
+    if current is None or (current['path'] or '') != prof_path or (current['proxy'] or '') != prof_proxy:
+        raise HTTPException(409, 'Liên kết Profile đã thay đổi. Hãy quét lại danh sách kênh.')
     added, updated = 0, 0
     for ch in found or []:
         handle = (ch.get("handle") or "").strip()
@@ -3857,7 +4222,7 @@ def _upsert_profile_channels(
     return added, updated
 
 
-@app.post("/api/profiles/{profile_name}/refresh-channels")
+@app.post("/api/profiles/{profile_name:path}/refresh-channels")
 def api_refresh_profile_channels(profile_name: str):
     """Quét danh sách kênh YouTube thật trong Chrome Profile và cập nhật vào bảng youtube_channels."""
     prof = get_profile_binding(profile_name)
@@ -3879,16 +4244,16 @@ def api_refresh_profile_channels(profile_name: str):
     found = probe.get("channels") or []
     new_status = "Đã đăng nhập" if probe.get("logged_in") else "Chưa đăng nhập"
 
-    conn = get_conn()
-    conn.execute(
-        "UPDATE chrome_profiles SET login_status = ?, last_login_check = ? WHERE name = ?",
-        (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), profile_name),
-    )
-    conn.execute("UPDATE youtube_channels SET status = ? WHERE profile_name = ?", (new_status, profile_name))
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        _check_profile_probe_binding(conn, profile_name, prof)
+        conn.execute(
+            "UPDATE chrome_profiles SET login_status = ?, last_login_check = ? WHERE name = ?",
+            (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), profile_name),
+        )
+        conn.execute("UPDATE youtube_channels SET status = ? WHERE profile_name = ?", (new_status, profile_name))
 
-    added, updated = _upsert_profile_channels(conn, profile_name, prof_path, prof_proxy, found, new_status)
-    conn.commit()
-    conn.close()
+        added, updated = _upsert_profile_channels(conn, profile_name, prof_path, prof_proxy, found, new_status)
     add_log(
         "Profile",
         f"Quét kênh Profile '{profile_name}': {new_status}. Thêm mới {added} kênh, cập nhật {updated} kênh.",
@@ -3933,6 +4298,7 @@ def api_list_channels(profile: Optional[str] = None):
     channels = []
     for row in rows:
         channel = public_channel(row)
+        channel['metadata_revision'] = metadata_revision(row, 'channel')
         channel["group_names"] = group_map.get(int(row["id"])) or [str(row["group_name"] or "Mặc định")]
         channels.append(channel)
     conn.close()
@@ -3941,9 +4307,13 @@ def api_list_channels(profile: Optional[str] = None):
 
 @app.post("/api/channels")
 def api_create_channel(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Tên kênh không được để trống.")
+    try:
+        supplied_fields = set(data)
+        data = validate_config(data, 'channel', create=True)
+        data = prepare_channel_update({}, data, supplied_fields)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    name = data['name']
     prof_name = (data.get("profile_name") or name).strip()
     prof_path = (data.get("profile_path") or "").strip()
 
@@ -3956,17 +4326,13 @@ def api_create_channel(data: Dict[str, Any] = Body(...)):
         )
     )
     upload_mode = (data.get("upload_mode") or "playwright").strip()
+    if upload_mode not in ("playwright", "youtube_api"):
+        raise HTTPException(400, "Phương thức đăng không hợp lệ.")
     if is_antidetect:
         if not str(binding.get("antidetect_profile_id") or "").strip():
             raise HTTPException(
                 400,
                 "Profile Antidetect này thiếu ID liên kết. Hãy bấm 'Đồng Bộ Antidetect' rồi thử lại.",
-            )
-        if upload_mode == "youtube_api":
-            raise HTTPException(
-                400,
-                "Kênh dùng Profile Antidetect chỉ hỗ trợ đăng qua trình duyệt Playwright "
-                "(YouTube Data API sẽ đi sai proxy/fingerprint của Antidetect).",
             )
         prof_path = binding.get("path") or f"antidetect://{binding['antidetect_profile_id']}"
 
@@ -3975,148 +4341,108 @@ def api_create_channel(data: Dict[str, Any] = Body(...)):
         candidate = DHB_PROFILE_CHROME_DIR / prof_name
         prof_path = str(candidate) if candidate.exists() else str(APP_PROFILES_DIR / prof_name)
 
-    conn = get_conn()
-    group_names = _validated_group_names(
-        conn, data.get("group_names"), legacy=data.get("group_name") or "", default="Mặc định"
-    )
-    cur = conn.execute(
-        """
-        INSERT INTO youtube_channels (
-            name, channel_id, handle, group_name, upload_mode, profile_name,
-            profile_path, emulate_mobile, use_hidden_desktop, proxy, oauth_token_json,
-            default_category_id, default_privacy, made_for_kids, note
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            name,
-            data.get("channel_id") or "",
-            data.get("handle") or "",
-            group_names[0],
-            "playwright" if is_antidetect else upload_mode,
-            prof_name,
-            prof_path,
-            0 if is_antidetect else (1 if data.get("emulate_mobile", False) else 0),
-            1 if data.get("use_hidden_desktop") else 0,
-            "" if is_antidetect else (data.get("proxy") or ""),
-            data.get("oauth_token_json") or "",
-            data.get("default_category_id") or "22",
-            data.get("default_privacy") or "public",
-            1 if data.get("made_for_kids") else 0,
-            data.get("note") or "",
-        ),
-    )
-    set_channel_group_memberships(conn, int(cur.lastrowid), group_names)
-    conn.commit()
-    conn.close()
+    if upload_mode == 'youtube_api':
+        _validate_channel_oauth(data)
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        group_names = _validated_group_names(
+            conn, data.pop('group_names'), legacy=data.get('group_name'), default='Mặc định'
+        )
+        data.update(group_name=group_names[0], profile_name=prof_name, profile_path=prof_path)
+        if is_antidetect:
+            data.update(emulate_mobile=0, proxy='')
+        columns = ', '.join(data)
+        placeholders = ', '.join('?' for _ in data)
+        cur = conn.execute(f'INSERT INTO youtube_channels ({columns}) VALUES ({placeholders})', list(data.values()))
+        set_channel_group_memberships(conn, int(cur.lastrowid), group_names)
     add_log("Channel", f"Đã thêm kênh YouTube: {name}", "SUCCESS", channel_name=name)
     return {"ok": True}
+
+
+def _validate_channel_oauth(values):
+    try:
+        oauth = get_oauth_token_local_status(values)
+    except (ValueError, TypeError, OverflowError, OSError):
+        raise HTTPException(400, 'Cấu hình OAuth không hợp lệ. Kiểm tra token và thời gian hết hạn.') from None
+    if not oauth['configured'] or oauth['error']:
+        raise HTTPException(400, oauth['error'] or 'Kênh chưa có OAuth hợp lệ.')
 
 
 @app.put("/api/channels/{channel_id}")
 def api_update_channel(channel_id: int, data: Dict[str, Any] = Body(...)):
     """Cập nhật thông tin kênh YouTube (tên, handle, nhóm, proxy, chế độ đăng, cấu hình mặc định...)."""
-    text_fields = (
-        "name", "channel_id", "handle", "email", "group_name", "upload_mode", "proxy",
-        "oauth_token_json", "default_category_id", "default_privacy", "note", "status",
-        "profile_name", "profile_path",
-    )
-    bool_fields = ("emulate_mobile", "use_hidden_desktop", "made_for_kids", "altered_content")
-
-    if "name" in data and not (data.get("name") or "").strip():
-        raise HTTPException(400, "Tên kênh không được để trống.")
-    if "upload_mode" in data and data.get("upload_mode") not in ("playwright", "youtube_api"):
-        raise HTTPException(400, "Phương thức đăng không hợp lệ (chỉ nhận playwright / youtube_api).")
-    if "default_privacy" in data and data.get("default_privacy") not in ("public", "unlisted", "private"):
-        raise HTTPException(400, "Chế độ hiển thị mặc định không hợp lệ (public / unlisted / private).")
-
-    updates: Dict[str, Any] = {}
-    for k in text_fields:
-        if k in data:
-            v = data.get(k)
-            if k == "proxy" and "***" in str(v or ""):
-                # GET intentionally masks proxy passwords. A masked value means keep the stored proxy.
-                continue
-            if k == "oauth_token_json" and not str(v or "").strip():
-                # Ô token để trống = giữ nguyên token đã lưu (API không trả lại secret).
-                continue
-            updates[k] = "" if v is None else str(v).strip()
-    for k in bool_fields:
-        if k in data:
-            updates[k] = 1 if data.get(k) else 0
+    try:
+        updates = validate_config(data, 'channel')
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if 'proxy' in updates and '***' in updates['proxy']:
+        del updates['proxy']  # Masked GET value means keep the stored password.
+    if 'oauth_token_json' in updates and not updates['oauth_token_json']:
+        del updates['oauth_token_json']  # An empty editor never erases stored OAuth.
 
     if not updates:
         return {"ok": False, "message": "Không có trường hợp lệ để cập nhật."}
 
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM youtube_channels WHERE id = ?", (channel_id,)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "Không tìm thấy kênh YouTube này.")
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute("SELECT * FROM youtube_channels WHERE id = ?", (channel_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Không tìm thấy kênh YouTube này.")
+        if ('expected_metadata_revision' in data
+                and data['expected_metadata_revision'] != metadata_revision(row, 'channel')):
+            raise HTTPException(409, 'Metadata của kênh đã đổi. Tải lại trước khi lưu để không ghi đè lựa chọn mới.')
+        try:
+            updates = prepare_channel_update(dict(row), updates, set(data))
+        except MetadataIntentConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        final = {**dict(row), **updates}
+        if final['upload_mode'] == 'youtube_api' and {'upload_mode','oauth_token_json'} & updates.keys():
+            _validate_channel_oauth(final)
 
-    group_names = None
-    if "group_names" in data or "group_name" in data:
-        group_names = _validated_group_names(
-            conn,
-            data.get("group_names") if "group_names" in data else data.get("group_name"),
-            legacy=row["group_name"] or "",
-            default="Mặc định",
-        )
-        updates["group_name"] = group_names[0]
-
-    # Đổi Profile: tự đồng bộ profile_path từ bảng chrome_profiles nếu người dùng không nhập đường dẫn mới
-    if "profile_name" in updates and not updates.get("profile_path"):
-        prof_name = updates["profile_name"]
-        if not prof_name:
-            conn.close()
-            raise HTTPException(400, "Tên Profile Chrome không được để trống.")
-        prof_row = conn.execute("SELECT path FROM chrome_profiles WHERE name = ?", (prof_name,)).fetchone()
-        if prof_row and prof_row["path"]:
-            updates["profile_path"] = prof_row["path"]
-
-    # Kênh gắn Profile Antidetect: path là định danh do Antidetect quản lý, proxy/mobile do Antidetect quyết định.
-    final_prof_name = updates.get("profile_name", row["profile_name"] or "")
-    prof_binding = conn.execute(
-        "SELECT * FROM chrome_profiles WHERE name = ?", (final_prof_name,)
-    ).fetchone() if final_prof_name else None
-    if prof_binding and (
-        str(prof_binding["source"] or "") == "Antidetect"
-        or str(prof_binding["antidetect_profile_id"] or "").strip()
-    ):
-        ad_binding_id = str(prof_binding["antidetect_profile_id"] or "").strip()
-        if not ad_binding_id:
-            conn.close()
-            raise HTTPException(
-                400,
-                "Profile Antidetect này thiếu ID liên kết. Hãy bấm 'Đồng Bộ Antidetect' rồi thử lại.",
+        group_names = None
+        if 'group_names' in updates or 'group_name' in updates:
+            raw_groups = updates.pop('group_names', updates.get('group_name'))
+            group_names = _validated_group_names(
+                conn, raw_groups, legacy=updates.get('group_name', row['group_name']) or '', default='Mặc định',
             )
-        if updates.get("upload_mode") == "youtube_api":
-            conn.close()
-            raise HTTPException(
-                400,
-                "Kênh dùng Profile Antidetect chỉ hỗ trợ đăng qua trình duyệt Playwright "
-                "(YouTube Data API sẽ đi sai proxy/fingerprint của Antidetect).",
-            )
-        updates["profile_path"] = prof_binding["path"] or f"antidetect://{ad_binding_id}"
-        updates["proxy"] = ""
-        updates["emulate_mobile"] = 0
+            updates['group_name'] = group_names[0]
 
-    cols = ", ".join(f"{k} = ?" for k in updates.keys())
-    conn.execute(f"UPDATE youtube_channels SET {cols} WHERE id = ?", list(updates.values()) + [channel_id])
-    if group_names is not None:
-        set_channel_group_memberships(conn, channel_id, group_names)
-    conn.commit()
-    conn.close()
+        # Đổi Profile: lấy path của binding khi không nhập đường dẫn mới.
+        if 'profile_name' in updates and not updates.get('profile_path'):
+            if not updates['profile_name']:
+                raise HTTPException(400, 'Tên Profile Chrome không được để trống.')
+            prof_row = conn.execute('SELECT path FROM chrome_profiles WHERE name=?', (updates['profile_name'],)).fetchone()
+            if prof_row and prof_row['path']:
+                updates['profile_path'] = prof_row['path']
+
+        final_prof_name = updates.get('profile_name', row['profile_name'] or '')
+        prof_binding = conn.execute('SELECT * FROM chrome_profiles WHERE name=?', (final_prof_name,)).fetchone() if final_prof_name else None
+        if prof_binding and (str(prof_binding['source'] or '') == 'Antidetect' or str(prof_binding['antidetect_profile_id'] or '').strip()):
+            ad_binding_id = str(prof_binding['antidetect_profile_id'] or '').strip()
+            if not ad_binding_id:
+                raise HTTPException(400, "Profile Antidetect này thiếu ID liên kết. Hãy bấm 'Đồng Bộ Antidetect' rồi thử lại.")
+            updates.update(profile_path=prof_binding['path'] or f'antidetect://{ad_binding_id}', proxy='', emulate_mobile=0)
+
+        cols = ', '.join(f'{key} = ?' for key in updates)
+        conn.execute(f'UPDATE youtube_channels SET {cols} WHERE id = ?', [*updates.values(), channel_id])
+        if group_names is not None:
+            set_channel_group_memberships(conn, channel_id, group_names)
     add_log("Channel", f"Đã cập nhật thông tin kênh YouTube #{channel_id}.", "INFO")
     return {"ok": True}
 
 
 @app.delete("/api/channels/{channel_id}")
 def api_delete_channel(channel_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM channel_group_memberships WHERE channel_id = ?", (channel_id,))
-    conn.execute("DELETE FROM youtube_channels WHERE id = ?", (channel_id,))
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        channel = conn.execute('SELECT profile_name FROM youtube_channels WHERE id=?', (channel_id,)).fetchone()
+        if channel is None:
+            raise HTTPException(404, 'Không tìm thấy kênh.')
+        _ensure_binding_deletable(conn, [channel_id], channel['profile_name'] or '')
+        conn.execute('DELETE FROM channel_group_memberships WHERE channel_id=?', (channel_id,))
+        conn.execute('DELETE FROM youtube_channels WHERE id=?', (channel_id,))
     return {"ok": True}
 
 
@@ -4302,89 +4628,68 @@ def api_list_options():
     conn = get_conn()
     rows = conn.execute("SELECT * FROM upload_option_groups ORDER BY id ASC").fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [{**dict(row), 'metadata_revision': metadata_revision(row, 'option')} for row in rows]
 
 
 @app.post("/api/options")
 def api_create_option(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Tên bộ tùy chọn không được để trống.")
-    conn = get_conn()
-    cur = conn.execute(
-        """
-        INSERT INTO upload_option_groups (
-            name, affiliate_enabled, affiliate_url, affiliate_CTA,
-            pin_comment_enabled, pin_comment_text, append_hashtags,
-            default_tags, category_id, language, made_for_kids, ai_label,
-            disable_shorts_remix
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            name,
-            1 if data.get("affiliate_enabled") else 0,
-            data.get("affiliate_url") or "",
-            data.get("affiliate_CTA") or "👉 Mua ngay sản phẩm chính hãng tại đây:",
-            1 if data.get("pin_comment_enabled") else 0,
-            data.get("pin_comment_text") or "",
-            data.get("append_hashtags") or "#shorts #trending #viral",
-            data.get("default_tags") or "",
-            data.get("category_id") or "22",
-            data.get("language") or "vi",
-            1 if data.get("made_for_kids") else 0,
-            1 if data.get("ai_label") else 0,
-            1 if data.get("disable_shorts_remix") else 0,
-        ),
-    )
-    new_id = cur.lastrowid
-    conn.commit()
-    conn.close()
+    try:
+        supplied_fields = set(data)
+        data = validate_config(data, 'option', create=True)
+        data = prepare_option_update({}, data, supplied_fields)
+        validate_option_state(data)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    with closing(get_conn()) as conn, conn:
+        columns = ', '.join(data)
+        placeholders = ', '.join('?' for _ in data)
+        cur = conn.execute(f'INSERT INTO upload_option_groups ({columns}) VALUES ({placeholders})', list(data.values()))
+        new_id = cur.lastrowid
     return {"ok": True, "id": new_id}
 
 
 @app.put("/api/options/{opt_id}")
 def api_update_option(opt_id: int, data: Dict[str, Any] = Body(...)):
     """Sửa đầy đủ một bộ tùy chọn đăng (affiliate, pin comment, hashtags, tags, danh mục...)."""
-    if "name" in data and not (data.get("name") or "").strip():
-        raise HTTPException(400, "Tên bộ tùy chọn không được để trống.")
-
-    text_fields = (
-        "name", "affiliate_url", "affiliate_CTA", "pin_comment_text",
-        "append_hashtags", "default_tags", "category_id", "language",
-    )
-    bool_fields = ("affiliate_enabled", "pin_comment_enabled", "made_for_kids", "ai_label", "disable_shorts_remix")
-
-    updates: Dict[str, Any] = {}
-    for k in text_fields:
-        if k in data:
-            v = data.get(k)
-            updates[k] = ("" if v is None else str(v)).strip()
-    for k in bool_fields:
-        if k in data:
-            updates[k] = 1 if data.get(k) else 0
+    try:
+        updates = validate_config(data, 'option')
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     if not updates:
         return {"ok": False, "message": "Không có trường hợp lệ để cập nhật."}
 
-    conn = get_conn()
-    row = conn.execute("SELECT id FROM upload_option_groups WHERE id = ?", (opt_id,)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "Không tìm thấy bộ tùy chọn đăng này.")
-    cols = ", ".join(f"{k} = ?" for k in updates.keys())
-    conn.execute(f"UPDATE upload_option_groups SET {cols} WHERE id = ?", list(updates.values()) + [opt_id])
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM upload_option_groups WHERE id=?', (opt_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, 'Không tìm thấy bộ tùy chọn đăng này.')
+        if ('expected_metadata_revision' in data
+                and data['expected_metadata_revision'] != metadata_revision(row, 'option')):
+            raise HTTPException(409, 'Metadata của bộ tùy chọn đã đổi. Tải lại trước khi lưu để không ghi đè lựa chọn mới.')
+        try:
+            updates = prepare_option_update(dict(row), updates, set(data))
+            validate_option_state({**dict(row), **updates})
+        except MetadataIntentConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        cols = ', '.join(f'{key} = ?' for key in updates)
+        conn.execute(f'UPDATE upload_option_groups SET {cols} WHERE id=?', [*updates.values(), opt_id])
     add_log("Options", f"Đã cập nhật bộ tùy chọn đăng #{opt_id}.", "INFO")
     return {"ok": True}
 
 
 @app.delete("/api/options/{opt_id}")
 def api_delete_option(opt_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM upload_option_groups WHERE id = ?", (opt_id,))
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if not conn.execute('SELECT 1 FROM upload_option_groups WHERE id=?', (opt_id,)).fetchone():
+            raise HTTPException(404, 'Không tìm thấy bộ tùy chọn đăng.')
+        if (conn.execute('SELECT 1 FROM video_queue WHERE option_group_id=? LIMIT 1', (opt_id,)).fetchone()
+                or conn.execute('SELECT 1 FROM monitors WHERE option_group_id=? LIMIT 1', (opt_id,)).fetchone()):
+            raise HTTPException(409, 'Bộ tùy chọn đang được video hoặc Monitor sử dụng. Chọn lại cấu hình và xem trước các mục liên quan trước khi xóa để không mất yêu cầu metadata.')
+        conn.execute('DELETE FROM upload_option_groups WHERE id=?', (opt_id,))
     return {"ok": True}
 
 
@@ -4402,62 +4707,73 @@ def api_get_render_resources():
 # ==========================================================
 # PRESET RENDER CÓ TÊN (học quy trình preset JSON của DHB)
 # ==========================================================
-@app.get("/api/render-presets")
+@app.get('/api/render-presets')
 def api_list_render_presets():
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM render_presets ORDER BY name ASC").fetchall()
-    conn.close()
-    res = []
-    for r in rows:
-        d = dict(r)
-        try:
-            d["config"] = json.loads(d.get("config_json") or "{}")
-        except Exception:
-            d["config"] = {}
-        res.append(d)
-    return res
+    with closing(get_conn()) as conn:
+        return [public_preset(row) for row in conn.execute('SELECT * FROM render_presets ORDER BY name')]
 
 
-@app.post("/api/render-presets")
+def _validated_preset_config(values):
+    try:
+        return validate_render_config(values['config'], values['render_mode'])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _check_preset_revision(row, expected):
+    if not expected or expected != preset_revision(row):
+        raise HTTPException(409, 'Preset đã thay đổi hoặc thiếu phiên bản đã đọc. Hãy nạp lại trước khi cập nhật/xóa.')
+
+
+@app.post('/api/render-presets')
 def api_save_render_preset(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Tên preset không được để trống.")
-    render_mode = data.get("render_mode") or "shorts_9_16"
-    cfg = data.get("config") or {}
-    if not isinstance(cfg, dict):
-        raise HTTPException(400, "Cấu hình preset phải là một object JSON.")
-    if "speed" in cfg:
-        try:
-            cfg["speed"] = normalize_render_speed(cfg["speed"])
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-    note = (data.get("note") or "").strip()
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO render_presets (name, render_mode, config_json, note)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(name) DO UPDATE SET
-            render_mode = excluded.render_mode,
-            config_json = excluded.config_json,
-            note = excluded.note
-        """,
-        (name, render_mode, json.dumps(cfg, ensure_ascii=False), note),
-    )
-    conn.commit()
-    conn.close()
-    add_log("Render", f"Đã lưu Preset Render '{name}' (chế độ {render_mode}).", "SUCCESS")
-    return {"ok": True}
+    values = _validated_crud_input(PresetCreate, data)
+    cfg = _validated_preset_config(values)
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if conn.execute('SELECT 1 FROM render_presets WHERE name=?', (values['name'],)).fetchone():
+            raise HTTPException(409, 'Tên preset đã tồn tại. Hãy nạp preset và chọn Cập nhật, hoặc nhập tên mới.')
+        cursor = conn.execute('INSERT INTO render_presets(name,render_mode,config_json,note) VALUES(?,?,?,?)',
+            (values['name'],values['render_mode'],json.dumps(cfg,ensure_ascii=False,allow_nan=False),values['note']))
+        row = conn.execute('SELECT * FROM render_presets WHERE id=?', (cursor.lastrowid,)).fetchone()
+    return {'ok': True, **public_preset(row)}
 
 
-@app.delete("/api/render-presets/{preset_id}")
-def api_delete_render_preset(preset_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM render_presets WHERE id = ?", (preset_id,))
-    conn.commit()
-    conn.close()
-    return {"ok": True}
+@app.put('/api/render-presets/{preset_id}')
+def api_update_render_preset(preset_id: int, data: Dict[str, Any] = Body(...)):
+    updates = _validated_crud_input(PresetUpdate, data, partial=True)
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM render_presets WHERE id=?', (preset_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, 'Không tìm thấy preset này.')
+        _check_preset_revision(row, updates.pop('expected_revision', ''))
+        values = {key: row[key] for key in ('name','render_mode','note')}
+        if 'config' not in updates:
+            try:
+                values['config'] = json.loads(row['config_json'])
+            except (ValueError, TypeError):
+                raise HTTPException(400, 'Cấu hình cũ bị lỗi. Cần cung cấp cấu hình thay thế đầy đủ.') from None
+        values.update(updates)
+        cfg = _validated_preset_config(values)
+        if conn.execute('SELECT 1 FROM render_presets WHERE name=? AND id<>?', (values['name'],preset_id)).fetchone():
+            raise HTTPException(409, 'Tên preset đã tồn tại; không thể ghi đè preset khác.')
+        conn.execute('UPDATE render_presets SET name=?,render_mode=?,config_json=?,note=? WHERE id=?',
+            (values['name'],values['render_mode'],json.dumps(cfg,ensure_ascii=False,allow_nan=False),values['note'],preset_id))
+        result = public_preset(conn.execute('SELECT * FROM render_presets WHERE id=?', (preset_id,)).fetchone())
+    return {'ok': True, **result}
+
+
+@app.delete('/api/render-presets/{preset_id}')
+def api_delete_render_preset(preset_id: int, expected_revision: str = ''):
+    with closing(get_conn()) as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM render_presets WHERE id=?', (preset_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, 'Không tìm thấy preset này.')
+        _check_preset_revision(row, expected_revision)
+        conn.execute('DELETE FROM render_presets WHERE id=?', (preset_id,))
+    return {'ok': True}
 
 
 # ==========================================================
@@ -4468,40 +4784,78 @@ def api_list_monitors():
     return pipeline_manager.get_monitor_snapshots()
 
 
+@app.get('/api/upload-capabilities')
+def api_upload_capabilities():
+    from youtube_uploader import upload_capabilities
+    return upload_capabilities()
+
+
 @app.post("/api/monitors")
 def api_create_monitor(data: Dict[str, Any] = Body(...)):
-    name = (data.get("name") or "").strip()
-    source_urls = (data.get("source_urls") or "").strip()
-    if not name or not source_urls:
-        raise HTTPException(400, "Vui lòng nhập Tên luồng Monitor và Danh sách link kênh nguồn.")
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO monitors (
-            name, source_urls, target_channel_id, target_group_name,
-            upload_to, render_mode, option_group_id, ai_Action, ai_provider,
-            ai_target_lang, min_views, check_interval_minutes, max_videos_per_scan
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            name,
-            source_urls,
-            data.get("target_channel_id") or None,
-            data.get("target_group_name") or "Mặc định",
-            data.get("upload_to") or "Shorts",
-            data.get("render_mode") or "shorts_9_16",
-            data.get("option_group_id") or None,
-            data.get("ai_Action") or "rewrite_seo",
-            data.get("ai_provider") or "gemini",
-            data.get("ai_target_lang") or "Tiếng Việt",
-            int(data.get("min_views") or 0),
-            int(data.get("check_interval_minutes") or 30),
-            int(data.get("max_videos_per_scan") or 3),
-        ),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        data = validate_monitor_create(data)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        with closing(get_conn()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if data['target_channel_id'] is not None:
+                if not conn.execute('SELECT 1 FROM youtube_channels WHERE id=?', (data['target_channel_id'],)).fetchone():
+                    raise HTTPException(400, 'Kênh đích không còn tồn tại; hãy chọn lại kênh.')
+            elif not conn.execute('SELECT 1 FROM channel_groups WHERE name=?', (data['target_group_name'],)).fetchone():
+                raise HTTPException(400, 'Nhóm kênh đích không còn tồn tại; hãy chọn lại nhóm.')
+            if data['option_group_id'] is not None and not conn.execute('SELECT 1 FROM upload_option_groups WHERE id=?', (data['option_group_id'],)).fetchone():
+                raise HTTPException(400, 'Bộ tùy chọn không còn tồn tại; hãy chọn lại.')
+            columns = ', '.join(data)
+            placeholders = ', '.join('?' for _ in data)
+            conn.execute(f'INSERT INTO monitors ({columns}) VALUES ({placeholders})', list(data.values()))
+    except sqlite3.IntegrityError as exc:
+        if 'UNIQUE constraint failed: monitors.name' in str(exc):
+            raise HTTPException(409, 'Tên monitor đã tồn tại; hãy chọn tên khác.') from None
+        raise
     return {"ok": True}
+
+
+@app.get("/api/monitors/{monitor_id}/metadata-preview")
+def api_monitor_metadata_preview(monitor_id: int):
+    conn = get_conn()
+    try:
+        row = conn.execute('SELECT * FROM monitors WHERE id=?', (monitor_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, 'Không tìm thấy monitor.')
+        mon = dict(row)
+        result = monitor_policy.preview(conn, mon, mon.get('metadata_policy_json') or monitor_policy.DEFAULT_POLICY)
+        result.pop('envelope')
+        return result
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.post("/api/monitors/{monitor_id}/metadata-confirm")
+def api_monitor_metadata_confirm(monitor_id: int, data: Dict[str, Any] = Body(...)):
+    conn = get_conn()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM monitors WHERE id=?', (monitor_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, 'Không tìm thấy monitor.')
+        if row['is_running'] or pipeline_manager._monitor_handles_alive(monitor_id):
+            raise HTTPException(409, 'Dừng monitor và đợi worker kết thúc trước khi xác nhận.')
+        result = monitor_policy.preview(conn, dict(row), data.get('policy'))
+        if result['blocked']:
+            raise HTTPException(409, ' '.join(reason for channel in result['channels'] for reason in channel['reasons']))
+        if result['revision'] != data.get('revision'):
+            raise HTTPException(409, 'Cấu hình đã đổi. Hãy xem trước lại.')
+        conn.execute("UPDATE monitors SET metadata_policy_json=?,metadata_revision=?,status='Stopped' WHERE id=?",
+                     (monitor_policy.encode(result['policy']), result['revision'], monitor_id))
+        conn.commit()
+        return {'ok': True}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        conn.close()
 
 
 @app.post("/api/monitors/{monitor_id}/toggle")
@@ -4576,6 +4930,7 @@ def api_log_modules():
 
 @app.get("/api/logs/export")
 def api_export_logs(module: str = "", status: str = "", q: str = ""):
+    from csv_safety import ENCODING_COLUMN, ENCODING_VERSION, encode_csv_cell
     where_sql, params = _log_query_parts(module, status, q)
     conn = get_conn()
     rows = conn.execute(
@@ -4589,16 +4944,17 @@ def api_export_logs(module: str = "", status: str = "", q: str = ""):
     writer.writerow([
         "id", "created_at", "module", "status", "channel_name", "video_title", "message",
         "run_id", "queue_id", "attempt_id", "phase", "error_code",
+        ENCODING_COLUMN,
     ])
     secrets = collect_secret_values()
     for row in rows:
-        writer.writerow([
+        writer.writerow([encode_csv_cell(value) for value in [
             row["id"], row["created_at"], row["module"], row["status"],
             redact_secrets(row["channel_name"], secrets), redact_secrets(row["video_title"], secrets),
             redact_secrets(row["message"], secrets), redact_secrets(row["run_id"], secrets),
             row["queue_id"], row["attempt_id"], redact_secrets(row["phase"], secrets),
             redact_secrets(row["error_code"], secrets),
-        ])
+        ]] + [ENCODING_VERSION])
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     add_log("System", f"Đã xuất {len(rows)} dòng nhật ký ra file CSV.", "SUCCESS")
     return Response(

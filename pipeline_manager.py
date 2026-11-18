@@ -2,10 +2,10 @@ import json
 import hashlib
 import math
 import os
-import shutil
 import threading
 import time
 import uuid
+import monitor_policy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime
@@ -14,15 +14,19 @@ from typing import List, Dict, Any, Optional
 
 from database import (
     get_conn, add_log, get_settings, register_managed_artifact,
-    set_log_context, clear_log_context,
+    set_log_context, clear_log_context, queue_requires_review,
 )
 from config import APP_OUTPUT_DIR, APP_TEMP_DIR
-from scanner_downloader import download_video, scan_social_urls
+from scanner_downloader import download_video, scan_social_urls, MAX_SCAN_ITEMS
 from render_engine import render_video, generate_thumbnail_from_video
 from ai_engine import ai_optimize_youtube_metadata
 from youtube_uploader import (
-    UploadNotSent, upload_video_to_youtube, validate_upload_preflight, normalize_published_video_url,
+    UploadNotSent, UploadVerificationError, api_expected_metadata, upload_video_to_youtube,
+    validate_upload_preflight, normalize_published_video_url,
 )
+from upload_capabilities import UploadCapabilityError, normalize_mode
+from metadata_resolution import resolve_metadata
+from upload_evidence import make_evidence_sink, read_evidence
 from content_identity import normalize_source_url, sha256_file, source_dedupe_key
 from group_distribution import choose_target_channel, target_group_names
 from upload_approval import PreviewStale, approval_item, asset_stamps, encode, upload_source_path
@@ -307,7 +311,7 @@ def _start_upload_attempt(queue_id, claim_token, item, channel_id):
         conn.close()
 
 
-def _finish_upload_attempt(attempt_id, outcome, published_url="", error_message=""):
+def _finish_upload_attempt(attempt_id, outcome, published_url="", error_message="", warnings=None):
     if not attempt_id:
         return
     conn = get_conn()
@@ -317,7 +321,75 @@ def _finish_upload_attempt(attempt_id, outcome, published_url="", error_message=
             "error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (outcome, published_url or "", error_message or "", attempt_id),
         )
+        if warnings is not None:
+            conn.execute('UPDATE upload_attempts SET post_upload_warnings_json=? WHERE id=?',
+                         (encode(warnings), attempt_id))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _attempt_has_upload_evidence(attempt_id):
+    """An unreadable attempt cannot prove that no video has been received."""
+    conn = None
+    try:
+        conn = get_conn()
+        row = conn.execute('SELECT evidence_json FROM upload_attempts WHERE id=?', (attempt_id,)).fetchone()
+        return not row or row[0] != '{}'
+    except Exception:
+        return True
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _complete_upload_attempt(queue_id, claim_token, attempt_id, channel, published_url, warnings,
+                             *, backend, expected_metadata):
+    """Commit queue, attempt, history and reservation as one owned completion."""
+    conn = get_conn()
+    try:
+        conn.execute('PRAGMA synchronous=FULL')
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM video_queue WHERE id=?', (queue_id,)).fetchone()
+        attempt = conn.execute('SELECT * FROM upload_attempts WHERE id=?', (attempt_id,)).fetchone()
+        channel_id = channel['id']
+        reservation = conn.execute(
+            'SELECT state FROM content_reservations WHERE queue_id=? AND channel_id=? '
+            'AND claim_token=? AND content_key=?',
+            (queue_id, channel_id, claim_token, row['content_key'] if row else '')).fetchone()
+        if (not row or row['claim_token'] != claim_token or row['last_attempt_id'] != attempt_id
+                or not attempt or attempt['queue_id'] != queue_id or attempt['channel_id'] != channel_id
+                or attempt['content_key'] != row['content_key'] or attempt['outcome'] != 'InProgress'
+                or not reservation or reservation['state'] != 'Active'):
+            raise RuntimeError('Không còn quyền ghi kết quả lượt đăng; giữ lại để đối soát.')
+        evidence = read_evidence(attempt['evidence_json'], queue_id, attempt_id, channel_id)
+        if backend == 'youtube_api' or evidence:
+            if (not evidence or evidence['verification_state'] != 'verified'
+                    or evidence['backend'] != backend or evidence['expected'] != expected_metadata
+                    or normalize_published_video_url(evidence['video_url']) != published_url):
+                raise RuntimeError('Thiếu bằng chứng xác minh khớp video ID; giữ lại để đối soát.')
+        post_id = _history_source_post_id(dict(row), queue_id)
+        conn.execute('INSERT OR IGNORE INTO published_history '
+                     '(source_post_id,source_url,channel_id,content_key,published_url) VALUES(?,?,?,?,?)',
+                     (post_id, row['source_url'] or '', channel_id, row['content_key'], published_url))
+        conn.execute("UPDATE published_history SET "
+                     "source_url=CASE WHEN COALESCE(source_url,'')='' THEN ? ELSE source_url END, "
+                     "content_key=CASE WHEN COALESCE(content_key,'')='' THEN ? ELSE content_key END, "
+                     "published_url=CASE WHEN COALESCE(published_url,'')='' THEN ? ELSE published_url END "
+                     'WHERE source_post_id=? AND channel_id=?',
+                     (row['source_url'] or '', row['content_key'], published_url, post_id, channel_id))
+        conn.execute("UPDATE video_queue SET upload_progress=100,status='Completed',published_url=?,"
+                     "error_message='',post_upload_warnings_json=? WHERE id=? AND claim_token=?",
+                     (published_url, encode(warnings), queue_id, claim_token))
+        conn.execute("UPDATE upload_attempts SET phase='Finished',outcome='Completed',published_url=?,"
+                     "error_message='',post_upload_warnings_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                     (published_url, encode(warnings), attempt_id))
+        conn.execute('DELETE FROM content_reservations WHERE queue_id=? AND channel_id=? AND claim_token=?',
+                     (queue_id, channel_id, claim_token))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -444,6 +516,15 @@ def insert_monitor_queue_item(
     )
     if cur.rowcount != 1:
         return None
+    if mon.get('metadata_policy_json'):
+        import monitor_policy
+        approved = monitor_policy.validate_session(conn, mon)
+        conn.execute('UPDATE video_queue SET monitor_metadata_policy_json=? WHERE id=?',
+                     (monitor_policy.encode(approved['envelope']), cur.lastrowid))
+        item = dict(conn.execute('SELECT * FROM video_queue WHERE id=?', (cur.lastrowid,)).fetchone())
+        channel, _ = choose_target_channel(conn, item)
+        monitor_policy.resolve_item(conn, item, channel)
+        monitor_policy.persist_values(conn, item)
     return cur.lastrowid
 
 
@@ -1016,6 +1097,11 @@ class PipelineManager:
             if self._is_running or self._active_threads > 0:
                 return {"ok": False, "message": "Hệ thống đang chạy hoặc đang dừng một tiến trình khác."}
 
+            with closing(get_conn()) as conn:
+                held = [item_id for item_id in item_ids if queue_requires_review(conn, item_id)]
+            if held:
+                return {"ok": False, "code": "REVIEW_REQUIRED", "message": f"Video cần đối soát: {held}"}
+
             batch_token = uuid.uuid4().hex
             if do_upload:
                 try:
@@ -1082,7 +1168,7 @@ class PipelineManager:
                     raise PreviewStale(f"Video #{item_id} không còn trong hàng đợi.")
                 item = dict(row)
                 status = str(item.get("status") or "").strip()
-                if (item.get("claim_token") or item.get("published_url") or status in ("Completed", "NeedsReview")
+                if (queue_requires_review(conn, item_id) or item.get("claim_token") or item.get("published_url") or status in ("Completed", "NeedsReview")
                         or status.startswith(("Uploading", "Downloading", "Rendering", "Đang đăng"))):
                     raise PreviewStale(f"Video #{item_id} đã đổi trạng thái. Hãy xem trước lại.")
 
@@ -1095,6 +1181,7 @@ class PipelineManager:
                 channel, frozen_groups = choose_target_channel(conn, item, validate_existing_assignment=True)
                 if snapshots[item_id] != encode(approval_item(conn, item, channel, frozen_groups)):
                     raise PreviewStale(f"Video #{item_id} đã đổi đích hoặc cấu hình. Hãy xem trước lại.")
+                monitor_policy.persist_values(conn, item)
                 _preview_upload_file(item, options)
                 channel_id = int(channel["id"])
                 groups = frozen_groups
@@ -1157,6 +1244,7 @@ class PipelineManager:
                     "channel_name": "",
                     "warnings": [],
                     "reasons": [],
+                    "reason_codes": [],
                     "blocked": False,
                 }
                 try:
@@ -1177,14 +1265,20 @@ class PipelineManager:
                     snapshots[item_id] = encode(snapshot)
                     for key in ("youtube_channel_id", "profile_name", "antidetect_profile_id"):
                         entry[key] = snapshot[key]
+                    entry["upload_mode"] = channel.get("upload_mode") or "playwright"
                     option_id = item.get("option_group_id")
                     option = conn.execute("SELECT * FROM upload_option_groups WHERE id = ?", (option_id,)).fetchone() if option_id else None
-                    metadata = validate_upload_preflight(item, channel, dict(option) if option else None)
-                    entry["title"] = metadata["title"]
-                    entry["visibility"] = metadata["privacy_status"]
-                    entry["schedule_time"] = metadata["schedule_time"]
+                    entry['metadata_effective'] = resolve_metadata(channel, dict(option) if option else None)
+                    entry['warnings'].extend(entry['metadata_effective']['warnings'])
+                    if options[2]:
+                        metadata = validate_upload_preflight(item, channel, dict(option) if option else None)
+                        entry["title"] = metadata["title"]
+                        entry["visibility"] = metadata["privacy_status"]
+                        entry["schedule_time"] = metadata["schedule_time"]
                     entry.update(_preview_upload_file(item, options))
-                    if snapshot["antidetect_profile_id"]:
+                    if entry["upload_mode"] == "youtube_api":
+                        entry["warnings"].append("DHB sẽ kiểm tra Channel ID của OAuth trước khi gửi file qua YouTube Data API.")
+                    elif snapshot["antidetect_profile_id"]:
                         entry["warnings"].append("Đăng nhập và đúng kênh sẽ được xác minh trong Studio trước khi gửi file.")
                     try:
                         if _history_contains_item(
@@ -1193,7 +1287,7 @@ class PipelineManager:
                             entry["warnings"].append("nội dung đã có trong lịch sử đăng ở kênh này")
                     except Exception:
                         entry["warnings"].append("không kiểm tra được lịch sử đăng trùng")
-                    if str(item.get("status") or "").strip() == "NeedsReview":
+                    if queue_requires_review(conn, item_id):
                         entry["reasons"].append("cần đối soát lượt đăng trước")
                     status = str(item.get("status") or "")
                     if status.strip() == "Completed" or item.get("published_url"):
@@ -1202,6 +1296,8 @@ class PipelineManager:
                         entry["reasons"].append("đang được worker khác giữ")
                 except Exception as exc:
                     entry["reasons"].append(str(exc))
+                    if isinstance(exc, UploadCapabilityError):
+                        entry["reason_codes"] = [issue['code'] for issue in exc.issues]
                 entry["blocked"] = bool(entry["reasons"])
                 previews.append(entry)
             if previews and not any(item["blocked"] for item in previews):
@@ -1429,7 +1525,7 @@ class PipelineManager:
         # A publish request may already have reached YouTube even when Studio did
         # not return a verifiable URL. Never turn that ambiguous result into an
         # automatic retry, including when force_reupload was requested.
-        if do_upload and existing_status == "NeedsReview":
+        if existing_status == "NeedsReview":
             add_log(
                 "Pipeline",
                 f"Giữ '{title}' ở trạng thái cần đối soát: lượt đăng trước chưa xác minh. "
@@ -1460,6 +1556,18 @@ class PipelineManager:
 
         token = claim_token or uuid.uuid4().hex
         conn = get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        if queue_requires_review(conn, item_id):
+            conn.rollback()
+            conn.close()
+            return
+        # Read under the same write lock as the claim; API checks can be stale.
+        fresh = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
+        if not fresh:
+            conn.rollback()
+            conn.close()
+            return
+        item = dict(fresh)
         cur = conn.execute(
             "UPDATE video_queue SET claim_token = ? WHERE id = ? AND COALESCE(claim_token, '') = ''",
             (token, item_id),
@@ -1557,6 +1665,7 @@ class PipelineManager:
         reservation_owned = False
         reservation_keep = False
         upload_started = False
+        upload_committed = False
         slot_owner = None
         upload_attempt_id = None
         channel = None
@@ -1587,6 +1696,8 @@ class PipelineManager:
                         c_opt.close()
                     if og_row:
                         option_group = dict(og_row)
+                    else:
+                        raise PreviewStale('Bộ tùy chọn của video không còn tồn tại; cần chọn lại trước khi đăng.')
                 validate_upload_preflight(item, channel, option_group)
 
             input_path = item.get("input_video_path") or ""
@@ -1776,13 +1887,15 @@ class PipelineManager:
                     verify_approval()
                     channel["_verify_approval"] = verify_approval
 
-                # Radio 18+ của Studio chưa được xác minh (HANDOVER v7). Chặn trước
-                # khi giữ reservation/gọi uploader để không tạo bản nháp rác.
-                if bool(fresh_item.get("age_restriction")):
-                    raise RuntimeError(
-                        "Chưa hỗ trợ xác minh giới hạn độ tuổi 18+ trên YouTube Studio. "
-                        "Đã dừng trước khi nạp file. Hãy tắt giới hạn tuổi hoặc probe lại DOM/selector trước."
-                    )
+                # Recheck fresh queue metadata before reserving content, using the
+                # same guard as preview and both direct upload adapters.
+                approved_upload_metadata = validate_upload_preflight(fresh_item, channel, option_group)
+                evidence_backend = normalize_mode(channel.get('upload_mode'))
+                evidence_expected = (api_expected_metadata(approved_upload_metadata, channel.get('channel_id'))
+                                     if evidence_backend == 'youtube_api' else
+                                     {'category_id': approved_upload_metadata['category_id']})
+                if evidence_backend != 'youtube_api' and approved_upload_metadata.get('video_language'):
+                    evidence_expected['video_language'] = approved_upload_metadata['video_language']
 
                 reservation_key, reservation_result = _acquire_content_reservation(
                     item_id,
@@ -1898,14 +2011,19 @@ class PipelineManager:
                         return
                     _mark_slot_entered(slot_owner, upload_attempt_id)
                     upload_started = True
+                evidence_sink = make_evidence_sink(
+                    get_conn, item_id, token, upload_attempt_id, channel['id'],
+                    backend=evidence_backend, expected=evidence_expected)
                 pub_res = upload_video_to_youtube(
                     video_item=fresh_item,
                     channel=channel,
                     option_group=option_group,
                     progress_callback=_make_progress_cb("upload_progress"),
+                    evidence_sink=evidence_sink,
                 )
 
                 if isinstance(pub_res, dict):
+                    post_warnings = pub_res.get('warnings') or []
                     pub_url = pub_res.get("url", "")
                     is_cancelled = bool(pub_res.get("cancelled", False))
                     is_flagged = bool(pub_res.get("flagged_copyright", False))
@@ -1913,6 +2031,7 @@ class PipelineManager:
                     warning_msg = pub_res.get("warning_message", "")
                     discard_status = str(pub_res.get("discard_status") or "").strip().lower()
                 else:
+                    post_warnings = []
                     pub_url = str(pub_res)
                     is_cancelled = False
                     is_flagged = False
@@ -2003,20 +2122,13 @@ class PipelineManager:
                         video_title=title,
                     )
                 else:
-                    completed_saved = _update_row(
-                        upload_progress=100,
-                        status="Completed",
-                        published_url=pub_url,
-                        error_message="",
-                    )
-                    if not completed_saved:
-                        reservation_keep = True
-                        raise RuntimeError("Không lưu được trạng thái Completed sau khi YouTube trả URL.")
-                    # Ghi lịch sử cho MỌI nguồn (link, kéo-thả, local path), không chỉ Monitor.
-                    if not self._record_published_history_for_item(item_id, channel):
-                        reservation_keep = True
-                        raise RuntimeError("Không ghi được published_history sau khi YouTube trả URL.")
-                    _finish_upload_attempt(upload_attempt_id, "Completed", pub_url)
+                    _complete_upload_attempt(item_id, token, upload_attempt_id, channel, pub_url, post_warnings,
+                                             backend=evidence_backend, expected_metadata=evidence_expected)
+                    upload_committed = True
+                    reservation_owned = False
+                    for warning in post_warnings:
+                        add_log('Upload', warning.get('message') or 'Bước phụ sau đăng cần kiểm tra.', 'WARNING',
+                                video_title=title, channel_name=channel['name'])
                     add_log(
                         "Upload",
                         f"✅ Đăng thành công lên kênh [{channel['name']}]: {pub_url}",
@@ -2024,33 +2136,6 @@ class PipelineManager:
                         channel_name=channel["name"],
                         video_title=title,
                     )
-
-                # Tự động di chuyển video nguồn trên máy vào thư mục uploaded/ (chỉ khi đăng thành công)
-                is_local_file = item.get("source_type") in ("File", "LocalFile") or item.get("platform") == "LocalFile"
-                if not is_cancelled and not result_unverified and pub_url and is_local_file and input_path and os.path.exists(input_path):
-                    try:
-                        p = Path(input_path)
-                        if p.parent.name != "uploaded":
-                            uploaded_dir = p.parent / "uploaded"
-                            uploaded_dir.mkdir(exist_ok=True)
-                            dest_file = uploaded_dir / p.name
-                            if not dest_file.exists():
-                                shutil.move(str(p), str(dest_file))
-                                _update_row(input_video_path=str(dest_file))
-                                try:
-                                    temp_root = os.path.normcase(str(APP_TEMP_DIR.resolve()))
-                                    moved_path = os.path.normcase(str(dest_file.resolve()))
-                                    if os.path.commonpath([moved_path, temp_root]) == temp_root:
-                                        try:
-                                            register_managed_artifact(str(dest_file), "upload_archive", "queue", item_id)
-                                        except Exception as manifest_err:
-                                            add_log("Storage", f"Không ghi được manifest cho file archive queue #{item_id}; file được giữ lại ({type(manifest_err).__name__}).", "WARNING", video_title=title)
-                                except (OSError, ValueError):
-                                    pass
-                                input_path = str(dest_file)
-                                add_log("Pipeline", f"Đã lưu trữ video gốc vào: {dest_file}", "INFO")
-                    except Exception as mv_err:
-                        add_log("Pipeline", f"Không thể di chuyển file vào uploaded/: {mv_err}", "WARNING")
 
                 # Xóa file tạm nếu cài đặt yêu cầu — chỉ xóa file nằm trong thư mục temp/ của tool
                 settings = get_settings()
@@ -2064,6 +2149,8 @@ class PipelineManager:
                         add_log("Storage", f"Không xóa artifact tạm thuộc queue #{item_id}; file được giữ để kiểm tra.", "WARNING", video_title=title)
 
         except InterruptedError:
+            if upload_committed:
+                return
             if upload_started:
                 reservation_keep = True
                 _finish_upload_attempt(
@@ -2085,14 +2172,18 @@ class PipelineManager:
                 _update_row(status="Stopped", error_message="Đã dừng theo yêu cầu của người dùng.")
                 add_log("Pipeline", f"Đã dừng xử lý video: {title}", "WARNING", video_title=title)
         except Exception as e:
-            if upload_started and isinstance(e, UploadNotSent):
+            # Completion is already one durable transaction. A later log or
+            # cleanup failure cannot downgrade it or authorize a second upload.
+            if upload_committed:
+                return
+            if upload_started and isinstance(e, UploadNotSent) and not _attempt_has_upload_evidence(upload_attempt_id):
                 if owner == "batch":
                     self._stop_event.set()
                 _finish_upload_attempt(upload_attempt_id, "NotSent", error_message=str(e))
                 _update_row(status="Error", error_message=str(e))
                 add_log("Upload", str(e), "ERROR", video_title=title, error_code="ERR_STUDIO_BASELINE")
                 return
-            if upload_started and isinstance(e, AntidetectNotReady):
+            if upload_started and isinstance(e, AntidetectNotReady) and not _attempt_has_upload_evidence(upload_attempt_id):
                 _finish_upload_attempt(upload_attempt_id, "NotSent", error_message=str(e))
                 _update_row(status="Error", error_message=str(e))
                 return
@@ -2115,6 +2206,7 @@ class PipelineManager:
                     f"Lỗi sau khi bắt đầu upload '{title}'; giữ reservation để đối soát: {err_msg}",
                     "ERROR",
                     video_title=title,
+                    error_code=e.code if isinstance(e, UploadVerificationError) else "ERR_UPLOAD_UNCERTAIN",
                 )
                 return
             if se.is_set():
@@ -2180,6 +2272,9 @@ class PipelineManager:
                     if current != snapshot:
                         raise PreviewStale("Đích hoặc cấu hình đã thay đổi sau khi xác nhận.")
                 elif item.get("_upload_origin") == "monitor":
+                    if not item.get('monitor_metadata_policy_json'):
+                        raise PreviewStale('Video monitor cũ thiếu chính sách; cần xác nhận metadata thủ công.')
+                    monitor_policy.persist_values(conn, item)
                     snapshot = current
                     approval_token = uuid.uuid4().hex
                     conn.execute(
@@ -2369,7 +2464,7 @@ class PipelineManager:
             conn = None
             try:
                 conn = get_conn()
-                mon_row = conn.execute("SELECT name FROM monitors WHERE id = ?", (monitor_id,)).fetchone()
+                mon_row = conn.execute("SELECT * FROM monitors WHERE id = ?", (monitor_id,)).fetchone()
                 if not mon_row:
                     stop_ev.set()
                     with self._monitor_lock:
@@ -2378,6 +2473,7 @@ class PipelineManager:
                     return {"ok": False, "lifecycle_state": "Stopped",
                             "message": f"Không tìm thấy Monitor #{monitor_id}."}
 
+                monitor_policy.validate_session(conn, dict(mon_row))
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 conn.execute(
                     "UPDATE monitors SET is_running = 1, status = 'Starting', last_checked_at = ?, last_heartbeat_at = ? WHERE id = ?",
@@ -2386,6 +2482,14 @@ class PipelineManager:
                 conn.commit()
             except Exception as exc:
                 stop_ev.set()
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                        conn.execute("UPDATE monitors SET is_running=0,status=? WHERE id=?",
+                                     (f'Cần xem lại cấu hình: {exc}', monitor_id))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
                 with self._monitor_lock:
                     if self._monitor_threads.get(monitor_id) is stop_ev:
                         self._monitor_threads.pop(monitor_id, None)
@@ -2760,92 +2864,34 @@ class PipelineManager:
         conn.close()
 
     @staticmethod
-    def _record_published_history_for_item(queue_id: int, channel: Dict[str, Any]) -> bool:
-        """Ghi published_history cho lượt đăng Completed có link thật.
-
-        Trước đây chỉ Auto Monitor ghi bảng này, nên video Completed từ link /
-        kéo-thả / đường dẫn local không được lưu lịch sử. Giữ source_post_id để
-        tương thích dữ liệu cũ và lưu content_key riêng cho file đã nhận diện.
-        """
+    def _monitor_upload_completed(queue_id: int) -> bool:
+        """Observe the owned completion; never repair history after claim release."""
         conn = get_conn()
         try:
+            conn.execute('BEGIN')
             row = conn.execute(
-                "SELECT status, published_url, post_id, source_url, content_key FROM video_queue WHERE id = ?",
+                "SELECT q.status,q.published_url,q.post_id,q.source_url,q.content_key,"
+                "a.channel_id,a.source_post_id,a.content_key AS attempt_content_key,"
+                "a.published_url AS attempt_url,a.phase,a.outcome "
+                "FROM video_queue q JOIN upload_attempts a ON a.id=q.last_attempt_id AND a.queue_id=q.id "
+                "WHERE q.id=? AND NOT EXISTS (SELECT 1 FROM upload_attempts newer WHERE newer.queue_id=q.id "
+                "AND (newer.attempt_no>a.attempt_no OR (newer.attempt_no=a.attempt_no AND newer.id>a.id)))",
                 (queue_id,),
             ).fetchone()
-            if not row:
+            if (not row or row['status'] != 'Completed' or row['outcome'] != 'Completed'
+                    or row['phase'] != 'Finished' or row['channel_id'] is None
+                    or not normalize_published_video_url(row['published_url'])
+                    or row['published_url'] != row['attempt_url']
+                    or row['content_key'] != row['attempt_content_key']
+                    or _history_source_post_id(dict(row), queue_id) != row['source_post_id']):
                 return False
-            if (row["status"] or "").strip() != "Completed" or not (row["published_url"] or "").strip():
-                return False
-            post_id = _history_source_post_id(dict(row), queue_id)
-            conn.execute(
-                "INSERT OR IGNORE INTO published_history "
-                "(source_post_id, source_url, channel_id, content_key, published_url) VALUES (?, ?, ?, ?, ?)",
-                (
-                    post_id,
-                    row["source_url"] or "",
-                    channel.get("id"),
-                    (row["content_key"] or "").strip(),
-                    (row["published_url"] or "").strip(),
-                ),
-            )
-            conn.execute(
-                "UPDATE published_history SET "
-                "source_url = CASE WHEN COALESCE(source_url, '') = '' THEN ? ELSE source_url END, "
-                "content_key = CASE WHEN COALESCE(content_key, '') = '' THEN ? ELSE content_key END, "
-                "published_url = CASE WHEN COALESCE(published_url, '') = '' THEN ? ELSE published_url END "
-                "WHERE source_post_id = ? AND channel_id = ?",
-                (
-                    row["source_url"] or "",
-                    (row["content_key"] or "").strip(),
-                    (row["published_url"] or "").strip(),
-                    post_id,
-                    channel.get("id"),
-                ),
-            )
-            conn.commit()
-            return True
-        finally:
-            conn.close()
-
-    def _record_monitor_published(self, queue_id: int, item_data: Dict[str, Any], mon: Dict[str, Any]) -> bool:
-        """Ghi published_history CHỈ khi video đã Completed và có link thật. Trả về True nếu đã ghi."""
-        conn = get_conn()
-        try:
-            row = conn.execute(
-                "SELECT status, published_url, content_key FROM video_queue WHERE id = ?", (queue_id,)
-            ).fetchone()
-            if not row:
-                return False
-            if (row["status"] or "").strip() != "Completed" or not (row["published_url"] or "").strip():
-                return False
-            conn.execute(
-                "INSERT OR IGNORE INTO published_history "
-                "(source_post_id, source_url, channel_id, content_key, published_url) VALUES (?, ?, ?, ?, ?)",
-                (
-                    item_data.get("post_id"),
-                    item_data.get("source_url"),
-                    mon.get("target_channel_id"),
-                    (row["content_key"] or "").strip(),
-                    (row["published_url"] or "").strip(),
-                ),
-            )
-            conn.execute(
-                "UPDATE published_history SET "
-                "source_url = CASE WHEN COALESCE(source_url, '') = '' THEN ? ELSE source_url END, "
-                "content_key = CASE WHEN COALESCE(content_key, '') = '' THEN ? ELSE content_key END, "
-                "published_url = CASE WHEN COALESCE(published_url, '') = '' THEN ? ELSE published_url END "
-                "WHERE source_post_id = ? AND channel_id = ?",
-                (
-                    item_data.get("source_url") or "",
-                    (row["content_key"] or "").strip(),
-                    (row["published_url"] or "").strip(),
-                    item_data.get("post_id"),
-                    mon.get("target_channel_id"),
-                ),
-            )
-            conn.commit()
-            return True
+            # A manual reupload may retain the first history URL; the latest URL
+            # belongs to the completed attempt, which is checked against the queue.
+            return conn.execute(
+                "SELECT 1 FROM published_history WHERE source_post_id=? AND channel_id=? "
+                "AND content_key=? AND COALESCE(published_url,'')<>'' LIMIT 1",
+                (row['source_post_id'], row['channel_id'], row['content_key']),
+            ).fetchone() is not None
         finally:
             conn.close()
 
@@ -2868,10 +2914,19 @@ class PipelineManager:
             interval_min = max(1, int(mon.get("check_interval_minutes") or 30))
 
             try:
+                with closing(get_conn()) as policy_conn:
+                    try:
+                        monitor_policy.validate_session(policy_conn, mon)
+                    except ValueError as exc:
+                        policy_conn.execute('UPDATE monitors SET is_running=0,status=? WHERE id=?',
+                                            (f'Cần xác nhận metadata: {exc}', monitor_id))
+                        policy_conn.commit()
+                        stop_ev.set()
+                        break
                 self._update_monitor_status(monitor_id, f"Đang quét {len(urls)} nguồn...")
                 scanned = scan_social_urls(
                     urls,
-                    max_items_per_url=max_vids * 2,
+                    max_items_per_url=min(MAX_SCAN_ITEMS, max_vids * 2),
                     min_views=min_views,
                     stop_event=stop_ev,
                 )
@@ -2961,7 +3016,7 @@ class PipelineManager:
 
                         # S2: chỉ đánh dấu "đã xử lý" KHI video thực sự đăng thành công —
                         # video lỗi/dừng sẽ được quét lại ở chu kỳ sau thay vì bị bỏ vĩnh viễn.
-                        published_now = self._record_monitor_published(queue_id, item_data, mon)
+                        published_now = self._monitor_upload_completed(queue_id)
                         if not published_now:
                             add_log(
                                 "Monitor",
@@ -2987,6 +3042,9 @@ class PipelineManager:
 
                     self._update_monitor_status(monitor_id, f"Hoàn tất chu kỳ. Quét tiếp sau {interval_min} phút.")
 
+            except InterruptedError:
+                # A requested Stop during extraction is a lifecycle transition.
+                break
             except Exception as e:
                 self._update_monitor_status(monitor_id, f"Lỗi: {e}")
                 add_log("Monitor", f"Lỗi luồng Monitor [{mon_name}]: {e}", "ERROR")

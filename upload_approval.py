@@ -4,6 +4,8 @@ import json
 import os
 import re
 import time
+import monitor_policy
+from metadata_resolution import resolve_metadata
 
 
 class PreviewStale(ValueError):
@@ -17,11 +19,13 @@ _QUEUE_FIELDS = (
     "made_for_kids", "altered_content", "age_restriction", "is_premiere",
     "render_mode", "render_config_json", "cut_start", "cut_end", "resolution",
     "emulate_mobile", "manual_reupload_authorized", "manual_reupload_reason",
+    "monitor_metadata_policy_json",
 )
 _CHANNEL_FIELDS = (
     "id", "channel_id", "profile_name", "profile_path", "upload_mode", "proxy",
     "default_category_id", "default_privacy", "made_for_kids", "altered_content",
     "emulate_mobile", "use_hidden_desktop", "is_subchannel",
+    "studio_category_mode",
 )
 
 
@@ -49,6 +53,7 @@ def upload_source_path(item):
 
 
 def approval_item(conn, item, channel, groups):
+    monitor_policy.resolve_item(conn, item, channel)
     channel_id = str(channel.get("channel_id") or "").strip()
     if not channel_id:
         raise PreviewStale("Kênh đích chưa có YouTube Channel ID.")
@@ -75,8 +80,11 @@ def approval_item(conn, item, channel, groups):
             raise PreviewStale("Liên kết UUID của profile Antidetect thiếu hoặc không khớp.")
     option_id = item.get("option_group_id")
     options = conn.execute("SELECT * FROM upload_option_groups WHERE id = ?", (option_id,)).fetchone() if option_id else None
+    if option_id and not options:
+        raise PreviewStale('Bộ tùy chọn của video không còn tồn tại. Chọn lại và xem trước, không tự dùng mặc định của kênh.')
     paths = [item.get(key) or "" for key in ("input_video_path", "output_video_path", "thumbnail_path")]
     return {
+        "schema_version": 3,
         "id": item["id"],
         "channel_id": channel["id"],
         "youtube_channel_id": channel_id,
@@ -94,6 +102,7 @@ def approval_item(conn, item, channel, groups):
             "oauth": digest(channel.get("oauth_token_json")),
         }),
         "option_revision": digest(dict(options) if options else None),
+        "metadata_effective": resolve_metadata(channel, dict(options) if options else None),
     }
 
 
