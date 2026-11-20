@@ -39,7 +39,7 @@ const source = fs.readFileSync(process.argv[1], 'utf8');
 const adminSource = fs.readFileSync(process.argv[2], 'utf8');
 const factoryStart = source.indexOf('  const node = ');
 const factoryEnd = source.indexOf('  function queueItems()', factoryStart);
-const rendererStart = source.indexOf('    const renderScheduleBanner = sched => {');
+const rendererStart = source.indexOf('    const renderScheduleBanner = ');
 const rendererEnd = source.indexOf("\n    if (typeof apiFetch === 'function')", rendererStart);
 assert(factoryStart >= 0 && factoryEnd > factoryStart && rendererStart >= 0 && rendererEnd > rendererStart);
 class Element {
@@ -54,23 +54,24 @@ class Element {
 }
 const drift = {detected: true, missing_future_count: 7, new_files_count: 7, next_source_exists: false};
 const waiting = {configured: true, status: 'waiting', message: 'Đang chờ', folder_drift: drift, action_required: true};
-function fixture(payload) {
-  const box = new Element('section'); const calls = [];
+function fixture(payload, syncResult = {}) {
+  const box = new Element('section'); const calls = []; const toasts = [];
   const context = {
     document: {createElement: tag => new Element(tag)}, dialog: {isConnected: true},
     byId: id => { assert.equal(id, 'publish-schedule-status'); return box; }, state: {},
-    capture: () => {}, refreshValidity: () => {},
+    capture: () => {}, refreshValidity: () => {}, showToast: (text, type) => toasts.push({text, type}),
     apiFetch: async (url, options) => {
       calls.push({url, options}); assert.equal(url, '/api/scheduled-uploads/sync');
-      return {ok: true, schedule: {configured: true, status: 'waiting', message: 'Đang chờ',
-        action_required: false, folder_drift: {detected: false, missing_future_count: 0, new_files_count: 0, next_source_exists: true}}};
+      return {ok: true, added_count: 2, removed_pending_count: 1, schedule: {configured: true,
+        status: 'waiting', message: 'Đang chờ', completed_count: 1, total_count: 9,
+        action_required: false, folder_drift: {detected: false, missing_future_count: 0, new_files_count: 0, next_source_exists: true}}, ...syncResult};
     },
   };
   vm.createContext(context);
   vm.runInContext(source.slice(factoryStart, factoryEnd) + source.slice(rendererStart, rendererEnd)
     + '\nglobalThis.render = renderScheduleBanner;', context);
   context.render(payload);
-  return {box, calls};
+  return {box, calls, toasts};
 }
 async function main() {
   let cases = 0;
@@ -82,7 +83,29 @@ async function main() {
   assert.equal(f.calls.length, 0); cases++;
   await f.box.find('publish-schedule-sync').listeners.click();
   assert.equal(f.calls.length, 1); assert.equal(f.calls[0].options.method, 'POST');
-  assert.equal(f.box.dataset.state, 'ready'); cases++;
+  assert.equal(f.box.dataset.state, 'ready');
+  assert.deepEqual(f.toasts.map(toast => toast.type), ['success']);
+  assert.match(f.toasts[0].text, /\+2 video mới, -1 mục mất file/); cases++;
+  const hostileWarning = '<img src=x onerror=window.scheduleXss=1>';
+  for (const [warning_code, expected] of [
+    ['STALE_CLEANUP_INCOMPLETE', 'một số mục cũ vẫn còn trong hàng đợi'],
+    [hostileWarning, 'Lịch đã cập nhật có cảnh báo'],
+    [{code: hostileWarning}, 'Lịch đã cập nhật có cảnh báo'],
+  ]) {
+    f = fixture(waiting, {warning_code});
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.toasts.length, 0);
+    await f.box.find('publish-schedule-sync').listeners.click();
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls[0].options.method, 'POST');
+    assert.equal(f.box.dataset.state, 'warning');
+    assert(f.box.textContent.includes('1/9 video'));
+    assert(f.box.textContent.includes(expected));
+    assert(!f.box.textContent.includes(hostileWarning));
+    assert.deepEqual(f.toasts.map(toast => toast.type), ['warning']);
+    assert(f.toasts[0].text.includes(expected));
+    assert(!f.toasts[0].text.includes(hostileWarning)); cases++;
+  }
   for (const status of ['running', 'submitted']) {
     f = fixture({...waiting, status, inflight_queue_id: 239});
     assert.equal(f.box.find('publish-schedule-sync'), undefined);

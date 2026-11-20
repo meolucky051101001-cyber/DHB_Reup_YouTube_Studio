@@ -1,5 +1,15 @@
 # CHANGELOG — DHB Reup YouTube Studio
 
+## 2026-11-21 — Giới hạn phạm vi đồng bộ và hoàn thiện gate phát hành
+
+- Đồng bộ chỉ xử lý pending ID thuộc manifest; giữ hàng đợi ngoài lịch trong cùng project. ID mới phải do chính lần scan trả về và vượt qua kiểm tra binding/nguồn; không tự nhận hàng được tạo đồng thời bởi thao tác khác. Đồng bộ lấy khóa runtime trước khóa lịch và kiểm tra dung lượng danh sách trước khi có thay đổi.
+- Nâng scan scheduler lên phạm vi 1.000 file được API hỗ trợ; trả `added_ids` từ transaction INSERT để xác định nguồn gốc hàng mới. Lỗi Preview không xóa slot cũ hoặc cập nhật manifest; scan có thể đã tạo hàng mới trong queue trước khi gặp lỗi ở bước sau.
+- Hàng do scan tạo có biên nhận HMAC riêng; rollback chỉ gỡ hàng còn nguyên trạng, không có claim/approval/evidence. Kiểm tra byte JSON trước công bố, giữ cặp gốc trong `sync-recovery-*` nếu phục hồi lỗi và chỉ dọn slot cũ bằng đối chiếu có điều kiện sau công bố. Giao diện hiển thị rõ cảnh báo nếu còn mục chưa dọn được.
+- CI bật và chạy rõ lớp Chromium trạng thái lịch vốn nằm ngoài glob cũ. Thêm guard kiểm tra mọi module browser opt-in đều được workflow bao phủ và giữ fail-fast. Xác minh CI giữ nguyên mọi gate; khi GitHub CLI không dùng được, chỉ đọc API GitHub công khai với cùng repo/run/SHA/job và fail closed nếu không xác minh đủ.
+- Soak chịu được WAL/artifact biến mất giữa phép liệt kê và stat, vẫn báo lỗi quyền/I/O khác. Áp cùng giới hạn tài nguyên/children/DB lock cho mẫu cuối trước complete; giữ soak thực 60 phút, 1.000 job và cooldown 30 phút.
+- Build ứng viên `2026.11.20-hardening.2`; bổ sung regression cho mixed-project/provenance/capacity, CI discovery và final-only resource growth. Nghiệm thu/CI/soak phải gắn với revision mới; không tái sử dụng kết quả soak dở dang của revision trước.
+
+
 ## 2026-11-20 — Gia cố receipt, lịch Private và triển khai
 
 - Receipt recheck ưu tiên trạng thái upload/xử lý thất bại thay vì chấp nhận một trường thành công; giữ đúng video ID và thao tác chỉ đọc, không tự giải quyết NeedsReview.

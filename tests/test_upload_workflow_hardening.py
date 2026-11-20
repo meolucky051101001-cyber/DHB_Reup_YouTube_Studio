@@ -622,7 +622,8 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
             def project_rows(self_api, _project):
                 return [dict(r) for r in db_rows]
 
-            def delete_rows(self_api, ids):
+            def delete_rows(self_api, ids, *, expected_rows=None):
+                self.assertEqual([row["id"] for row in expected_rows or []], list(ids))
                 deleted_batches.append(list(ids))
                 db_rows[:] = [r for r in db_rows if r["id"] not in set(ids)]
                 return {"ok": True, "deleted": len(ids)}
@@ -639,7 +640,8 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
                     "is_claimed": False,
                     "requires_review": False,
                 })
-                return {"ok": True, "added": 1, "skipped": 1}
+                return {"ok": True, "added": 1, "skipped": 1, "added_ids": [242],
+                        "cleanup_receipts": [{"queue_id": 242, "proof": "f" * 64}]}
 
             def preview_batch(self_api, _manifest, queue_ids):
                 previewed_batches.append(list(queue_ids))

@@ -167,6 +167,71 @@ def stop_owned_launch(launch_process):
     require(not remaining, 'The launched app did not terminate.')
 
 
+def public_ci_run(repo, run):
+    """Read one public GitHub run without credentials, redirects or response URLs."""
+    require(isinstance(repo, str) and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo)
+            and all(part not in ('.', '..') for part in repo.split('/'))
+            and isinstance(run, str) and re.fullmatch(r'[0-9]+', run), 'Invalid public CI run reference.')
+    base = f'https://api.github.com/repos/{repo}/actions/runs/{run}'
+    with requests.Session() as session:
+        session.trust_env = False  # Do not load netrc credentials or proxy configuration.
+
+        def get(url):
+            try:
+                response = session.get(url, timeout=(5, 15), allow_redirects=False,
+                                       headers={'Accept': 'application/vnd.github+json'})
+                require(response.status_code == 200, 'Public GitHub CI request failed.')
+                data = response.json()
+            except (requests.RequestException, ValueError):
+                raise RuntimeError('Public GitHub CI response is unavailable or malformed.') from None
+            require(isinstance(data, dict), 'Invalid public GitHub CI response schema.')
+            return data
+
+        data = get(base)
+        require(type(data.get('id')) is int and str(data['id']) == run
+                and isinstance(data.get('repository'), dict)
+                and data['repository'].get('full_name') == repo,
+                'Public GitHub CI run identity differs from the requested run.')
+        require(isinstance(data.get('head_sha'), str)
+                and re.fullmatch(r'[0-9a-fA-F]{40}', data['head_sha'])
+                and isinstance(data.get('conclusion'), str)
+                and data.get('status') == 'completed', 'Invalid public GitHub CI run schema.')
+        jobs, seen, total = [], set(), None
+        for page in range(1, 11):
+            batch = get(f'{base}/jobs?filter=latest&per_page=100&page={page}')
+            count, rows = batch.get('total_count'), batch.get('jobs')
+            require(type(count) is int and 0 <= count <= 1000
+                    and isinstance(rows, list) and len(rows) <= 100
+                    and (total is None or count == total), 'Invalid public GitHub CI jobs schema.')
+            total = count
+            for job in rows:
+                require(isinstance(job, dict) and type(job.get('id')) is int
+                        and job['id'] not in seen and type(job.get('run_id')) is int
+                        and str(job['run_id']) == run
+                        and isinstance(job.get('name'), str) and bool(job['name'])
+                        and isinstance(job.get('conclusion'), str)
+                        and ('head_sha' not in job or job['head_sha'] == data['head_sha']),
+                        'Invalid or mismatched public GitHub CI job.')
+                seen.add(job['id'])
+                jobs.append({'name': job['name'], 'conclusion': job['conclusion']})
+            require(len(jobs) <= total, 'Public GitHub CI jobs exceed their declared count.')
+            if len(jobs) == total:
+                return {'headSha': data['head_sha'], 'conclusion': data['conclusion'], 'jobs': jobs,
+                        'url': f'https://github.com/{repo}/actions/runs/{run}'}
+            require(bool(rows), 'Public GitHub CI jobs pagination is incomplete.')
+        raise RuntimeError('Public GitHub CI jobs exceed the pagination limit.')
+
+
+def ci_run(repo, run):
+    try:
+        output = subprocess.check_output(
+            ['gh', 'run', 'view', run, '--repo', repo, '--json', 'headSha,conclusion,jobs,url'],
+            text=True, encoding='utf-8', timeout=30)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return public_ci_run(repo, run)
+    return json.loads(output)
+
+
 def verify_acceptance(path, revision):
     result = json.loads(path.read_text(encoding='utf-8-sig'))
     require(result.get('revision') == revision and all(result.get(check) is True for check in
@@ -185,9 +250,7 @@ def verify_acceptance(path, revision):
             'Soak did not cover the release duration, load matrix and real cooldown.')
     repo, run = result.get('repo', ''), str(result.get('ci_run_id', ''))
     require(re.fullmatch(r'[\w.-]+/[\w.-]+', repo) and run.isdecimal(), 'Invalid CI run reference.')
-    ci = json.loads(subprocess.check_output(
-        ['gh', 'run', 'view', run, '--repo', repo, '--json', 'headSha,conclusion,jobs,url'],
-        text=True, encoding='utf-8', timeout=30))
+    ci = ci_run(repo, run)
     require(ci['headSha'] == revision and ci['conclusion'] == 'success'
             and {'unittest', 'media'} <= {job['name'] for job in ci['jobs'] if job['conclusion'] == 'success'},
             'Release CI is incomplete for this revision.')

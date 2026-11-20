@@ -183,7 +183,7 @@
       if (state.followup) requestAnimationFrame(() => runFollowup(state.followup));
     }, {once: true});
     dialog.showModal(); refreshValidity(); state.timer = setInterval(refreshValidity, 500);
-    const renderScheduleBanner = sched => {
+    const renderScheduleBanner = (sched, syncWarning = '') => {
       if (!dialog.isConnected || !sched || typeof sched !== 'object' || Array.isArray(sched) || sched.configured !== true) return;
       const box = byId('publish-schedule-status');
       if (!box) return;
@@ -198,7 +198,7 @@
       const newCount = validCount(drift.new_files_count) ? drift.new_files_count : 0;
       const nextMissing = drift.next_source_exists === false;
       const sourceChanged = drift.detected === true || missingCount > 0 || newCount > 0 || nextMissing;
-      box.dataset.state = sched.action_required === true || nextMissing || malformedDrift ? 'error' : (sourceChanged ? 'warning' : (sched.status === 'finished' ? 'done' : 'ready'));
+      box.dataset.state = sched.action_required === true || nextMissing || malformedDrift ? 'error' : (sourceChanged || syncWarning ? 'warning' : (sched.status === 'finished' ? 'done' : 'ready'));
       const headline = nextMissing ? 'Cần xử lý nguồn trước lượt đăng tiếp: file kế tiếp không còn trên đĩa.'
         : malformedDrift ? 'Cần kiểm tra nguồn: dữ liệu kiểm tra thư mục không hợp lệ.'
         : sourceChanged ? 'Cần kiểm tra nguồn: thư mục đã thay đổi.' : (sched.message || sched.status || 'Chưa rõ trạng thái');
@@ -219,19 +219,30 @@
             } catch (_) {}
             capture(state);
             refreshValidity();
-            if (res?.schedule) renderScheduleBanner(res.schedule);
+            const warning = res?.warning_code === 'STALE_CLEANUP_INCOMPLETE'
+              ? 'Lịch đã cập nhật, nhưng một số mục cũ vẫn còn trong hàng đợi. Đối chiếu hàng đợi với lịch mới trước khi tiếp tục.'
+              : res && Object.hasOwn(res, 'warning_code')
+                ? 'Lịch đã cập nhật có cảnh báo. Kiểm tra lịch và hàng đợi trước khi tiếp tục.' : '';
+            if (res?.schedule) renderScheduleBanner(res.schedule, warning);
             if (typeof showToast === 'function') {
-              showToast(`Đã đồng bộ lịch đăng (+${res?.added_count || 0} video mới, -${res?.removed_pending_count || 0} mục mất file).`, 'success');
+              if (warning) showToast(warning, 'warning');
+              else showToast(`Đã đồng bộ lịch đăng (+${res?.added_count || 0} video mới, -${res?.removed_pending_count || 0} mục mất file).`, 'success');
             }
           } catch (err) {
             syncBtn.disabled = false;
             syncBtn.textContent = 'Đồng bộ thư mục nguồn';
-            if (typeof showToast === 'function') showToast('Không thể đồng bộ thư mục nguồn: ' + (err?.message || err), 'error');
+            if (typeof showToast === 'function') {
+              const message = err?.status === 409
+                ? 'Không thể đồng bộ thư mục nguồn. Kiểm tra lịch và các mục trong hàng đợi; xử lý mục chưa được lên lịch hoặc cần khôi phục trước khi thử lại.'
+                : 'Không thể đồng bộ thư mục nguồn: ' + (err?.message || err);
+              showToast(message, 'error');
+            }
           }
         });
         headerRow.append(syncBtn);
       }
       box.append(headerRow);
+      if (syncWarning) box.append(node('p', 'publish-schedule-note', syncWarning));
       const details = [];
       if ((sourceChanged || malformedDrift) && (sched.message || sched.status)) details.push(`Trạng thái lịch: ${sched.message || sched.status}`);
       if (Number.isInteger(sched.completed_count) && Number.isInteger(sched.total_count)) {
