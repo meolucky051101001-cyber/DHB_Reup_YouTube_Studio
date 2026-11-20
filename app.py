@@ -387,7 +387,7 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.18-oauth"
+APP_BUILD_VERSION = "2026.11.20-hardening"
 
 
 def get_schedule_state_dir() -> Path:

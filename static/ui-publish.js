@@ -184,15 +184,27 @@
     }, {once: true});
     dialog.showModal(); refreshValidity(); state.timer = setInterval(refreshValidity, 500);
     const renderScheduleBanner = sched => {
-      if (!dialog.isConnected || !sched?.configured) return;
+      if (!dialog.isConnected || !sched || typeof sched !== 'object' || Array.isArray(sched) || sched.configured !== true) return;
       const box = byId('publish-schedule-status');
       if (!box) return;
       box.replaceChildren();
-      const drift = sched.folder_drift || {};
-      box.dataset.state = sched.action_required ? 'error' : (drift.detected ? 'warning' : (sched.status === 'finished' ? 'done' : 'ready'));
+      const rawDrift = sched.folder_drift;
+      const drift = rawDrift && typeof rawDrift === 'object' && !Array.isArray(rawDrift) ? rawDrift : {};
+      const validCount = value => Number.isSafeInteger(value) && value >= 0;
+      const malformedDrift = rawDrift != null && (rawDrift !== drift
+        || ['detected', 'next_source_exists'].some(key => drift[key] !== undefined && typeof drift[key] !== 'boolean')
+        || ['missing_future_count', 'new_files_count'].some(key => drift[key] !== undefined && !validCount(drift[key])));
+      const missingCount = validCount(drift.missing_future_count) ? drift.missing_future_count : 0;
+      const newCount = validCount(drift.new_files_count) ? drift.new_files_count : 0;
+      const nextMissing = drift.next_source_exists === false;
+      const sourceChanged = drift.detected === true || missingCount > 0 || newCount > 0 || nextMissing;
+      box.dataset.state = sched.action_required === true || nextMissing || malformedDrift ? 'error' : (sourceChanged ? 'warning' : (sched.status === 'finished' ? 'done' : 'ready'));
+      const headline = nextMissing ? 'Cần xử lý nguồn trước lượt đăng tiếp: file kế tiếp không còn trên đĩa.'
+        : malformedDrift ? 'Cần kiểm tra nguồn: dữ liệu kiểm tra thư mục không hợp lệ.'
+        : sourceChanged ? 'Cần kiểm tra nguồn: thư mục đã thay đổi.' : (sched.message || sched.status || 'Chưa rõ trạng thái');
       const headerRow = node('div', 'publish-scope');
-      headerRow.append(node('strong', '', `Lịch đăng Private định kỳ: ${sched.message || sched.status}`));
-      const canSync = !sched.inflight_queue_id && sched.status !== 'running' && sched.status !== 'submitted';
+      headerRow.append(node('strong', '', `Lịch đăng Private định kỳ: ${headline}`));
+      const canSync = !malformedDrift && !sched.inflight_queue_id && sched.status !== 'running' && sched.status !== 'submitted';
       if (canSync) {
         const syncBtn = node('button', 'btn btn-outline btn-sm', 'Đồng bộ thư mục nguồn');
         syncBtn.type = 'button';
@@ -221,6 +233,7 @@
       }
       box.append(headerRow);
       const details = [];
+      if ((sourceChanged || malformedDrift) && (sched.message || sched.status)) details.push(`Trạng thái lịch: ${sched.message || sched.status}`);
       if (Number.isInteger(sched.completed_count) && Number.isInteger(sched.total_count)) {
         details.push(`Tiến độ: ${sched.completed_count}/${sched.total_count} video`);
       }
@@ -234,12 +247,18 @@
         details.push(`Lượt gần nhất: #${sched.last_result.queue_id} (${sched.last_result.status})`);
       }
       if (details.length) box.append(node('p', 'publish-schedule-meta', details.join(' · ')));
-      if (drift.detected) {
+      if (sourceChanged) {
         const parts = [];
-        if (drift.missing_future_count) parts.push(`${drift.missing_future_count} file chờ không còn trên đĩa`);
-        if (drift.new_files_count) parts.push(`${drift.new_files_count} file mới chưa nạp vào lịch`);
-        box.append(node('p', 'publish-schedule-note', `Phát hiện thay đổi thư mục nguồn (${parts.join(', ')}). Bấm “Đồng bộ thư mục nguồn” để cập nhật an toàn.`));
+        if (missingCount) parts.push(`${missingCount} file chờ không còn trên đĩa`);
+        if (newCount) parts.push(`${newCount} file mới chưa nạp vào lịch`);
+        const summary = parts.length ? ` (${parts.join(', ')})` : '';
+        const nextStep = malformedDrift ? 'Tải lại trạng thái để kiểm tra nguồn trước khi đồng bộ hoặc chạy tiếp.'
+          : canSync ? 'Kiểm tra đúng thư mục/file nguồn rồi bấm “Đồng bộ thư mục nguồn” nếu muốn cập nhật lịch.'
+          : 'Chờ lượt đang xử lý kết thúc, kiểm tra nguồn rồi mới đồng bộ thư mục.';
+        box.append(node('p', 'publish-schedule-note', `Phát hiện thay đổi thư mục nguồn${summary}. ${nextStep}`));
+        if (newCount) box.append(node('p', 'publish-schedule-note', 'File mới không mặc nhiên là file đổi tên. Đối chiếu nội dung trước khi đồng bộ để tránh đăng trùng.'));
       }
+      if (malformedDrift) box.append(node('p', 'publish-schedule-note', 'Chưa đọc được đầy đủ thông tin nguồn lịch. Tải lại trạng thái và kiểm tra nguồn trước khi đồng bộ hoặc chạy tiếp.'));
       if (sched.task_disable_recommended) {
         box.append(node('p', 'publish-schedule-note', 'Đã hoàn tất toàn bộ lô video; bạn có thể tắt Windows Task để kết thúc chu kỳ kiểm tra.'));
       } else if (sched.task_session_required) {

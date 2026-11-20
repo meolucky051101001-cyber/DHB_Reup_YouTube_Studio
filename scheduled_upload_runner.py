@@ -74,11 +74,11 @@ def main(argv=None):
     args = parser().parse_args(argv)
     try:
         if args.command == "status":
-            print(json.dumps(read_schedule_status(args.state_dir), ensure_ascii=False, indent=2))
+            print(json.dumps(read_schedule_status(args.state_dir), ensure_ascii=True, indent=2))
             return 0
         if args.command == "sync-folder":
             result = sync_schedule_folder(args.state_dir, args.runtime_dir, base_url=args.base_url)
-            print(json.dumps(result, ensure_ascii=False))
+            print(json.dumps(result, ensure_ascii=True))
             return 0
         if args.command == "prepare-release":
             value = release_pin(args.runtime_dir, args.revision, args.build)
@@ -114,7 +114,7 @@ def main(argv=None):
                                     observer_seconds=args.observer_seconds)
             code = runner.run(dry_run=args.dry_run, observe_only=args.command == "observe")
             logger.info("Schedule check finished; exit_code=%d dry_run=%s", code, args.dry_run)
-            print(json.dumps(read_schedule_status(args.state_dir), ensure_ascii=False))
+            print(json.dumps(read_schedule_status(args.state_dir), ensure_ascii=True))
             return code
         except Exception as error:
             # Never include provider/HTTP bodies or arbitrary exception text in logs.

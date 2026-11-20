@@ -20,6 +20,8 @@ from urllib.parse import urlsplit
 
 import requests
 
+from app_instance_lock import AppInstanceAlreadyRunning, AppInstanceLock
+
 
 CONTRACT_VERSION = 1
 MANIFEST_VERSION = 2
@@ -212,6 +214,20 @@ def migrate_legacy(manifest, state, *, start_at):
 
 
 @contextmanager
+def runtime_operation_lock(runtime_dir):
+    """Exclude runner and rollout operations before they take a schedule lock."""
+    lock = AppInstanceLock(Path(runtime_dir).resolve() / "data" / "schedule_operation.lock")
+    try:
+        lock.acquire()
+    except AppInstanceAlreadyRunning:
+        raise ScheduleError("RUNTIME_OPERATION_ACTIVE") from None
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextmanager
 def single_instance(state_dir):
     path = Path(state_dir) / "schedule.lock"
     with path.open("a+b") as handle:
@@ -297,7 +313,10 @@ def read_schedule_status(state_dir, *, now=None):
                 public_result["finished_at"] = stamp(parse_time(result["finished_at"]))
         index = state["next_index"]
         drift = detect_folder_drift(manifest, state)
-        return {"configured": True, "status": status, "message": MESSAGES[status],
+        message = MESSAGES[status]
+        if status == "error" and state.get("error_code") == "SOURCE_CHANGED":
+            message = "Tệp nguồn của lượt kế tiếp đã thay đổi, không còn hoặc không đọc được. Cần kiểm tra trước khi đăng."
+        return {"configured": True, "status": status, "message": message,
                 "last_checked_at": state.get("last_checked_at"), "last_started_at": state.get("last_started_at"),
                 "last_result": public_result, "next_due_at": stamp(due) if index < len(manifest["jobs"]) else None,
                 "inflight_queue_id": state.get("inflight_queue_id"),
@@ -605,6 +624,16 @@ class ScheduleRunner:
         self.state["error_code"] = code
         save_json(self.directory / "state.json", self.state)
 
+    @staticmethod
+    def _check_source(job):
+        path = Path(job["path"])
+        try:
+            if path.is_file() and sha256(path) == job["sha256"].lower():
+                return
+        except OSError:
+            pass  # The source can disappear or become unreadable during the hash.
+        raise ScheduleError("SOURCE_CHANGED")
+
     def _check_rows(self, rows):
         index, inflight = self.state["next_index"], self.state.get("inflight_queue_id")
         for offset, job in enumerate(self.manifest["jobs"]):
@@ -657,7 +686,7 @@ class ScheduleRunner:
     def run(self, *, dry_run=False, observe_only=False):
         if not self.directory.is_dir():
             raise ScheduleError("SCHEDULE_UNINITIALIZED")
-        with single_instance(self.directory):
+        with runtime_operation_lock(self.runtime), single_instance(self.directory):
             self.manifest = load_json(self.directory / "manifest.json")
             jobs = validate_manifest(self.manifest)
             # Missing state is a hard stop, never permission to restart from job 0.
@@ -665,6 +694,16 @@ class ScheduleRunner:
             validate_state(self.state, self.manifest)
             release = load_json(self.directory / "release.json")
             validate_release(release, self.runtime)
+            index = self.state["next_index"]
+            if (not observe_only and index < len(jobs) and not self.state.get("inflight_queue_id")
+                    and self.state["submission_state"] == "ready"):
+                # Reject bad input before creating the API client or starting its server.
+                try:
+                    self._check_source(jobs[index])
+                except ScheduleError as error:
+                    if not dry_run:
+                        self._save("error", error.code)
+                    raise
             self.api = self.api_factory(self.base_url, self.runtime, release)
             try:
                 if self.api_factory is LocalAPI and not dry_run:
@@ -694,10 +733,12 @@ class ScheduleRunner:
                     slot = diagnostics.get("upload_slot") or {}
                     if not slot.get("available") or slot.get("state") == "recovery_required":
                         raise ScheduleError("UPLOAD_SLOT_UNAVAILABLE")
-                    for pending_job in jobs[self.state["next_index"]:]:
-                        if not Path(pending_job["path"]).is_file() or sha256(pending_job["path"]) != pending_job["sha256"].lower():
-                            raise ScheduleError("SOURCE_CHANGED")
-                    self.api.preview(self.manifest, jobs[self.state["next_index"]]["queue_id"])
+                    for pending_job in jobs[index:]:
+                        self._check_source(pending_job)
+                    # The HTTP preview persists an approval in the runtime database.
+                    # Only injected adapters may supply a read-only preview here.
+                    if not isinstance(self.api, LocalAPI):
+                        self.api.preview(self.manifest, jobs[index]["queue_id"])
                     return 0
                 due = next_due(self.manifest, self.state)
                 remaining = (due - self.now()).total_seconds()
@@ -720,10 +761,11 @@ class ScheduleRunner:
                     raise ScheduleError("UPLOAD_SLOT_UNAVAILABLE")
                 if slot.get("state") == "active" or (slot.get("remaining_seconds") or 0) > 0:
                     raise ScheduleError("UPLOAD_SLOT_BUSY")
-                job = jobs[self.state["next_index"]]
-                if not Path(job["path"]).is_file() or sha256(job["path"]) != job["sha256"].lower():
-                    raise ScheduleError("SOURCE_CHANGED")
+                job = jobs[index]
+                self._check_source(job)
                 payload = self.api.preview(self.manifest, job["queue_id"])
+                # The file can change during preview. Check before recording a submission.
+                self._check_source(job)
                 submitted = stamp(self.now())
                 self.state.update(inflight_queue_id=job["queue_id"], submission_state="submitting", submitted_at=submitted,
                                   last_started_at=submitted)
@@ -736,10 +778,13 @@ class ScheduleRunner:
                 self.state["submission_state"] = "started"
                 self._save("running")
                 return self._observe()
-            except (ScheduleError, OSError, ValueError, TypeError, KeyError):
+            except (ScheduleError, OSError, ValueError, TypeError, KeyError) as error:
                 # Keep inflight/submitting intact: an uncertain response cannot authorize resend.
                 if not dry_run:
-                    self._save("error", "SCHEDULE_CHECK_FAILED")
+                    code = "SCHEDULE_CHECK_FAILED"
+                    if isinstance(error, ScheduleError) and error.code == "SOURCE_CHANGED":
+                        code = error.code
+                    self._save("error", code)
                 raise
             finally:
                 session = getattr(self.api, "session", None)

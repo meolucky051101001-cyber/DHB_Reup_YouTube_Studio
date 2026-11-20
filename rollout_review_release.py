@@ -7,7 +7,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
-from contextlib import closing
+from contextlib import ExitStack, closing
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -18,7 +18,11 @@ from app_instance_lock import acquire_app_instance_lock
 from audit_upload_capabilities import environment_manifest
 from runtime_identity import APPLICATION_ID, git_environment, git_output, source_fingerprint
 from scheduled_upload_runner import release_pin as build_schedule_release_pin
-from scheduled_uploads import load_json as load_schedule_json, save_json as save_schedule_json, validate_manifest as validate_schedule_manifest, validate_state as validate_schedule_state
+from scheduled_uploads import (
+    load_json as load_schedule_json, save_json as save_schedule_json,
+    runtime_operation_lock, single_instance as schedule_single_instance,
+    validate_manifest as validate_schedule_manifest, validate_state as validate_schedule_state,
+)
 from validate_review_release import backup, rehearse, sha256_file, snapshot, verify_transition
 
 
@@ -29,6 +33,13 @@ def require(ok, message):
 
 def git(root, *args):
     return git_output(root, *args, timeout=45)
+
+
+def runtime_checkout_status(root):
+    """Keep old checkouts usable after the shared operation guard creates its file."""
+    status = git(root, 'status', '--porcelain', '--untracked-files=all')
+    return '\n'.join(line for line in status.splitlines()
+                     if line != '?? data/schedule_operation.lock')
 
 
 def server_arguments(port, *, access_log=False):
@@ -105,7 +116,8 @@ def verify_idle_schedule(schedule_dir):
     require(state.get('inflight_queue_id') is None and state.get('submission_state') not in ('submitting', 'started'),
             'Scheduled upload has an active or uncertain inflight job.')
     release_path = schedule_dir / 'release.json'
-    return load_schedule_json(release_path) if release_path.is_file() else None
+    require(release_path.is_file(), 'Configured schedule release pin is missing.')
+    return load_schedule_json(release_path)
 
 
 def verify_idle_db(path):
@@ -120,9 +132,11 @@ def verify_idle_db(path):
             require(conn.execute(query).fetchone()[0] == 0, 'Database has active work or upload recovery.')
 
 
-def launch(root, python, port, log_path):
+def launch(root, python, port, log_path, *, schedule_dir=None):
     env = git_environment(root, trust_root=True)
     env.pop('DHB_DISABLE_BACKGROUND_TASKS', None)
+    if schedule_dir is not None:
+        env['DHB_SCHEDULE_STATE_DIR'] = str(Path(schedule_dir).resolve())
     with log_path.open('xb') as log:
         return subprocess.Popen([str(python), *server_arguments(port)], cwd=root, env=env, stdin=subprocess.DEVNULL,
                                 stdout=log, stderr=log, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -318,15 +332,16 @@ def rehearse_recovery(root, revision, python, db):
                 'existing_evidence_preserved': True, 'changes': changes}, before
 
 
-def restore_previous(root, branch, previous, python, port, evidence, session, base, db, recovery_before):
+def restore_previous(root, branch, previous, python, port, evidence, session, base, db, recovery_before, *, schedule_dir=None):
     """Restart only the reviewed old code against exactly the rehearsed DB state."""
     require(recovery_before is not None and snapshot(db) == recovery_before,
             'Recovery DB differs from its verified snapshot. Runtime remains stopped; DB retained.')
     git(root, 'switch', branch)
-    require(git(root, 'rev-parse', 'HEAD') == previous and not git(root, 'status', '--porcelain'),
+    require(git(root, 'rev-parse', 'HEAD') == previous and not runtime_checkout_status(root),
             'Recovery checkout changed. Runtime remains stopped; DB retained.')
     require(not listeners(port), 'Recovery port is occupied; no process was started.')
-    restored = launch(root, python, port, evidence / f'restored-{previous[:12]}.log')
+    restored = launch(root, python, port, evidence / f'restored-{previous[:12]}.log',
+                      schedule_dir=schedule_dir)
     try:
         wait_for_start(session, base, root, previous, restored)
         verify_transition(recovery_before, snapshot(db), startup=True)
@@ -346,13 +361,26 @@ def rollout(args):
     require(revision == args.revision and not git(source, 'status', '--porcelain'), 'Release source must be clean and pinned.')
     previous = git(root, 'rev-parse', 'HEAD')
     branch = git(root, 'branch', '--show-current')
-    require(branch and not git(root, 'status', '--porcelain'), 'Runtime checkout must be clean and on a branch.')
+    require(branch and not runtime_checkout_status(root), 'Runtime checkout must be clean and on a branch.')
     git(root, 'check-ref-format', '--branch', args.branch)
     db = root / 'data' / 'dhb_youtube.sqlite'
-    schedule_dir = (args.schedule_state_dir.resolve() if getattr(args, 'schedule_state_dir', None)
-                    else (root / 'data' / 'scheduled_uploads' / 'default'))
+    schedule_override = getattr(args, 'schedule_state_dir', None)
+    if schedule_override is None:
+        environment_schedule = os.environ.get('DHB_SCHEDULE_STATE_DIR', '').strip()
+        # The runtime resolves a relative environment override from its own cwd.
+        schedule_override = (root / environment_schedule if environment_schedule
+                             else root / 'data' / 'scheduled_uploads' / 'default')
+    schedule_dir = Path(schedule_override).resolve()
     base = f'http://127.0.0.1:{args.port}'
-    with requests.Session() as session:
+    with ExitStack() as locks:
+        # Match the runner: runtime operation, configured schedule, then app singleton.
+        # The runtime guard also excludes work if a schedule appears during rehearsal.
+        if args.apply:
+            locks.enter_context(runtime_operation_lock(root))
+        schedule_configured = (schedule_dir / 'manifest.json').is_file()
+        if args.apply and schedule_configured:
+            locks.enter_context(schedule_single_instance(schedule_dir))
+        session = locks.enter_context(requests.Session())
         session.trust_env = False
         process = verified_server(root, args.port)
         if process is not None:
@@ -387,6 +415,8 @@ def rollout(args):
         if process is not None:
             http_state(session, base, root, previous)
         verify_idle_db(db)
+        require((schedule_dir / 'manifest.json').is_file() == schedule_configured,
+                'Schedule configuration changed during preflight.')
         previous_schedule_release = verify_idle_schedule(schedule_dir)
         schedule_backup = evidence / f'before-schedule-release-{revision[:12]}.json'
         stopped, switched, schedule_updated, launched = False, False, False, None
@@ -399,8 +429,10 @@ def rollout(args):
             lock = acquire_app_instance_lock(root / 'data' / 'app_instance.lock')
             try:
                 verify_idle_db(db)
+                require((schedule_dir / 'manifest.json').is_file() == schedule_configured,
+                        'Schedule configuration changed during preflight.')
                 previous_schedule_release = verify_idle_schedule(schedule_dir)
-                require(git(root, 'rev-parse', 'HEAD') == previous and not git(root, 'status', '--porcelain'),
+                require(git(root, 'rev-parse', 'HEAD') == previous and not runtime_checkout_status(root),
                         'Runtime checkout changed during preflight.')
                 backup(db, backup_path)
                 if previous_schedule_release is not None:
@@ -411,15 +443,19 @@ def rollout(args):
                 recovery_before = None
                 recovery, recovery_before = rehearse_recovery(root, previous, previous_python, backup_path)
                 require(snapshot(db) == before, 'Runtime DB changed following backup.')
+                require((schedule_dir / 'manifest.json').is_file() == schedule_configured,
+                        'Schedule configuration changed during rehearsal.')
+                require(verify_idle_schedule(schedule_dir) == previous_schedule_release,
+                        'Schedule release pin changed during rehearsal.')
                 git(root, 'switch', '-c', args.branch, revision)
                 switched = True
-                if (schedule_dir / 'manifest.json').is_file():
+                if schedule_configured:
                     save_schedule_json(schedule_dir / 'release.json',
                                        build_schedule_release_pin(root, revision, expected_build))
                     schedule_updated = True
             finally:
                 lock.release()
-            launched = launch(root, python, args.port, runtime_log)
+            launched = launch(root, python, args.port, runtime_log, schedule_dir=schedule_dir)
             diag = wait_for_start(session, base, root, revision, launched)
             require(diag['version'] == expected_build, 'Live build differs from the pinned release build.')
             verify_idle_db(db)
@@ -447,7 +483,7 @@ def rollout(args):
                 raise RuntimeError('Post-start verification failed. Runtime stopped and current DB retained.') from None
             if stopped and not listeners(args.port):
                 restore_previous(root, branch, previous, previous_python, args.port,
-                                 evidence, session, base, db, recovery_before)
+                                 evidence, session, base, db, recovery_before, schedule_dir=schedule_dir)
             elif switched:
                 git(root, 'switch', branch)
             raise
