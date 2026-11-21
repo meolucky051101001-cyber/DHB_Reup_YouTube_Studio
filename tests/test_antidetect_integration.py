@@ -366,12 +366,58 @@ class AntidetectLeaseTests(unittest.TestCase):
         lease._playwright = fake_pw
         lease.port = 9333
         with mock.patch.object(ac.time, "sleep"):
-            with self.assertRaises(ac.AntidetectError) as ctx:
+            with self.assertRaises(ac.AntidetectNotReady) as ctx:
                 lease._connect_cdp()
         message = str(ctx.exception)
         self.assertIn("9333", message)
         self.assertIn("sau 3 lần thử", message)
         self.assertEqual(len(fake_pw.chromium.calls), 3)
+
+    def test_lease_cdp_attach_failure_is_not_ready_and_cleans_owned_profile(self):
+        start = {
+            "success": True,
+            "port": 9222,
+            "launched_now": True,
+            "cdp_ready": True,
+            "configuration_verified": True,
+            "cdp_health": {"state": "healthy", "launch_id": "launch-1"},
+        }
+        lease, fake_pw, client, _ = self._lease(start, failures=99)
+        with mock.patch("playwright.sync_api.sync_playwright", return_value=fake_pw), \
+                mock.patch.object(ac.time, "sleep") as sleep:
+            with self.assertRaises(ac.AntidetectNotReady) as ctx:
+                lease.__enter__()
+
+        self.assertIn("9222", str(ctx.exception))
+        self.assertIn("sau 3 lần thử", str(ctx.exception))
+        self.assertEqual(len(fake_pw.chromium.calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(client.stop_calls, [("ad-1", "launch-1")])
+        self.assertTrue(fake_pw.stopped)
+
+    def test_lease_without_browser_context_is_not_ready_and_cleans_owned_profile(self):
+        start = {
+            "success": True,
+            "port": 9222,
+            "launched_now": True,
+            "cdp_ready": True,
+            "configuration_verified": True,
+            "cdp_health": {"state": "healthy", "launch_id": "launch-1"},
+        }
+        lease, fake_pw, client, context = self._lease(start)
+        browser = _FakeBrowser(context)
+        browser.contexts = []
+        with mock.patch("playwright.sync_api.sync_playwright", return_value=fake_pw), \
+                mock.patch.object(fake_pw.chromium, "connect_over_cdp", return_value=browser):
+            with self.assertRaises(ac.AntidetectNotReady) as ctx:
+                lease.__enter__()
+
+        self.assertEqual(
+            str(ctx.exception),
+            "Không tìm thấy context trình duyệt của profile Antidetect.",
+        )
+        self.assertEqual(client.stop_calls, [("ad-1", "launch-1")])
+        self.assertTrue(fake_pw.stopped)
 
     def test_hidden_lease_moves_started_window_offscreen(self):
         start = {
