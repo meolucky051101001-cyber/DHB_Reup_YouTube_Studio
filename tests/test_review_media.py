@@ -109,6 +109,14 @@ class RealMediaMatrix(unittest.TestCase):
                 self.run_case(name,mode,speed,audio,music,expected=expected,extra=extra)
                 self.assertEqual(run.call_count,1,'intro/outro must be encoded in the main pass')
 
+    def test_edge_intro_outro_after_cut_removes_all_audio(self):
+        source=self.root/'audio-first-second.mp4'
+        self.ffmpeg(['-i',str(self.root/'silent.mp4'),'-f','lavfi','-i','sine=frequency=440:duration=1','-c:v','copy','-c:a','aac',str(source)])
+        for name,mode,music in (('cut-no-audio-outro','full_16_9',False),('cut-no-audio-outro-music','shorts_9_16',True)):
+            with self.subTest(name=name):
+                self.run_case(name,mode,1,music=music,expected=3,source=source,cut_start='00:00:02',
+                              extra={'outro_enabled':True,'outro_name':'outro.mp4'})
+
     def test_edge_autofit(self):
         self.run_case('autofit','shorts_9_16',1,expected=4/1.34,
                       extra={'enforce_shorts_duration':True,'max_shorts_duration':3,'shorts_fit_mode':'speedup'})

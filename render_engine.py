@@ -332,7 +332,8 @@ def _inline_intro_outro(cmd: list, intro: Optional[Path], outro: Optional[Path],
     parts = [
         cmd[fc_index],
         f"[outv]trim=duration={dur:.6f},setpts=PTS-STARTPTS,fps={f},setsar=1,format=yuv420p,settb=AVTB[io_main_v]",
-        f"{main_audio}{audio_filter},{audio_norm},apad,atrim=duration={dur:.6f},asetpts=PTS-STARTPTS,asettb=AVTB[io_main_a]",
+        # asetpts=N/SR/TB: a cut that leaves no source audio yields untimed/empty audio that would stall concat.
+        f"{main_audio}{audio_filter},asetpts=N/SR/TB,{audio_norm},apad,atrim=duration={dur:.6f},asetpts=PTS-STARTPTS,asettb=AVTB[io_main_a]",
     ]
     first_extra = sum(1 for arg in cmd if arg == "-i")
     segments, new_inputs, expected = [], [], dur

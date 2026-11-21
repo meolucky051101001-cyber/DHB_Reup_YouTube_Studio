@@ -41,7 +41,7 @@ class IntroOutroConcatTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("music.wav") + 1:cmd.index("music.wav") + 3], ["-i", "outro.mp4"])
         self.assertIn("[2:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
         self.assertIn("pad=1080:1920", fc)
-        self.assertIn("[outa]anull,aformat=sample_rates=48000", fc)
+        self.assertIn("[outa]anull,asetpts=N/SR/TB,aformat=sample_rates=48000", fc)
         self.assertIn("[io_main_v][io_main_a][io_outro_v][io_outro_a]concat=n=2:v=1:a=1[io_v][io_a]", fc)
         self.assertNotIn("-shortest", cmd)
         self.assertEqual(cmd[-3:], ["-t", "5.500000", "out.mp4"])
@@ -57,7 +57,7 @@ class IntroOutroConcatTests(unittest.TestCase):
         self.assertNotIn("-af", cmd)
         self.assertEqual(cmd[cmd.index("src.mp4") + 1:cmd.index("src.mp4") + 5],
                          ["-i", "intro.mp4", "-i", "outro.mp4"])
-        self.assertIn("[0:a]atempo=2.0,aformat=sample_rates=44100", fc)
+        self.assertIn("[0:a]atempo=2.0,asetpts=N/SR/TB,aformat=sample_rates=44100", fc)
         self.assertIn("[1:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
         self.assertIn("[2:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
         self.assertIn("anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=1.500000", fc)
