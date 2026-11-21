@@ -343,8 +343,26 @@ class AntidetectClient:
             raise AntidetectError(data.get("error") or "Antidetect không dừng được profile.")
         return data if isinstance(data, dict) else {}
 
+    def open_url(self, profile_id: str, url: str) -> Dict[str, Any]:
+        """Start the profile on its default page, then open url in a new tab."""
+        # Starting a Google URL directly failed Antidetect's stealth checks.
+        res = self.start_profile(profile_id)
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{res['port']}", timeout=15000)
+            if not browser.contexts:
+                raise AntidetectNotReady("Profile Antidetect không có cửa sổ trình duyệt để mở trang.")
+            page = browser.contexts[0].new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+        return res
+
     def open_login(self, profile_id: str, url: str = "https://studio.youtube.com") -> Dict[str, Any]:
-        res = self.start_profile(profile_id, url=url)
+        res = self.open_url(profile_id, url)
         return {
             "ok": True,
             "antidetect": True,
