@@ -518,25 +518,29 @@ def sync_schedule_folder(state_dir, runtime_dir, *, api_factory=LocalAPI, base_u
                 if not row or row.get("status") != "Completed" or not row.get("published_url") or row.get("is_claimed") or row.get("requires_review"):
                     raise ScheduleError("COMPLETED_ITEM_CHANGED")
 
-            stale_ids = []
+            missing_ids = []
+            outside_ids = []
             for qid, row in sorted(by_id.items()):
                 if qid in completed_ids:
                     continue
                 if row.get("status") != "Pending" or row.get("published_url") or row.get("is_claimed") or row.get("requires_review"):
                     raise ScheduleError("PENDING_ITEM_CHANGED")
                 candidate = Path(str(row.get("input_video_path") or ""))
-                in_root = False
-                if candidate.is_file():
-                    try:
-                        candidate.resolve().relative_to(source_root)
-                        in_root = True
-                    except (ValueError, OSError):
-                        in_root = False
-                if not in_root:
-                    stale_ids.append(qid)
+                if not candidate.is_file():
+                    missing_ids.append(qid)
+                    continue
+                try:
+                    candidate.resolve().relative_to(source_root)
+                except (ValueError, OSError):
+                    outside_ids.append(qid)
 
-            if stale_ids:
-                api.delete_rows(stale_ids)
+            if outside_ids:
+                error = ScheduleError("PENDING_OUTSIDE_SOURCE")
+                error.queue_ids = outside_ids
+                raise error
+
+            if missing_ids:
+                api.delete_rows(missing_ids)
 
             scan_res = api.scan_folder(manifest)
             updated_rows = api.project_rows(manifest["project"])
@@ -578,7 +582,7 @@ def sync_schedule_folder(state_dir, runtime_dir, *, api_factory=LocalAPI, base_u
             save_json(directory / "state.json", new_state_obj)
             return {
                 "ok": True,
-                "removed_pending_count": len(stale_ids),
+                "removed_pending_count": len(missing_ids),
                 "added_count": int(scan_res.get("added") or 0),
                 "schedule": read_schedule_status(directory),
             }

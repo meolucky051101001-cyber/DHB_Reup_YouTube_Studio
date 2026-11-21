@@ -531,7 +531,7 @@ async function apiFetch(url, options = {}) {
     let errText = await res.text();
     try {
       const j = JSON.parse(errText);
-      errText = j.detail || j.message || errText;
+      errText = typeof j.detail === 'string' ? j.detail : (j.detail?.message || j.message || errText);
     } catch (_) {}
     const error = new Error(`HTTP ${res.status}: ${errText}`);
     error.status = res.status;
