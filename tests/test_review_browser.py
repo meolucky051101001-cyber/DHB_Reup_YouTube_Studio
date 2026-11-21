@@ -634,12 +634,15 @@ class ConfigBrowserTests(unittest.TestCase):
                 dialog.accept(next(prompts)) if dialog.type == 'prompt' else dialog.accept()
             page.on('dialog', dialog_handler)
             page.goto('http://127.0.0.1:8686/')
+            page.add_script_tag(content=(root/'static/ui-shared.js').read_text(encoding='utf-8'))
             page.add_script_tag(content=(root/'static/app.js').read_text(encoding='utf-8'))
             page.evaluate('loadProjects()')
             page.locator('[onclick="createNewProject()"]').click()
             page.wait_for_function("document.getElementById('sel-project').value === 'Dự án Việt / thử'")
+            page.wait_for_function("document.getElementById('studio-project-context').textContent.startsWith('Dự án Việt / thử')")
             page.locator('[onclick="renameCurrentProject()"]').click()
             page.wait_for_function("document.getElementById('sel-project').value === 'Đã đổi tên'")
+            page.wait_for_function("document.getElementById('studio-project-context').textContent.startsWith('Đã đổi tên')")
             # The option count already equals three before the duplicate request;
             # wait for its server error instead of racing the alert handler.
             with page.expect_event('dialog', predicate=lambda dialog: dialog.type == 'alert'):

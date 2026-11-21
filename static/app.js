@@ -673,6 +673,10 @@ async function loadProjects() {
   if ([...sel.options].some(o => o.value === current)) {
     sel.value = current;
   }
+  refreshProjectContext();
+}
+
+function refreshProjectContext() {
   window.StudioUI?.navigation(document.querySelector('.nav-tab.active')?.dataset.tab || 'tab-workspace');
 }
 
@@ -686,6 +690,7 @@ async function createNewProject() {
     });
     await loadProjects();
     document.getElementById('sel-project').value = name.trim();
+    refreshProjectContext();
     await loadQueue();
   } catch (e) {
     alert(e.message);
@@ -703,6 +708,7 @@ async function renameCurrentProject() {
     });
     await loadProjects();
     sel.value = result.name;
+    refreshProjectContext();
     await loadQueue();
   } catch (e) {
     alert(e.message);
