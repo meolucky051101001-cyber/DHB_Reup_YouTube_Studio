@@ -1187,12 +1187,14 @@ def remove_managed_artifact(artifact_id: int) -> None:
 _SETTINGS_CACHE_TTL_SECONDS = 2.0
 _SETTINGS_CACHE_LOCK = threading.Lock()
 _SETTINGS_CACHE: Optional[tuple] = None
+_SETTINGS_CACHE_GENERATION = 0
 
 
 def _invalidate_settings_cache() -> None:
-    global _SETTINGS_CACHE
+    global _SETTINGS_CACHE, _SETTINGS_CACHE_GENERATION
     with _SETTINGS_CACHE_LOCK:
         _SETTINGS_CACHE = None
+        _SETTINGS_CACHE_GENERATION += 1
 
 
 def get_settings() -> Dict[str, Any]:
@@ -1202,6 +1204,7 @@ def get_settings() -> Dict[str, Any]:
     now = time.monotonic()
     with _SETTINGS_CACHE_LOCK:
         cached = _SETTINGS_CACHE
+        generation = _SETTINGS_CACHE_GENERATION
     if cached and cached[0] == source and now - cached[1] < _SETTINGS_CACHE_TTL_SECONDS:
         return copy.deepcopy(cached[2])
     conn = get_conn()
@@ -1214,7 +1217,9 @@ def get_settings() -> Dict[str, Any]:
         except Exception:
             res[r["key"]] = r["value"]
     with _SETTINGS_CACHE_LOCK:
-        _SETTINGS_CACHE = (source, now, res)
+        # A save during this read invalidated the cache; don't republish the pre-save snapshot.
+        if generation == _SETTINGS_CACHE_GENERATION:
+            _SETTINGS_CACHE = (source, now, res)
     return copy.deepcopy(res)
 
 

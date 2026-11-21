@@ -109,5 +109,26 @@ class SettingsCacheTests(unittest.TestCase):
             self.assertEqual(database.get_settings()["max_concurrent_threads"], 3)
 
 
+    def test_save_during_cache_miss_does_not_republish_old_snapshot(self):
+        real_get_conn = database.get_conn
+
+        class SaveMidRead:
+            def __init__(self):
+                self.conn = real_get_conn()
+
+            def execute(self, *args):
+                rows = self.conn.execute(*args).fetchall()
+                database.save_settings({"max_concurrent_threads": 5})
+                return mock.Mock(fetchall=lambda: rows)
+
+            def close(self):
+                self.conn.close()
+
+        with mock.patch.object(database, "get_conn", side_effect=[SaveMidRead(), real_get_conn()]):
+            self.assertEqual(database.get_settings()["max_concurrent_threads"], 2)
+        self.assertIsNone(database._SETTINGS_CACHE)
+        self.assertEqual(database.get_settings()["max_concurrent_threads"], 5)
+
+
 if __name__ == "__main__":
     unittest.main()
