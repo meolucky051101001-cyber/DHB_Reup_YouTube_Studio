@@ -508,7 +508,8 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
         error = su.ScheduleError("PENDING_OUTSIDE_SOURCE")
         error.queue_ids = [271, 272]
         with mock.patch.dict(os.environ, {"DHB_SCHEDULE_STATE_DIR": str(self.state_dir)}), \
-                mock.patch.object(studio_app, "sync_schedule_folder", side_effect=error):
+                mock.patch.object(studio_app, "sync_schedule_folder", side_effect=error), \
+                mock.patch.object(studio_app, "collect_secret_values", return_value=[]):
             client = TestClient(studio_app.app, base_url="http://127.0.0.1:8686")
             token = client.get("/api/auth/token").json()["token"]
             headers = {"X-DHB-Token": token, "Origin": "http://127.0.0.1:8686"}
