@@ -278,11 +278,10 @@ def _build_branding(cfg, base_label: str, input_count: int, extra_inputs: list, 
     return overlay_segments, draw_chain, label, input_count
 
 
-def _apply_intro_outro(main_path: str, cfg, target_w: int, target_h: int, fps: int,
-                       progress_callback=None, stop_event=None, owner: str = "") -> Tuple[str, float]:
+def _resolve_intro_outro(cfg) -> Tuple[Optional[Path], Optional[Path]]:
     """
-    Ghép Intro / Outro từ kho tài nguyên (_Intro / _Outro) vào đầu / cuối video đã render,
-    hỗ trợ chọn ngẫu nhiên (intro_random / outro_random) — kế thừa preset Render của DHB.
+    Chọn Intro / Outro từ kho tài nguyên (_Intro / _Outro), hỗ trợ chọn ngẫu nhiên
+    (intro_random / outro_random) — kế thừa preset Render của DHB.
     """
     intro = _pick_media(
         DHB_RENDER_DIR / "_Intro", cfg.get("intro_name") or "", bool(cfg.get("intro_random")),
@@ -297,73 +296,76 @@ def _apply_intro_outro(main_path: str, cfg, target_w: int, target_h: int, fps: i
         raise ValueError("Đã bật Intro nhưng chưa chọn tài nguyên Intro.")
     if cfg.get("outro_enabled") and outro is None:
         raise ValueError("Đã bật Outro nhưng chưa chọn tài nguyên Outro.")
+    return intro, outro
 
-    if not intro and not outro:
-        return main_path, float(probe_video_info(main_path)["seconds"])
 
-    media = [m for m in (intro, Path(main_path), outro) if m]
-    segment_durations = {str(m): float(probe_video_info(str(m))["seconds"]) for m in media}
-    expected_duration = sum(segment_durations.values())
-    inputs = []
-    for m in media:
-        inputs.extend(["-i", str(m)])
+def _inline_intro_outro(cmd: list, intro: Optional[Path], outro: Optional[Path], main_duration: float,
+                        target_w: int, target_h: int, fps: int) -> Tuple[list, float]:
+    """
+    Ghép Intro / Outro ngay trong lệnh render chính để video chỉ encode một lần.
+    `cmd` là lệnh render chính: map video [outv], audio qua [outa] hoặc stream + -af tùy chọn.
+    """
+    cmd = list(cmd)
+    output_path = cmd.pop()
+    if len(cmd) >= 2 and cmd[-2] == "-t":
+        del cmd[-2:]
+    cmd = [arg for arg in cmd if arg != "-shortest"]
 
-    parts, vids, auds = [], [], []
+    fc_index = cmd.index("-filter_complex") + 1
+    maps = [i for i, arg in enumerate(cmd) if arg == "-map"]
+    video_map, audio_map = cmd[maps[0] + 1], cmd[maps[1] + 1]
+    if video_map != "[outv]":
+        raise ValueError(f"Lệnh render không hỗ trợ ghép Intro/Outro (map video {video_map}).")
+    audio_filter = "anull"
+    if "-af" in cmd:
+        af_index = cmd.index("-af")
+        audio_filter = cmd[af_index + 1]
+        del cmd[af_index:af_index + 2]
+        maps = [i for i, arg in enumerate(cmd) if arg == "-map"]
+        fc_index = cmd.index("-filter_complex") + 1
+    sample_rate = cmd[cmd.index("-ar") + 1] if "-ar" in cmd else "44100"
+
     f = int(fps or 30)
-    # Main nằm ngay sau intro khi có intro, nếu không thì đứng đầu — KHÔNG giả định i == 1,
-    # vì khi chỉ có outro thì main là i=0 và outro mới là segment cần chuẩn hóa khung hình.
-    main_index = 1 if intro else 0
-    for i, m in enumerate(media):
-        # Concat filter yêu cầu các segment cùng timebase/pix_fmt/sample_rate/channel_layout —
-        # chuẩn hóa triệt để (settb=AVTB + aformat) để tránh "Error linking filters"
-        if i == main_index:
-            parts.append(f"[{i}:v]setpts=PTS-STARTPTS,fps={f},setsar=1,format=yuv420p,settb=AVTB[p{i}]")
-        else:
-            parts.append(
-                f"[{i}:v]setpts=PTS-STARTPTS,scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
-                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps={f},setsar=1,format=yuv420p,settb=AVTB[p{i}]"
-            )
-        vids.append(f"[p{i}]")
-        seg_probe = probe_video_info(str(m))
-        seg_dur = float(seg_probe["seconds"])
-        if seg_probe.get("has_audio"):
-            parts.append(
-                f"[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS,"
-                f"apad,atrim=duration={seg_dur:.6f},asettb=AVTB[a{i}]"
-            )
-        else:
-            parts.append(
-                f"anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration={seg_dur:.6f},asettb=AVTB[a{i}]"
-            )
-        auds.append(f"[a{i}]")
-
-    n = len(media)
-    # concat filter nhận input XEN KẼ theo từng segment: [v0][a0][v1][a1]... (KHÔNG phải video hết rồi audio)
-    fc = ";".join(parts) + ";" + "".join(f"[p{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[v][a]"
-
-    out_path = str(APP_OUTPUT_DIR / _make_output_filename("yt_io", Path(main_path).stem, ".mp4"))
-    cmd = (
-        [FFMPEG_EXE, "-y"] + inputs
-        + ["-filter_complex", fc, "-map", "[v]", "-map", "[a]"]
-        + ["-c:v", "libx264", "-r", str(f), "-crf", "20", "-preset", "superfast"]
-        + ["-c:a", "aac", "-b:a", "192k"]
-        + _clear_metadata_args()
-        + [out_path]
-    )
-    try:
-        _run_ffmpeg_with_progress(
-            cmd, expected_duration,
-            progress_callback, stop_event=stop_event, partial_output=out_path, owner=owner,
+    dur = float(main_duration)
+    main_audio = audio_map if audio_map.startswith("[") else f"[{audio_map.rstrip('?')}]"
+    audio_norm = f"aformat=sample_rates={sample_rate}:channel_layouts=stereo"
+    parts = [
+        cmd[fc_index],
+        f"[outv]trim=duration={dur:.6f},setpts=PTS-STARTPTS,fps={f},setsar=1,format=yuv420p,settb=AVTB[io_main_v]",
+        f"{main_audio}{audio_filter},{audio_norm},apad,atrim=duration={dur:.6f},asetpts=PTS-STARTPTS,asettb=AVTB[io_main_a]",
+    ]
+    first_extra = sum(1 for arg in cmd if arg == "-i")
+    segments, new_inputs, expected = [], [], dur
+    for name, media in (("intro", intro), ("outro", outro)):
+        if not media:
+            continue
+        index = first_extra + len(new_inputs) // 2
+        new_inputs.extend(["-i", str(media)])
+        probe = probe_video_info(str(media))
+        seg_dur = float(probe["seconds"])
+        expected += seg_dur
+        parts.append(
+            f"[{index}:v]setpts=PTS-STARTPTS,scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps={f},setsar=1,format=yuv420p,settb=AVTB[io_{name}_v]"
         )
-    except BaseException:
-        _cleanup_partial_output(main_path)
-        raise
-    try:
-        if out_path != main_path and os.path.exists(main_path):
-            os.remove(main_path)
-    except Exception:
-        pass
-    return out_path, expected_duration
+        if probe.get("has_audio"):
+            parts.append(
+                f"[{index}:a]{audio_norm},asetpts=PTS-STARTPTS,apad,atrim=duration={seg_dur:.6f},asettb=AVTB[io_{name}_a]"
+            )
+        else:
+            parts.append(
+                f"anullsrc=channel_layout=stereo:sample_rate={sample_rate},atrim=duration={seg_dur:.6f},asettb=AVTB[io_{name}_a]"
+            )
+        segments.append(name)
+    order = (["intro"] if "intro" in segments else []) + ["main"] + (["outro"] if "outro" in segments else [])
+    # concat filter nhận input XEN KẼ theo từng segment: [v0][a0][v1][a1]...
+    parts.append("".join(f"[io_{n}_v][io_{n}_a]" for n in order) + f"concat=n={len(order)}:v=1:a=1[io_v][io_a]")
+
+    cmd[fc_index] = ";".join(parts)
+    cmd[maps[0] + 1], cmd[maps[1] + 1] = "[io_v]", "[io_a]"
+    input_end = fc_index - 1
+    cmd[input_end:input_end] = new_inputs
+    return cmd + ["-t", f"{expected:.6f}", output_path], expected
 
 
 def time_str_to_seconds(t_str: str) -> float:
@@ -702,6 +704,18 @@ def render_video(
         crf_val = "20"
 
     bitrate = str(cfg.get("bitrate") or default_bitrate)
+    intro_media, outro_media = (None, None)
+    if render_mode not in ("md5_cut", "custom_ffmpeg"):
+        intro_media, outro_media = _resolve_intro_outro(cfg)
+
+    def run_main_render(cmd: list, frame_w: int, frame_h: int) -> float:
+        main_duration = effective_dur / speed
+        cmd[-1:-1] = ["-t", f"{main_duration:.6f}"]
+        expected = main_duration
+        if intro_media or outro_media:
+            cmd, expected = _inline_intro_outro(cmd, intro_media, outro_media, main_duration, frame_w, frame_h, fps)
+        _run_ffmpeg_with_progress(cmd, expected, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
+        return expected
 
     # Các chế độ copy stream/custom command không có filter graph để áp crop/xoay/viền/zoom
     pre_edit_chain = ""
@@ -858,8 +872,7 @@ def render_video(
                 + _clear_metadata_args()
                 + [output_path]
             )
-        cmd[-1:-1] = ["-t", f"{effective_dur / speed:.6f}"]
-        _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
+        expected_output_duration = run_main_render(cmd, w_shorts, h_shorts)
         out_w, out_h = w_shorts, h_shorts
         rendered = True
 
@@ -903,8 +916,7 @@ def render_video(
                 + _clear_metadata_args()
                 + [output_path]
             )
-            cmd[-1:-1] = ["-t", f"{effective_dur / speed:.6f}"]
-            _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
+            expected_output_duration = run_main_render(cmd, 1280, 720)
             out_w, out_h = 1280, 720
             rendered = True
 
@@ -987,24 +999,10 @@ def render_video(
                 + [output_path]
             )
 
-        cmd[-1:-1] = ["-t", f"{effective_dur / speed:.6f}"]
-        _run_ffmpeg_with_progress(cmd, effective_dur / speed, progress_callback, stop_event=stop_event, partial_output=output_path, owner=owner)
+        expected_output_duration = run_main_render(cmd, w_res, h_res)
         out_w, out_h = w_res, h_res
         rendered = True
 
-    # GHÉP INTRO/OUTRO TỰ ĐỘNG (kế thừa preset Render của DHB) — áp cho các chế độ có encode lại video
-    if rendered and (cfg.get("intro_enabled") or cfg.get("outro_enabled")):
-        main_output_path = output_path
-        try:
-            output_path, expected_output_duration = _apply_intro_outro(
-                output_path, cfg, out_w, out_h, fps,
-                progress_callback=progress_callback, stop_event=stop_event, owner=owner,
-            )
-        except BaseException:
-            _cleanup_partial_output(main_output_path)
-            raise
-    else:
-        expected_output_duration = effective_dur / speed
     _finalize_render_output(
         output_path,
         expected_width=int(out_w), expected_height=int(out_h),
