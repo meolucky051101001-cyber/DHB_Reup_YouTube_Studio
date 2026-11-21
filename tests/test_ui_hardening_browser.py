@@ -236,6 +236,36 @@ class UploadWorkflowHardeningBrowserTests(unittest.TestCase):
         self.assertIn("1 file chờ không còn trên đĩa", banner.inner_text())
         self.assertIn("2 file mới chưa nạp vào lịch", banner.inner_text())
 
+        outside_message = (
+            "Dự án lịch đăng có video thêm tay nằm ngoài thư mục nguồn (#271, #272). "
+            "Hãy chuyển các video này sang dự án khác rồi đồng bộ lại. Chưa xóa video nào."
+        )
+
+        def outside_source_error(route, parsed):
+            if parsed.path != "/api/scheduled-uploads/sync":
+                return False
+            route.fulfill(
+                status=409,
+                content_type="application/json",
+                body=json.dumps({
+                    "detail": {
+                        "message": outside_message,
+                        "code": "PENDING_OUTSIDE_SOURCE",
+                        "queue_ids": [271, 272],
+                    }
+                }),
+            )
+            return True
+
+        self.fixture.handler = outside_source_error
+        with self.page.expect_response("**/api/scheduled-uploads/sync"):
+            banner.locator("#publish-schedule-sync").click()
+        error_toast = self.page.locator("#toast-container .ui-toast-error").last
+        error_toast.wait_for(state="visible")
+        self.assertIn(outside_message, error_toast.inner_text())
+        self.assertNotIn("[object Object]", error_toast.inner_text())
+
+        self.fixture.handler = None
         with self.page.expect_response("**/api/scheduled-uploads/sync"):
             banner.locator("#publish-schedule-sync").click()
         self.page.wait_for_function("document.getElementById('publish-schedule-status')?.dataset?.state === 'ready'")

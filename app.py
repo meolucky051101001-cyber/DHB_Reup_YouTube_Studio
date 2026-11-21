@@ -788,6 +788,24 @@ def api_scheduled_uploads_sync():
         )
         return result
     except ScheduleError as exc:
+        if exc.code == "PENDING_OUTSIDE_SOURCE":
+            queue_ids = list(getattr(exc, "queue_ids", []))
+            id_list = ", ".join(f"#{queue_id}" for queue_id in queue_ids)
+            ids_label = f" ({id_list})" if id_list else ""
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": {
+                        "message": (
+                            "Dự án lịch đăng có video thêm tay nằm ngoài thư mục nguồn"
+                            f"{ids_label}. Hãy chuyển các video này sang dự án khác rồi đồng bộ lại. "
+                            "Chưa xóa video nào."
+                        ),
+                        "code": exc.code,
+                        "queue_ids": queue_ids,
+                    }
+                },
+            )
         raise HTTPException(
             status_code=409,
             detail={"message": f"Không thể đồng bộ thư mục lịch đăng ({exc.code}).", "code": exc.code},
