@@ -48,8 +48,8 @@ def server_arguments(port, *, access_log=False):
 
 
 def http_state(session, base, root, revision):
-    def get(path, **kwargs):
-        response = session.get(base + path, timeout=15, allow_redirects=False, **kwargs)
+    def get(path, *, timeout=15, **kwargs):
+        response = session.get(base + path, timeout=timeout, allow_redirects=False, **kwargs)
         response.raise_for_status()
         return response.json()
 
@@ -59,7 +59,7 @@ def http_state(session, base, root, revision):
     headers = {'X-DHB-Token': get('/api/auth/token')['token'], 'Origin': base}
     overview = get('/api/overview', headers=headers)
     require(not overview['pipeline_running'] and overview['monitors_running'] == 0, 'Runtime is busy.')
-    diag = get('/api/diagnostics', headers=headers)
+    diag = get('/api/diagnostics', headers=headers, timeout=45)
     identity = diag['runtime']
     require(identity['revision'] == revision and not identity['restart_required']
             and identity['startup_fingerprint'] == source_fingerprint(root),

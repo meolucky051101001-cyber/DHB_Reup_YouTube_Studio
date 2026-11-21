@@ -330,13 +330,15 @@ class ScheduleSyncScopeTests(unittest.TestCase):
         self.assertEqual((recovery_directory / "state.json").read_bytes(), before[1])
 
     def test_recovery_directory_cleanup_error_cannot_undo_successful_publication(self):
+        # Exercise the canonical/lexical path difference also seen with Windows temp aliases.
+        self.state_dir = self.state_dir / ".." / self.state_dir.name
         Path(self.rows[240]["input_video_path"]).unlink()
         self.scan_rows = [self.row(250)]
         native_rmdir = Path.rmdir
         cleanup_attempts = []
 
         def fail_backup_cleanup(path):
-            if path.parent == self.state_dir and path.name.startswith("sync-recovery-"):
+            if path.parent.resolve() == self.state_dir.resolve() and path.name.startswith("sync-recovery-"):
                 cleanup_attempts.append(path)
                 raise OSError("fixture cleanup error")
             return native_rmdir(path)
