@@ -88,20 +88,7 @@ def open_url_in_channel_browser(
         from antidetect_client import AntidetectClient
 
         client = AntidetectClient()
-        res = client.start_profile(ad_id, url=url)
-        # If the Antidetect profile was already running, open a dedicated tab via CDP so the user sees `url` immediately.
-        if not res.get("launched_now") and isinstance(res.get("port"), int):
-            from playwright.sync_api import sync_playwright
-
-            with sync_playwright() as pw:
-                browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{res['port']}", timeout=15000)
-                if browser.contexts:
-                    page = browser.contexts[0].new_page()
-                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    try:
-                        page.bring_to_front()
-                    except Exception:
-                        pass
+        res = client.open_url(ad_id, url)
         return {"browser": "antidetect", "antidetect_profile_id": ad_id, "port": res.get("port")}
 
     if not webbrowser.open(url):

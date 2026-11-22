@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -28,6 +29,22 @@ LIMITS = {
 def require(ok, message):
     if not ok:
         raise RuntimeError(message)
+
+
+def file_size(path, *, regular_only=False):
+    """Measure one entry; a concurrently removed file contributes no bytes."""
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return 0
+    return info.st_size if not regular_only or stat.S_ISREG(info.st_mode) else 0
+
+
+def check_sample_limits(sample, baseline, *, peak_lock_ms=0):
+    require(not sample['children'] and max(sample['lock_ms'], peak_lock_ms) <= LIMITS['lock_ms'],
+            'Child processes or excessive SQLite lock latency after drain.')
+    for key in ('rss', 'handles', 'threads', 'db_wal', 'artifact', 'log_rows'):
+        require(sample[key] <= baseline[key] + LIMITS[key + '_growth'], f'Limit exceeded: {key}.')
 
 
 def restrict_boundaries():
@@ -130,10 +147,11 @@ class Soak:
         lock_ms = self.measure_db_lock()
         with closing(self.db.get_conn()) as conn:
             log_rows = conn.execute('SELECT COUNT(*) FROM system_logs').fetchone()[0]
-        db_wal = sum(path.stat().st_size for path in self.config.APP_DATA_DIR.glob('soak.sqlite*')
+        db_wal = sum(file_size(path) for path in self.config.APP_DATA_DIR.glob('soak.sqlite*')
                      if not path.name.endswith('-shm'))
-        artifacts = sum(file.stat().st_size for path in (self.config.APP_OUTPUT_DIR, self.config.APP_TEMP_DIR)
-                        for file in path.rglob('*') if file.is_file())
+        artifacts = sum(file_size(file, regular_only=True)
+                        for path in (self.config.APP_OUTPUT_DIR, self.config.APP_TEMP_DIR)
+                        for file in path.rglob('*'))
         handles = process.num_handles() if os.name == 'nt' else process.num_fds()
         return {'rss': process.memory_info().rss, 'threads': process.num_threads(), 'handles': handles,
                 'db_wal': db_wal, 'artifact': artifacts, 'lock_ms': lock_ms, 'log_rows': log_rows,
@@ -341,10 +359,7 @@ def run(args, log, root):
                 result = soak.render_round(f'Round {round_no + 1}', 8 if args.pilot else 100, workers)
                 sample = result['sample']
                 soak.report('round', **result)
-                require(not sample['children'] and max(sample['lock_ms'], result['peak_lock_ms']) <= LIMITS['lock_ms'],
-                        'Render children or excessive SQLite lock latency after drain.')
-                for key in ('rss', 'handles', 'threads', 'db_wal', 'artifact', 'log_rows'):
-                    require(sample[key] <= baseline[key] + LIMITS[key + '_growth'], f'Limit exceeded: {key}.')
+                check_sample_limits(sample, baseline, peak_lock_ms=result['peak_lock_ms'])
                 require(not denied, 'A prohibited external boundary was reached.')
             if not args.pilot:
                 time.sleep(max(0, started + args.minutes * 60 - time.monotonic()))
@@ -354,8 +369,10 @@ def run(args, log, root):
                     and all(soak.hash_file(path) == digest for rows in soak.sources.values() for path, digest in rows),
                     'Source content changed during soak.')
             require(not children() and not denied and not soak.violations, 'Soak invariants failed after drain.')
+            final = soak.sample()
+            check_sample_limits(final, baseline)
             summary = {'pilot': args.pilot, 'revision': args.revision, 'jobs': len(soak.rendered) - WARMUP_JOBS,
-                       'seconds': round(time.monotonic() - started, 3), 'uploads': uploads, 'final': soak.sample()}
+                       'seconds': round(time.monotonic() - started, 3), 'uploads': uploads, 'final': final}
     finally:
         soak.manager._stop_event.set()
         soak.uploader._stop_event.set()
@@ -369,18 +386,28 @@ def run(args, log, root):
     soak.report('complete', **summary)
 
 
-if __name__ == '__main__':
+def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True, help='New JSONL report path')
     parser.add_argument('--minutes', type=int, default=60)
     parser.add_argument('--pilot', action='store_true', help='Short harness check without cooldown acceptance')
-    args = parser.parse_args()
+    return parser
+
+
+def parse_args(argv=None):
+    parser = make_parser()
+    args = parser.parse_args(argv)
     if not 60 <= args.minutes <= 120:
         parser.error('Choose 60 to 120 minutes for the acceptance soak.')
+    return args
+
+
+if __name__ == '__main__':
+    args = parse_args()
     source_root = Path(__file__).resolve().parent
     args.revision = git_output(source_root, 'rev-parse', 'HEAD')
     if not args.pilot and git_output(source_root, 'status', '--porcelain'):
-        parser.error('Run acceptance on a clean, committed revision.')
+        make_parser().error('Run acceptance on a clean, committed revision.')
     with (args.output.open('x', encoding='utf-8') as log,
           tempfile.TemporaryDirectory(prefix='dhb-offline-soak-') as folder):
         run(args, log, Path(folder))

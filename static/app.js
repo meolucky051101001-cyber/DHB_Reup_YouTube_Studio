@@ -35,6 +35,8 @@ let gPipelineRunning = false;
 let gPendingBannerDismissed = false;
 let gPendingQueueIds = [];
 let gLastQueueProject = null;
+let gQueueEtag = null;
+const API_NOT_MODIFIED = Symbol('apiNotModified');
 let gApiToken = null;
 let gApiTokenPromise = null;
 let gLiveRefreshInFlight = false;
@@ -504,14 +506,15 @@ async function ensureApiToken(force = false) {
 }
 
 async function apiFetch(url, options = {}) {
+  const { onHeaders, ...fetchOptions } = options;
   const doFetch = async () => {
     const token = await ensureApiToken();
-    const headers = new Headers(options.headers || {});
+    const headers = new Headers(fetchOptions.headers || {});
     headers.set('X-DHB-Token', token);
-    if (!(options.body instanceof FormData) && !headers.has('Content-Type')) {
+    if (!(fetchOptions.body instanceof FormData) && !headers.has('Content-Type')) {
       headers.set('Content-Type', 'application/json');
     }
-    return fetch(url, { ...options, headers });
+    return fetch(url, { ...fetchOptions, headers });
   };
   const safeFetch = async () => {
     try { return await doFetch(); }
@@ -527,6 +530,7 @@ async function apiFetch(url, options = {}) {
     resetApiToken();
     res = await safeFetch();
   }
+  if (res.status === 304) return API_NOT_MODIFIED;
   if (!res.ok) {
     let errText = await res.text();
     try {
@@ -537,6 +541,7 @@ async function apiFetch(url, options = {}) {
     error.status = res.status;
     throw error;
   }
+  if (onHeaders) onHeaders(res.headers);
   return res.json();
 }
 
@@ -1877,10 +1882,23 @@ async function loadQueue(preserveSelection = false) {
     gLastQueueProject = proj;
     gPendingBannerDismissed = false;
   }
+  // Poll chỉ tải lại khi dữ liệu đổi; tải lại chủ động hoặc khi danh sách kênh đổi thì luôn render lại.
+  const queueEtagKey = { proj, channels: gChannels };
+  const knownEtag = preserveSelection && gQueueEtag && gQueueEtag.proj === proj && gQueueEtag.channels === gChannels
+    ? gQueueEtag.value : '';
   let items;
-  try { items = await apiFetch(`/api/queue?project=${encodeURIComponent(proj)}`); }
+  let nextEtag = '';
+  try {
+    items = await apiFetch(`/api/queue?project=${encodeURIComponent(proj)}`, {
+      cache: 'no-store',
+      headers: knownEtag ? { 'If-None-Match': knownEtag } : {},
+      onHeaders: headers => { nextEtag = headers.get('ETag') || ''; },
+    });
+  }
   catch (error) { window.StudioQueue?.onLoadError(error); throw error; }
   if ((document.getElementById('sel-project').value || 'Default') !== proj) return;
+  if (items === API_NOT_MODIFIED) return;
+  gQueueEtag = nextEtag ? { ...queueEtagKey, value: nextEtag } : null;
   gQueueItems = items || [];
   updatePendingQueueBanner(gQueueItems);
   if (!preserveSelection) {

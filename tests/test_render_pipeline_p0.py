@@ -19,69 +19,53 @@ def _filter_complex_of(cmd):
 
 
 class IntroOutroConcatTests(unittest.TestCase):
-    """Concat chuẩn hóa khung hình/âm thanh cho intro/outro, kể cả khi chỉ bật một phía."""
+    """Intro/outro được ghép ngay trong lệnh render chính, chuẩn hóa khung hình/âm thanh."""
 
-    def _apply(self, intro, outro, main_path):
-        captured = {}
+    main_cmd = (
+        "ffmpeg", "-y", "-i", "src.mp4", "-stream_loop", "-1", "-i", "music.wav",
+        "-filter_complex", "[0:v]scale=1080:1920[outv];[1:a]volume=0.5[outa]",
+        "-map", "[outv]", "-map", "[outa]", "-c:v", "libx264", "-ar", "48000", "-shortest",
+        "-t", "4.000000", "out.mp4",
+    )
 
-        def fake_pick(folder, name, use_random, exts):
-            if folder.name == "_Intro":
-                return intro
-            if folder.name == "_Outro":
-                return outro
-            return None
+    def _inline(self, intro, outro, cmd=None, has_audio=True):
+        with mock.patch.object(render_engine, "probe_video_info",
+                               return_value={"has_audio": has_audio, "seconds": 1.5}):
+            return render_engine._inline_intro_outro(
+                list(cmd or self.main_cmd), intro, outro, 4.0, 1080, 1920, 30)
 
-        def fake_run(cmd, *args, **kwargs):
-            captured["cmd"] = cmd
-            captured["kwargs"] = kwargs
+    def test_outro_only_is_appended_after_main_in_same_command(self):
+        cmd, expected = self._inline(None, Path("outro.mp4"))
+        fc = _filter_complex_of(cmd)
+        self.assertEqual(expected, 5.5)
+        self.assertEqual(cmd[cmd.index("music.wav") + 1:cmd.index("music.wav") + 3], ["-i", "outro.mp4"])
+        self.assertIn("[2:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
+        self.assertIn("pad=1080:1920", fc)
+        self.assertIn("[outa]anull,asetpts=N/SR/TB,aformat=sample_rates=48000", fc)
+        self.assertIn("[io_main_v][io_main_a][io_outro_v][io_outro_a]concat=n=2:v=1:a=1[io_v][io_a]", fc)
+        self.assertNotIn("-shortest", cmd)
+        self.assertEqual(cmd[-3:], ["-t", "5.500000", "out.mp4"])
+        maps = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-map"]
+        self.assertEqual(maps, ["[io_v]", "[io_a]"])
 
-        cfg = {"intro_enabled": bool(intro), "outro_enabled": bool(outro)}
-        with mock.patch.object(render_engine, "_pick_media", side_effect=fake_pick), \
-                mock.patch.object(
-                    render_engine, "probe_video_info",
-                    return_value={"has_audio": True, "seconds": 10.0},
-                ), \
-                mock.patch.object(render_engine, "_run_ffmpeg_with_progress", side_effect=fake_run):
-            render_engine._apply_intro_outro(
-                main_path, cfg, 1080, 1920, 30, owner="monitor",
-            )
-        return captured
+    def test_intro_and_outro_wrap_main_and_keep_stream_audio_filter(self):
+        main_cmd = ["ffmpeg", "-y", "-ss", "1", "-i", "src.mp4", "-filter_complex", "[0:v]null[outv]",
+                    "-map", "[outv]", "-map", "0:a?", "-af", "atempo=2.0", "-t", "4.000000", "out.mp4"]
+        cmd, expected = self._inline(Path("intro.mp4"), Path("outro.mp4"), main_cmd, has_audio=False)
+        fc = _filter_complex_of(cmd)
+        self.assertEqual(expected, 7.0)
+        self.assertNotIn("-af", cmd)
+        self.assertEqual(cmd[cmd.index("src.mp4") + 1:cmd.index("src.mp4") + 5],
+                         ["-i", "intro.mp4", "-i", "outro.mp4"])
+        self.assertIn("[0:a]atempo=2.0,asetpts=N/SR/TB,aformat=sample_rates=44100", fc)
+        self.assertIn("[1:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
+        self.assertIn("[2:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
+        self.assertIn("anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=1.500000", fc)
+        self.assertIn("[io_intro_v][io_intro_a][io_main_v][io_main_a][io_outro_v][io_outro_a]concat=n=3", fc)
 
-    def test_outro_only_normalizes_outro_frame(self):
-        with tempfile.TemporaryDirectory() as td:
-            main = Path(td) / "main.mp4"
-            main.write_bytes(b"main")
-            outro = Path(td) / "outro.mp4"
-            outro.write_bytes(b"outro")
-
-            captured = self._apply(None, outro, str(main))
-            fc = _filter_complex_of(captured["cmd"])
-
-            # Main (i=0) đã đúng khung, outro (i=1) phải được scale/pad về cùng khung
-            self.assertIn("[0:v]setpts=PTS-STARTPTS,fps=30", fc)
-            self.assertNotIn("[0:v]scale=", fc)
-            self.assertIn("[1:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
-            self.assertIn("pad=1080:1920", fc)
-            self.assertIn("concat=n=2:v=1:a=1", fc)
-            self.assertEqual(captured["kwargs"]["owner"], "monitor")
-
-    def test_intro_and_outro_normalize_both_ends(self):
-        with tempfile.TemporaryDirectory() as td:
-            main = Path(td) / "main.mp4"
-            main.write_bytes(b"main")
-            intro = Path(td) / "intro.mp4"
-            intro.write_bytes(b"intro")
-            outro = Path(td) / "outro.mp4"
-            outro.write_bytes(b"outro")
-
-            captured = self._apply(intro, outro, str(main))
-            fc = _filter_complex_of(captured["cmd"])
-
-            self.assertIn("[0:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
-            self.assertIn("[1:v]setpts=PTS-STARTPTS,fps=30", fc)
-            self.assertNotIn("[1:v]scale=", fc)
-            self.assertIn("[2:v]setpts=PTS-STARTPTS,scale=1080:1920", fc)
-            self.assertIn("concat=n=3:v=1:a=1", fc)
+    def test_missing_selected_asset_fails_before_encoding(self):
+        with mock.patch.object(render_engine, "_pick_media", return_value=None), self.assertRaises(ValueError):
+            render_engine._resolve_intro_outro({"outro_enabled": True})
 
 
 class _FakeFFmpegProc:

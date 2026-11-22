@@ -1,4 +1,25 @@
 # CHANGELOG — DHB Reup YouTube Studio
+
+## 2026-11-21 — Giới hạn phạm vi đồng bộ và hoàn thiện gate phát hành
+
+- Đồng bộ chỉ xử lý pending ID thuộc manifest; giữ hàng đợi ngoài lịch trong cùng project. ID mới phải do chính lần scan trả về và vượt qua kiểm tra binding/nguồn; không tự nhận hàng được tạo đồng thời bởi thao tác khác. Đồng bộ lấy khóa runtime trước khóa lịch và kiểm tra dung lượng danh sách trước khi có thay đổi.
+- Nâng scan scheduler lên phạm vi 1.000 file được API hỗ trợ; trả `added_ids` từ transaction INSERT để xác định nguồn gốc hàng mới. Lỗi Preview không xóa slot cũ hoặc cập nhật manifest; scan có thể đã tạo hàng mới trong queue trước khi gặp lỗi ở bước sau.
+- Hàng do scan tạo có biên nhận HMAC riêng; rollback chỉ gỡ hàng còn nguyên trạng, không có claim/approval/evidence. Kiểm tra byte JSON trước công bố, giữ cặp gốc trong `sync-recovery-*` nếu phục hồi lỗi và chỉ dọn slot cũ bằng đối chiếu có điều kiện sau công bố. Giao diện hiển thị rõ cảnh báo nếu còn mục chưa dọn được.
+- CI bật và chạy rõ lớp Chromium trạng thái lịch vốn nằm ngoài glob cũ. Thêm guard kiểm tra mọi module browser opt-in đều được workflow bao phủ và giữ fail-fast. Xác minh CI giữ nguyên mọi gate; khi GitHub CLI không dùng được, chỉ đọc API GitHub công khai với cùng repo/run/SHA/job và fail closed nếu không xác minh đủ.
+- Soak chịu được WAL/artifact biến mất giữa phép liệt kê và stat, vẫn báo lỗi quyền/I/O khác. Áp cùng giới hạn tài nguyên/children/DB lock cho mẫu cuối trước complete; giữ soak thực 60 phút, 1.000 job và cooldown 30 phút.
+- Build ứng viên `2026.11.20-hardening.2`; bổ sung regression cho mixed-project/provenance/capacity, CI discovery và final-only resource growth. Nghiệm thu/CI/soak phải gắn với revision mới; không tái sử dụng kết quả soak dở dang của revision trước.
+
+
+## 2026-11-20 — Gia cố receipt, lịch Private và triển khai
+
+- Receipt recheck ưu tiên trạng thái upload/xử lý thất bại thay vì chấp nhận một trường thành công; giữ đúng video ID và thao tác chỉ đọc, không tự giải quyết NeedsReview.
+- CLI lịch chạy xuất JSON an toàn trên console Windows cp1252, giữ nguyên Unicode sau decode và bảo toàn mã thoát thất bại của runner.
+- Kiểm tra file/hash lượt kế tiếp trước khi tự mở server hoặc chờ lịch, kiểm tra lại trước/sau preview; giữ observer, con trỏ và cơ chế ghi trạng thái trước khi start để tránh gửi trùng.
+- Dry-run của LocalAPI không gọi preview-distribution có ghi approval vào DB; chỉ kiểm tra nguồn/binding/diagnostics/slot, không thay thế việc xem trước và phê duyệt metadata để đăng thật.
+- Dùng chung khóa thao tác theo runtime rồi khóa lịch và khóa app trong toàn bộ cửa sổ rollout/hậu kiểm/phục hồi để ngăn runner chen vào lúc cập nhật pin, kể cả khi lịch mới xuất hiện. Chọn đúng lịch tùy chỉnh từ CLI/môi trường và truyền sang app/rollback; chặn lịch thiếu release pin trước khi thay đổi runtime. Chỉ bỏ qua đúng lockfile vận hành untracked khi kiểm tra Git sạch, không bỏ qua sửa đổi code hoặc file khác.
+- Giao diện ưu tiên cảnh báo nguồn thiếu/thay đổi, nêu số file và yêu cầu đối chiếu nội dung mới; không tự đồng bộ hoặc bắt đầu đăng. Thêm regression fixture, test cạnh tranh rollout và test console Windows; cập nhật hợp đồng evidence v2/reader v1.
+- Build ứng viên `2026.11.20-hardening`; cache-bust các tài nguyên giao diện đổi. Kết quả nghiệm thu của revision hiện tại được bàn giao riêng; chưa coi đây là bằng chứng deploy hoặc upload YouTube thật.
+
 ## 2026-11-04 — Sửa monitor và URL sau nghiệm thu độc lập
 
 - Danh sách monitor thu hồi các lượt đã dừng và đọc lại DB dưới cùng khóa lifecycle, để `is_running`, trạng thái và quyền Chạy/Xóa cùng phản ánh trạng thái đã đồng bộ. Sửa trường hợp SQLite bận khiến nút Dừng dùng dữ liệu cũ và thao tác toggle lại khởi chạy monitor.

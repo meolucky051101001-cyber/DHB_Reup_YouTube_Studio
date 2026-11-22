@@ -94,6 +94,26 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual(self.row()['input_video_path'],str(self.source))
         self.assertTrue(Path(self.row(902)['input_video_path']).is_file())
 
+    def test_batch_worker_frees_prepare_slot_before_waiting_for_upload_slot(self):
+        options = [False,False,True]
+        token = self.manager.preview_distribution([901], options)['preview_token']
+        self.manager._freeze_batch_assignments([901],token,options,'capacity-test')
+        prepare, ready = threading.Semaphore(0), threading.Semaphore(1)
+        capacity = pm._WorkerCapacity(prepare, ready, threading.Event())
+        seen = {}
+        real_reserve = pm.reserve_upload_slot
+        def reserve(stop_event, queue_id=None):
+            seen['prepare_free'] = prepare.acquire(timeout=0)
+            if seen['prepare_free']:
+                prepare.release()
+            seen['ready_held'] = not ready.acquire(timeout=0)
+            return real_reserve(stop_event, queue_id)
+        with mock.patch.object(pm,'upload_video_to_youtube', return_value={'url':'https://youtu.be/dQw4w9WgXcQ'}),                 mock.patch.object(pm,'reserve_upload_slot', side_effect=reserve):
+            self.manager._process_single_item_safe(901,0,*options,capacity,'capacity-test')
+        self.assertEqual(self.row()['status'],'Completed')
+        self.assertEqual(seen, {'prepare_free': True, 'ready_held': True})
+        self.assertTrue(ready.acquire(timeout=0))
+
     def test_repair_is_readonly_by_default_and_idempotent(self):
         from repair_review_state import repair
         self.reserve_review('Rendered')
