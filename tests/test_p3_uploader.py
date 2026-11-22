@@ -958,6 +958,37 @@ class ResumableUploadTests(unittest.TestCase):
                 str(path), self._metadata(), self._channel(), session=session
             )
 
+    def test_refresh_failure_is_not_sent_before_resumable_init(self):
+        session = _ResumableSession([])
+        refresh_error = "OAuth refresh failed: invalid_grant"
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "clip.mp4"
+            path.write_bytes(b"data")
+            with mock.patch.object(yu, "_refresh_google_access_token", side_effect=RuntimeError(refresh_error)):
+                with self.assertRaises(yu.UploadNotSent) as raised:
+                    yu._upload_via_youtube_api_with_session(
+                        str(path), self._metadata(), self._channel(), session=session
+                    )
+
+        self.assertEqual(str(raised.exception), refresh_error)
+        self.assertFalse(any("uploadType=resumable" in url for url, _kwargs in session.post_calls))
+
+    def test_identity_mismatch_is_not_sent_before_resumable_init(self):
+        session = _ResumableSession([])
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "clip.mp4"
+            path.write_bytes(b"data")
+            with mock.patch.object(yu, "_refresh_google_access_token", return_value="access"), \
+                    mock.patch.object(yu, "_fetch_oauth_channel_identity", return_value={
+                        "channel_id": "UC" + "b" * 22, "name": "Different channel"
+                    }):
+                with self.assertRaises(yu.UploadNotSent):
+                    yu._upload_via_youtube_api_with_session(
+                        str(path), self._metadata(), self._channel(), session=session
+                    )
+
+        self.assertFalse(any("uploadType=resumable" in url for url, _kwargs in session.post_calls))
+
     def test_partial_server_range_after_disconnect_resumes_at_confirmed_offset(self):
         session = _ResumableSession([
             _Response(308, headers={"Range": "bytes=0-3"}),

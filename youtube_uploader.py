@@ -2012,23 +2012,28 @@ def _upload_via_youtube_api_with_session(
     raw_channel_id = str(channel.get('channel_id') or '').strip()
     if raw_channel_id:
         metadata = {**metadata, 'youtube_channel_id': raw_channel_id}
-    oauth_data = _parse_oauth_payload(channel.get("oauth_token_json") or "")
-    access_token = _refresh_google_access_token(oauth_data, session=http)
+    try:
+        oauth_data = _parse_oauth_payload(channel.get("oauth_token_json") or "")
+        access_token = _refresh_google_access_token(oauth_data, session=http)
 
-    # XÁC MINH KÊNH: YouTube Data API không cho chọn kênh con khi upload — token chính là kênh nhận video.
-    identity = _fetch_oauth_channel_identity(access_token, session=http)
-    target_id = (channel.get("channel_id") or "").strip()
-    target_label = (channel.get("name") or "").strip() or (channel.get("handle") or "").strip()
-    if not target_id:
-        raise RuntimeError(
-            f"Kênh '{target_label}' chưa có Channel ID nên không thể xác minh chính xác kênh nhận video qua YouTube API. "
-            "Hãy bấm 'Refresh Kênh' hoặc nhập Channel ID trong tab Quản Lý Kênh trước khi đăng."
-        )
-    if identity["channel_id"] != target_id:
-        raise RuntimeError(
-            f"Token YouTube API đang đại diện kênh '{identity['name']}' (ID {identity['channel_id']}), "
-            f"không khớp Channel ID đích {target_id}. Đã dừng để tránh đăng nhầm kênh."
-        )
+        # XÁC MINH KÊNH: YouTube Data API không cho chọn kênh con khi upload — token chính là kênh nhận video.
+        identity = _fetch_oauth_channel_identity(access_token, session=http)
+        target_id = (channel.get("channel_id") or "").strip()
+        target_label = (channel.get("name") or "").strip() or (channel.get("handle") or "").strip()
+        if not target_id:
+            raise RuntimeError(
+                f"Kênh '{target_label}' chưa có Channel ID nên không thể xác minh chính xác kênh nhận video qua YouTube API. "
+                "Hãy bấm 'Refresh Kênh' hoặc nhập Channel ID trong tab Quản Lý Kênh trước khi đăng."
+            )
+        if identity["channel_id"] != target_id:
+            raise RuntimeError(
+                f"Token YouTube API đang đại diện kênh '{identity['name']}' (ID {identity['channel_id']}), "
+                f"không khớp Channel ID đích {target_id}. Đã dừng để tránh đăng nhầm kênh."
+            )
+    except UploadNotSent:
+        raise
+    except Exception as exc:
+        raise UploadNotSent(str(exc)) from exc
     if progress_callback:
         progress_callback(6, f"Đã xác minh kênh YouTube API: {identity['name']} ({identity['channel_id']})")
 
