@@ -11,6 +11,7 @@ import threading
 import subprocess
 import sqlite3
 from contextlib import closing
+from functools import lru_cache
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -418,12 +419,17 @@ _JSON_SECRET_KEYS = {
 _JSON_OAUTH_PRESENCE_KEYS = {"hasoauthtoken", "hasaccesstoken", "hasrefreshtoken"}
 
 
+@lru_cache(maxsize=4096)
+def _normalize_json_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", key.lower())
+
+
 def _redact_json_value(value: Any, secrets: List[str]) -> Any:
     """Redact JSON values structurally so text patterns cannot corrupt JSON syntax."""
     if isinstance(value, dict):
         safe = {}
         for key, child in value.items():
-            normalized_key = re.sub(r"[^a-z0-9]+", "", str(key).lower())
+            normalized_key = _normalize_json_key(str(key))
             if isinstance(child, bool) and normalized_key in _JSON_OAUTH_PRESENCE_KEYS:
                 safe[key] = child
                 continue
@@ -451,6 +457,10 @@ def _apply_security_headers(response):
     for key, value in _FRAME_DENY_HEADERS.items():
         response.headers.setdefault(key, value)
     return response
+
+
+def _parse_if_none_match(header: str) -> set:
+    return {item.strip() for item in header.split(",") if item.strip()}
 
 
 @app.middleware("http")
@@ -486,12 +496,20 @@ async def guard_local_api(request: Request, call_next):
             payload = json.loads(raw_body.decode("utf-8"))
             safe_payload = _redact_json_value(payload, collect_secret_values())
             safe_body = json.dumps(safe_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            safe_response = Response(
-                content=safe_body,
-                status_code=response.status_code,
-                media_type=response.headers.get("content-type", "application/json"),
-                background=response.background,
-            )
+            etag = ""
+            if request.method == "GET" and response.status_code == 200:
+                etag = 'W/"' + hashlib.sha1(safe_body).hexdigest() + '"'
+            if etag and etag in _parse_if_none_match(request.headers.get("if-none-match", "")):
+                safe_response = Response(status_code=304, background=response.background)
+            else:
+                safe_response = Response(
+                    content=safe_body,
+                    status_code=response.status_code,
+                    media_type=response.headers.get("content-type", "application/json"),
+                    background=response.background,
+                )
+            if etag:
+                safe_response.headers["ETag"] = etag
         except Exception:
             # The endpoint may already have completed a mutation. Do not return
             # the consumed body (which may contain credentials) or imply success.
@@ -509,7 +527,10 @@ async def guard_local_api(request: Request, call_next):
             b"content-length", b"content-encoding", b"transfer-encoding",
             b"content-type", b"etag", b"content-md5", b"digest",
         }
-        generated = [item for item in safe_response.raw_headers if item[0].lower() in {b"content-type", b"content-length"}]
+        generated = [
+            item for item in safe_response.raw_headers
+            if item[0].lower() in {b"content-type", b"content-length", b"etag"}
+        ]
         preserved = [item for item in response.raw_headers if item[0].lower() not in invalidated]
         safe_response.raw_headers = preserved + generated
         return safe_response
@@ -880,6 +901,11 @@ def api_delete_project(name: str):
 
 
 @app.get("/api/queue")
+def api_get_queue_route(project: str = ""):
+    # Rows are plain SQLite values, so skip FastAPI's generic encoder on this large payload.
+    return JSONResponse(api_get_queue(project))
+
+
 def api_get_queue(project: str = ""):
     conn = get_conn()
     if not project or project == "Default":
