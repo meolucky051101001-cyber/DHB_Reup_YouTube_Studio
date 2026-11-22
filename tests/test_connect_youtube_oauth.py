@@ -72,6 +72,27 @@ class DesktopOAuthTests(unittest.TestCase):
                 )
             sys_open.assert_not_called()
 
+    def test_bound_antidetect_channel_uses_open_url_without_system_browser_fallback(self):
+        url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=fixture"
+        client = mock.Mock()
+        client.open_url.return_value = {"port": 9222, "launched_now": True}
+
+        with mock.patch("antidetect_client.AntidetectClient", return_value=client), \
+                mock.patch.object(oauth.webbrowser, "open") as system_browser:
+            result = oauth.open_url_in_channel_browser(
+                {"antidetect_profile_id": "ad-bound"},
+                url,
+            )
+
+        self.assertEqual(result, {
+            "browser": "antidetect",
+            "antidetect_profile_id": "ad-bound",
+            "port": 9222,
+        })
+        client.open_url.assert_called_once_with("ad-bound", url)
+        client.start_profile.assert_not_called()
+        system_browser.assert_not_called()
+
     def test_same_profile_client_isolation_exposes_no_secrets(self):
         import sqlite3
         import app as studio_app

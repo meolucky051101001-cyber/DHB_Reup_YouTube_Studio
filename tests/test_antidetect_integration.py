@@ -474,6 +474,71 @@ class AntidetectConfigTests(unittest.TestCase):
             ac._normalize_base_url("127.0.0.1:8000")
 
 
+class AntidetectOpenUrlTests(unittest.TestCase):
+    def test_open_url_starts_default_page_then_opens_tab_for_both_start_states(self):
+        url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=fixture"
+        for launched_now in (True, False):
+            with self.subTest(launched_now=launched_now):
+                client = ac.AntidetectClient()
+                start_result = {"port": 9222, "launched_now": launched_now}
+                page = mock.Mock()
+                context = mock.Mock()
+                context.new_page.return_value = page
+                browser = mock.Mock(contexts=[context])
+                playwright = mock.Mock()
+                playwright.chromium.connect_over_cdp.return_value = browser
+                manager = mock.MagicMock()
+                manager.__enter__.return_value = playwright
+                manager.__exit__.return_value = False
+
+                with mock.patch.object(client, "start_profile", return_value=start_result) as start, \
+                        mock.patch("playwright.sync_api.sync_playwright", return_value=manager) as sync_playwright:
+                    result = client.open_url("ad-profile", url)
+
+                self.assertEqual(result, start_result)
+                start.assert_called_once_with("ad-profile")
+                sync_playwright.assert_called_once_with()
+                playwright.chromium.connect_over_cdp.assert_called_once_with(
+                    "http://127.0.0.1:9222", timeout=15000
+                )
+                context.new_page.assert_called_once_with()
+                page.goto.assert_called_once_with(url, wait_until="domcontentloaded", timeout=30000)
+                page.bring_to_front.assert_called_once_with()
+
+    def test_open_url_rejects_browser_without_contexts(self):
+        client = ac.AntidetectClient()
+        browser = mock.Mock(contexts=[])
+        playwright = mock.Mock()
+        playwright.chromium.connect_over_cdp.return_value = browser
+        manager = mock.MagicMock()
+        manager.__enter__.return_value = playwright
+        manager.__exit__.return_value = False
+
+        with mock.patch.object(client, "start_profile", return_value={"port": 9222}) as start, \
+                mock.patch("playwright.sync_api.sync_playwright", return_value=manager):
+            with self.assertRaises(ac.AntidetectNotReady):
+                client.open_url("ad-profile", "https://accounts.google.com/")
+
+        start.assert_called_once_with("ad-profile")
+        playwright.chromium.connect_over_cdp.assert_called_once_with(
+            "http://127.0.0.1:9222", timeout=15000
+        )
+
+    def test_open_login_uses_open_url_and_preserves_result(self):
+        client = ac.AntidetectClient()
+        with mock.patch.object(client, "open_url", return_value={"port": 9222}) as open_url:
+            result = client.open_login("ad-profile", "https://studio.youtube.com")
+
+        open_url.assert_called_once_with("ad-profile", "https://studio.youtube.com")
+        self.assertEqual(result, {
+            "ok": True,
+            "antidetect": True,
+            "profile_id": "ad-profile",
+            "port": 9222,
+            "message": "Đã mở Profile bằng Antidetect tại studio.youtube.com",
+        })
+
+
 class SyncDatabaseTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
