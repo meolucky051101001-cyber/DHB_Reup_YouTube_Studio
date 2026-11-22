@@ -421,7 +421,7 @@ class AntidetectBrowserLease:
             self._browser = self._connect_cdp()
             contexts = self._browser.contexts
             if not contexts:
-                raise AntidetectError("Không tìm thấy context trình duyệt của profile Antidetect.")
+                raise AntidetectNotReady("Không tìm thấy context trình duyệt của profile Antidetect.")
             self.context = contexts[0]
             self.tracked_context = _TrackedContext(self.context, self._pages, self.require_ready)
             self.page = self.tracked_context.new_page()
@@ -478,7 +478,7 @@ class AntidetectBrowserLease:
                 last_error = exc
                 if attempt < _CDP_CONNECT_ATTEMPTS:
                     time.sleep(_CDP_RETRY_BASE_DELAY_SEC * attempt)
-        raise AntidetectError(
+        raise AntidetectNotReady(
             f"Không kết nối được CDP tới profile Antidetect (cổng {self.port}) "
             f"sau {_CDP_CONNECT_ATTEMPTS} lần thử: {last_error}"
         )
