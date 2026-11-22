@@ -1943,11 +1943,18 @@ def recheck_api_video_receipt(
                 "mismatches": ["video_id"],
             }
         observed, field_states = _api_readback_fields(items[0])
-        processed = observed.get("upload_status") == "processed" or observed.get("processing_status") == "succeeded"
-        upload_state = "processed" if processed else "received"
+        upload_failed = observed.get("upload_status") in {"failed", "rejected", "deleted"}
+        processing_failed = observed.get("processing_status") in {"failed", "terminated"}
+        failed = upload_failed or processing_failed
+        processed = not failed and (
+            observed.get("upload_status") == "processed" or observed.get("processing_status") == "succeeded"
+        )
+        upload_state = "failed" if failed else "processed" if processed else "received"
         mismatches = []
         ai_omitted_when_false = False
-        if not processed:
+        if upload_failed:
+            mismatches.append("upload_status")
+        if processing_failed or (not processed and not upload_failed):
             mismatches.append("processing_status")
         if target_id and observed.get("youtube_channel_id") != target_id:
             mismatches.append("youtube_channel_id")

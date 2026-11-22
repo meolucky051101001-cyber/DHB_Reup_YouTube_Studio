@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import hashlib
+import hmac
 import monitor_policy
 import threading
 import subprocess
@@ -78,7 +79,7 @@ from youtube_uploader import (
     normalize_published_video_url,
     recheck_api_video_receipt,
 )
-from scheduled_uploads import ScheduleError, read_schedule_status, sync_schedule_folder
+from scheduled_uploads import MAX_SCHEDULE_JOBS, ScheduleError, read_schedule_status, sync_schedule_folder
 from pipeline_manager import pipeline_manager, upload_slot_recovery_status, acknowledge_upload_slot_recovery
 from group_distribution import target_group_names
 from phase4_rules import (
@@ -387,7 +388,7 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.18-oauth"
+APP_BUILD_VERSION = "2026.11.20-hardening.2"
 
 
 def get_schedule_state_dir() -> Path:
@@ -397,6 +398,7 @@ RUNTIME_IDENTITY = capture_runtime(APP_ROOT)
 app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
 
 API_TOKEN = generate_api_token()
+_SCHEDULE_SCAN_PROOF_KEY = os.urandom(32)
 TOKEN_EXEMPT_PATHS = {"/api/auth/token"}
 STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
@@ -730,15 +732,22 @@ class _InProcessScheduleAPI:
     def project_rows(self, project):
         return api_get_queue(project=project)
 
-    def delete_rows(self, ids):
-        return api_delete_queue_items(data={"ids": list(ids)})
+    def delete_rows(self, ids, *, expected_rows=None):
+        data = {"ids": list(ids)}
+        if expected_rows is not None:
+            data["expected_rows"] = expected_rows
+        try:
+            return api_delete_queue_items(data=data)
+        except HTTPException as exc:
+            raise ScheduleError("QUEUE_DELETE_FAILED") from exc
 
     def scan_folder(self, manifest):
         return api_scan_and_add(data={
             "project_name": manifest["project"],
             "urls": manifest["source_directory"],
-            "max_items": 500,
+            "max_items": MAX_SCHEDULE_JOBS,
             "recursive": False,
+            "schedule_sync": True,
             "target_channel_id": manifest["channel"]["id"],
             "upload_to": "Shorts",
             "render_mode": "shorts_9_16",
@@ -751,6 +760,12 @@ class _InProcessScheduleAPI:
             "emulate_mobile": False,
         })
 
+    def cleanup_scan_rows(self, receipts):
+        try:
+            return api_cleanup_schedule_scan(data={"receipts": receipts})
+        except HTTPException as exc:
+            raise ScheduleError("QUEUE_SCAN_CLEANUP_INCOMPLETE") from exc
+
     def preview_batch(self, manifest, queue_ids):
         if not queue_ids:
             return
@@ -759,6 +774,7 @@ class _InProcessScheduleAPI:
             "do_download": False,
             "do_render": False,
             "do_upload": True,
+            "schedule_sync": True,
         })
         items = result.get("items") or []
         if not result.get("ok") or len(items) != len(queue_ids):
@@ -948,7 +964,11 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
     min_comments = int(data.get("min_comments", 0) or 0)
     only_shorts = bool(data.get("only_shorts", False))
     recursive = bool(data.get("recursive", False))
+    schedule_sync = data.get("schedule_sync") is True
     target_channel_id = data.get("target_channel_id") or None
+    if schedule_sync and (len(urls) != 1 or recursive or not Path(urls[0]).is_dir()
+                          or type(target_channel_id) is not int or target_channel_id <= 0):
+        raise HTTPException(400, "Lịch đồng bộ cần một thư mục nội bộ và một kênh đích cụ thể.")
     raw_group_names = data.get("target_group_names", data.get("target_group_names_json"))
     if raw_group_names is None:
         raw_group_names = data.get("target_group_name") or "Mặc định"
@@ -997,6 +1017,8 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
     age_restriction = normalized["age_restriction"]
     altered_content = normalized["altered_content"]
     base_schedule_time = normalized["schedule_time"]
+    if schedule_sync and (visibility != "private" or base_schedule_time):
+        raise HTTPException(400, "Lịch đồng bộ chỉ nhập video riêng tư, không đặt giờ công bố.")
     if visibility == "schedule":
         start_dt = datetime.fromisoformat(base_schedule_time)
         schedule_interval_minutes = max(30, schedule_interval_minutes)
@@ -1024,7 +1046,8 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
     with closing(get_conn()) as conn, conn, _import_insert_lock:
         conn.execute('BEGIN IMMEDIATE')
         project_name = _current_import_project(conn, project_id)
-        added_count = 0
+        added_ids = []
+        cleanup_receipts = []
         skipped_count = 0
         seen_post_ids = set()
         for item in scanned:
@@ -1038,10 +1061,10 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
             item_sched = ""
             item_vis = visibility
             if visibility == "schedule":
-                item_dt = start_dt + timedelta(minutes=added_count * schedule_interval_minutes)
+                item_dt = start_dt + timedelta(minutes=len(added_ids) * schedule_interval_minutes)
                 item_sched = item_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO video_queue (
                     project_name, source_type, platform, post_id, source_url, input_video_path,
@@ -1084,12 +1107,20 @@ def api_scan_and_add(data: Dict[str, Any] = Body(...)):
                     emulate_mobile,
                 ),
             )
-            added_count += 1
+            queue_id = int(cursor.lastrowid)
+            added_ids.append(queue_id)
+            if schedule_sync:
+                row = conn.execute("SELECT * FROM video_queue WHERE id=?", (queue_id,)).fetchone()
+                cleanup_receipts.append({"queue_id": queue_id, "proof": _schedule_scan_proof(row)})
+    added_count = len(added_ids)
     log_msg = f"Đã quét và thêm {added_count} video vào dự án [{project_name}] (Chế độ: {visibility})."
     if skipped_count:
         log_msg += f" Bỏ qua {skipped_count} video đã có trong dự án."
     add_log("Scanner", log_msg, "SUCCESS")
-    return {"ok": True, "added": added_count, "skipped": skipped_count}
+    result = {"ok": True, "added": added_count, "skipped": skipped_count, "added_ids": added_ids}
+    if schedule_sync:
+        result["cleanup_receipts"] = cleanup_receipts
+    return result
 
 
 @app.post("/api/upload-video-files")
@@ -1950,6 +1981,130 @@ def api_edit_queue_metadata(data: Dict[str, Any] = Body(...)):
         conn.close()
 
 
+def _schedule_scan_proof(row):
+    # Bind rollback authority to the exact server-observed INSERT snapshot. The
+    # proof contains no row fields and is valid only until server restart.
+    payload = json.dumps(dict(row), sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hmac.new(_SCHEDULE_SCAN_PROOF_KEY, payload.encode("ascii"), hashlib.sha256).hexdigest()
+
+
+def _schedule_scan_cleanup_conflict():
+    return HTTPException(409, {"code": "SCHEDULE_SCAN_CLEANUP_CONFLICT",
+                               "message": "Lượt quét đã thay đổi hoặc đang được sử dụng; không xóa hàng đợi."})
+
+
+@app.post("/api/queue/schedule-scan-cleanup")
+def api_cleanup_schedule_scan(data: Dict[str, Any] = Body(...)):
+    """Roll back only rows inserted by a schedule scan and still pristine."""
+    receipts = data.get("receipts")
+    if not isinstance(receipts, list) or len(receipts) > MAX_SCHEDULE_JOBS:
+        raise HTTPException(400, "Danh sách bằng chứng dọn lượt quét không hợp lệ.")
+    expected = {}
+    for receipt in receipts:
+        queue_id = receipt.get("queue_id") if isinstance(receipt, dict) else None
+        proof = receipt.get("proof") if isinstance(receipt, dict) else None
+        if (type(queue_id) is not int or not 0 < queue_id < 2**63 or queue_id in expected
+                or not isinstance(proof, str) or not re.fullmatch(r"[0-9a-f]{64}", proof)):
+            raise HTTPException(400, "Bằng chứng dọn lượt quét không hợp lệ.")
+        expected[queue_id] = proof
+
+    deleted_ids = []
+    if expected:
+        with closing(get_conn()) as conn, conn:
+            # Hold the writer lock across snapshot verification and deletion, so
+            # concurrent editing, claiming, or approval cannot slip between them.
+            conn.execute("BEGIN IMMEDIATE")
+            for queue_id, proof in expected.items():
+                row = conn.execute("SELECT * FROM video_queue WHERE id=?", (queue_id,)).fetchone()
+                if row is None or not hmac.compare_digest(proof, _schedule_scan_proof(row)):
+                    raise _schedule_scan_cleanup_conflict()
+                cursor = conn.execute(
+                    """
+                    DELETE FROM video_queue
+                    WHERE id=? AND status='Pending' AND visibility='private'
+                      AND source_type='File' AND platform='LocalFile' AND source_url=input_video_path
+                      AND COALESCE(input_video_path,'')<>'' AND target_type='CHANNEL' AND target_channel_id>0
+                      AND COALESCE(schedule_time,'')='' AND COALESCE(claim_token,'')=''
+                      AND COALESCE(published_url,'')='' AND last_attempt_id IS NULL
+                      AND NOT EXISTS (SELECT 1 FROM upload_attempts WHERE queue_id=video_queue.id)
+                      AND NOT EXISTS (SELECT 1 FROM content_reservations WHERE queue_id=video_queue.id)
+                      AND NOT EXISTS (SELECT 1 FROM upload_approval_items WHERE queue_id=video_queue.id)
+                      AND NOT EXISTS (SELECT 1 FROM published_history WHERE channel_id=video_queue.target_channel_id
+                                      AND ((COALESCE(video_queue.post_id,'')<>'' AND source_post_id=video_queue.post_id)
+                                        OR (COALESCE(video_queue.source_url,'')<>'' AND source_url=video_queue.source_url)))
+                      AND NOT EXISTS (SELECT 1 FROM managed_artifacts
+                                      WHERE owner_type='queue' AND owner_id=video_queue.id)
+                    """, (queue_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise _schedule_scan_cleanup_conflict()
+                deleted_ids.append(queue_id)
+    return {"ok": True, "deleted_ids": deleted_ids, "retained_ids": []}
+
+
+def _delete_stale_schedule_rows(ids, expected_rows):
+    """Conditional SQL-only cleanup; the normal user delete path stays unchanged."""
+    if (not isinstance(expected_rows, list) or not 1 <= len(expected_rows) <= MAX_SCHEDULE_JOBS
+            or len(expected_rows) != len(ids)):
+        raise HTTPException(400, "Danh sách đối chiếu hàng đợi không hợp lệ.")
+    expected = {}
+    for row in expected_rows:
+        queue_id = row.get("id") if isinstance(row, dict) else None
+        if type(queue_id) is not int or not 0 < queue_id < 2**63 or queue_id in expected:
+            raise HTTPException(400, "Dòng đối chiếu hàng đợi không hợp lệ.")
+        expected[queue_id] = row
+    if set(ids) != set(expected):
+        raise HTTPException(400, "Danh sách ID không khớp hàng đợi cần đối chiếu.")
+    secrets = collect_secret_values()
+    with closing(get_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for queue_id in ids:
+            record = conn.execute("SELECT *, COALESCE(claim_token,'')<>'' AS is_claimed, "
+                                  "(status='NeedsReview' OR EXISTS (SELECT 1 FROM content_reservations "
+                                  "WHERE queue_id=video_queue.id AND state='NeedsReview')) AS requires_review "
+                                  "FROM video_queue WHERE id=?", (queue_id,)).fetchone()
+            if record is None:
+                raise _schedule_scan_cleanup_conflict()
+            current = dict(record)
+            # HTTP queue snapshots redact claim_token and any secret-like values;
+            # internal calls use raw snapshots. Compare the exact appropriate view.
+            if expected[queue_id] not in (current, _redact_json_value(current, secrets)):
+                raise _schedule_scan_cleanup_conflict()
+            candidate = Path(str(current.get("input_video_path") or ""))
+            if not candidate.is_absolute():
+                raise _schedule_scan_cleanup_conflict()
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise _schedule_scan_cleanup_conflict() from None
+            else:
+                raise _schedule_scan_cleanup_conflict()
+            deleted = conn.execute(
+                """
+                DELETE FROM video_queue
+                WHERE id=? AND status='Pending' AND visibility='private'
+                  AND source_type='File' AND platform='LocalFile' AND source_url=input_video_path
+                  AND target_type='CHANNEL' AND target_channel_id>0
+                  AND COALESCE(schedule_time,'')='' AND COALESCE(claim_token,'')=''
+                  AND COALESCE(published_url,'')='' AND last_attempt_id IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM upload_attempts WHERE queue_id=video_queue.id)
+                  AND NOT EXISTS (SELECT 1 FROM content_reservations WHERE queue_id=video_queue.id)
+                  AND NOT EXISTS (SELECT 1 FROM upload_approval_items WHERE queue_id=video_queue.id)
+                  AND NOT EXISTS (SELECT 1 FROM published_history WHERE channel_id=video_queue.target_channel_id
+                                  AND ((COALESCE(video_queue.post_id,'')<>'' AND source_post_id=video_queue.post_id)
+                                    OR (COALESCE(video_queue.content_key,'')<>'' AND content_key=video_queue.content_key)
+                                    OR (COALESCE(video_queue.source_url,'')<>'' AND source_url=video_queue.source_url)))
+                  AND NOT EXISTS (SELECT 1 FROM managed_artifacts
+                                  WHERE owner_type='queue' AND owner_id=video_queue.id)
+                """, (queue_id,),
+            )
+            if deleted.rowcount != 1:
+                raise _schedule_scan_cleanup_conflict()
+    return {"ok": True, "deleted": len(ids)}
+
+
 @app.post("/api/queue/delete")
 def api_delete_queue_items(data: Dict[str, Any] = Body(...)):
     ids = data.get("ids") or []
@@ -1959,6 +2114,8 @@ def api_delete_queue_items(data: Dict[str, Any] = Body(...)):
     normalized = _normalize_queue_ids(ids)
     if not normalized:
         return {"ok": True, "deleted": 0}
+    if "expected_rows" in data:
+        return _delete_stale_schedule_rows(normalized, data["expected_rows"])
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -3908,12 +4065,24 @@ def api_preview_distribution(data: Dict[str, Any] = Body(...)):
         bool(data.get(key, True)) for key in ("do_download", "do_render", "do_upload")
     ])
     items = preview["items"]
+    preview_id = preview["preview_token"]
+    if data.get("schedule_sync") is True and preview_id:
+        # Sync is validation only; never expose or retain its provisional approval.
+        with closing(get_conn()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            deleted = conn.execute(
+                "DELETE FROM upload_approvals WHERE token=? AND state='preview' AND run_token IS NULL",
+                (preview_id,),
+            )
+            if deleted.rowcount == 1:
+                conn.execute("DELETE FROM upload_approval_items WHERE token=?", (preview_id,))
+        preview_id = ""
     blocked = sum(bool(item.get("blocked")) for item in items)
     warnings = sum(len(item.get("warnings") or []) for item in items)
     return {
         "ok": blocked == 0,
         "items": items,
-        "preview_id": preview["preview_token"],
+        "preview_id": preview_id,
         "total": len(items),
         "blocked": blocked,
         "warning_count": warnings,

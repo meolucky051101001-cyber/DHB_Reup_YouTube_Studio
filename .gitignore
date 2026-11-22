@@ -20,4 +20,5 @@ logs/
 _backup_*/
 # Runtime singleton lock file and scheduled upload operational state
 data/app_instance.lock
+data/schedule_operation.lock
 data/scheduled_uploads/

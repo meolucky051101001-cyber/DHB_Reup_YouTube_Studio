@@ -20,12 +20,15 @@ from urllib.parse import urlsplit
 
 import requests
 
+from app_instance_lock import AppInstanceAlreadyRunning, AppInstanceLock
+
 
 CONTRACT_VERSION = 1
 MANIFEST_VERSION = 2
 STATE_VERSION = 2
 APPLICATION = "dhb-reup-youtube-studio"
 JSON_LIMIT = 512 * 1024
+MAX_SCHEDULE_JOBS = 1000
 PUBLIC_STATES = frozenset(("ready", "waiting", "submitted", "running", "completed", "needs_review", "error", "missed", "finished"))
 MESSAGES = {
     "ready": "Lịch đã sẵn sàng.", "waiting": "Đang chờ đủ khoảng cách giữa hai lượt đăng.",
@@ -75,21 +78,40 @@ def load_json(path):
     return value
 
 
+def _encode_json(value):
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    data = text.replace("\n", os.linesep).encode("utf-8")
+    if len(data) > JSON_LIMIT:
+        raise ScheduleError("JSON_TOO_LARGE")
+    return data
+
+
+def _write_synced_bytes(target, data):
+    target.write(data)
+    target.flush()
+    os.fsync(target.fileno())
+
+
+@contextmanager
+def _stage_json(path, data):
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as target:
+            _write_synced_bytes(target, data)
+        yield temporary
+    finally:
+        try:
+            Path(temporary).unlink(missing_ok=True)
+        except OSError:
+            # An abandoned temporary file must not change the publication outcome.
+            pass
+
+
 def save_json(path, value):
     """Durable replace; temporary names never collide across interrupted runs."""
     path = Path(path)
-    data = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    if len(data.encode("utf-8")) > JSON_LIMIT:
-        raise ScheduleError("JSON_TOO_LARGE")
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as target:
-            target.write(data)
-            target.flush()
-            os.fsync(target.fileno())
+    with _stage_json(path, _encode_json(value)) as temporary:
         os.replace(temporary, path)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
 
 
 def sha256(path):
@@ -126,7 +148,7 @@ def validate_manifest(manifest):
     if not root.is_absolute():
         raise ScheduleError("MANIFEST_SOURCE")
     jobs = manifest.get("jobs")
-    if not isinstance(jobs, list) or not 1 <= len(jobs) <= 1000:
+    if not isinstance(jobs, list) or not 1 <= len(jobs) <= MAX_SCHEDULE_JOBS:
         raise ScheduleError("MANIFEST_JOBS")
     ids, paths = set(), set()
     for job in jobs:
@@ -209,6 +231,20 @@ def migrate_legacy(manifest, state, *, start_at):
                                  "submitted" if state["inflight_queue_id"] else "ready")
     validate_state(converted_state, converted_manifest)
     return converted_manifest, converted_state
+
+
+@contextmanager
+def runtime_operation_lock(runtime_dir):
+    """Exclude runner and rollout operations before they take a schedule lock."""
+    lock = AppInstanceLock(Path(runtime_dir).resolve() / "data" / "schedule_operation.lock")
+    try:
+        lock.acquire()
+    except AppInstanceAlreadyRunning:
+        raise ScheduleError("RUNTIME_OPERATION_ACTIVE") from None
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 @contextmanager
@@ -297,7 +333,10 @@ def read_schedule_status(state_dir, *, now=None):
                 public_result["finished_at"] = stamp(parse_time(result["finished_at"]))
         index = state["next_index"]
         drift = detect_folder_drift(manifest, state)
-        return {"configured": True, "status": status, "message": MESSAGES[status],
+        message = MESSAGES[status]
+        if status == "error" and state.get("error_code") == "SOURCE_CHANGED":
+            message = "Tệp nguồn của lượt kế tiếp đã thay đổi, không còn hoặc không đọc được. Cần kiểm tra trước khi đăng."
+        return {"configured": True, "status": status, "message": message,
                 "last_checked_at": state.get("last_checked_at"), "last_started_at": state.get("last_started_at"),
                 "last_result": public_result, "next_due_at": stamp(due) if index < len(manifest["jobs"]) else None,
                 "inflight_queue_id": state.get("inflight_queue_id"),
@@ -396,11 +435,16 @@ class LocalAPI:
             raise ScheduleError("CHANNEL_CHANGED")
 
     def queue(self, manifest):
-        rows = self.request("GET", "/api/queue", params={"project": manifest["project"]})
-        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-            raise ScheduleError("QUEUE_INVALID")
-        found = {row.get("id"): row for row in rows}
-        if len(found) != len(rows) or set(found) != {job["queue_id"] for job in manifest["jobs"]}:
+        expected_ids = {job["queue_id"] for job in manifest["jobs"]}
+        found = {}
+        for row in self.project_rows(manifest["project"]):
+            queue_id = row.get("id")
+            if not _integer(queue_id) or queue_id not in expected_ids:
+                continue
+            if queue_id in found:
+                raise ScheduleError("QUEUE_SCOPE_CHANGED")
+            found[queue_id] = row
+        if set(found) != expected_ids:
             raise ScheduleError("QUEUE_SCOPE_CHANGED")
         for job in manifest["jobs"]:
             row = found[job["queue_id"]]
@@ -432,10 +476,13 @@ class LocalAPI:
             raise ScheduleError("QUEUE_INVALID")
         return rows
 
-    def delete_rows(self, ids):
+    def delete_rows(self, ids, *, expected_rows=None):
         if not ids:
             return {"ok": True, "deleted": 0}
-        result = self.request("POST", "/api/queue/delete", json={"ids": list(ids)}, timeout=30)
+        payload = {"ids": list(ids)}
+        if expected_rows is not None:
+            payload["expected_rows"] = expected_rows
+        result = self.request("POST", "/api/queue/delete", json=payload, timeout=30)
         if not isinstance(result, dict) or not result.get("ok"):
             raise ScheduleError("QUEUE_DELETE_FAILED")
         return result
@@ -447,8 +494,9 @@ class LocalAPI:
             json={
                 "project_name": manifest["project"],
                 "urls": manifest["source_directory"],
-                "max_items": 500,
+                "max_items": MAX_SCHEDULE_JOBS,
                 "recursive": False,
+                "schedule_sync": True,
                 "target_channel_id": manifest["channel"]["id"],
                 "upload_to": "Shorts",
                 "render_mode": "shorts_9_16",
@@ -466,10 +514,14 @@ class LocalAPI:
             raise ScheduleError("QUEUE_SCAN_FAILED")
         return result
 
+    def cleanup_scan_rows(self, receipts):
+        return self.request("POST", "/api/queue/schedule-scan-cleanup", json={"receipts": receipts}, timeout=30)
+
     def preview_batch(self, manifest, queue_ids):
         if not queue_ids:
             return
-        payload = {"ids": list(queue_ids), "do_download": False, "do_render": False, "do_upload": True}
+        payload = {"ids": list(queue_ids), "do_download": False, "do_render": False, "do_upload": True,
+                   "schedule_sync": True}
         result = self.request("POST", "/api/queue/preview-distribution", json=payload, timeout=45)
         items = result.get("items") or []
         if not result.get("ok") or len(items) != len(queue_ids):
@@ -482,12 +534,130 @@ class LocalAPI:
                 raise ScheduleError("PREVIEW_CHANGED")
 
 
+def _pending_queue_row(row):
+    return (row.get("status") == "Pending" and not row.get("published_url")
+            and not row.get("is_claimed") and not row.get("requires_review"))
+
+
+def _source_file_in_root(path, source_root):
+    return path.is_absolute() and path.is_file() and path.resolve().is_relative_to(source_root)
+
+
+def _check_sync_inventory(source_directory, completed_jobs, retained_paths):
+    """Bound both the files visited by scan and the eventual manifest size."""
+    completed_paths = {Path(job["path"]).resolve() for job in completed_jobs}
+    pending_paths = set(retained_paths)
+    # The scanner also counts .flv files toward its request limit.
+    scanned = 0
+    try:
+        for path in source_directory.iterdir():
+            if path.suffix.lower() not in VIDEO_SUFFIXES | {".flv"} or not path.is_file():
+                continue
+            scanned += 1
+            resolved = path.resolve()
+            if resolved not in completed_paths:
+                pending_paths.add(resolved)
+            if scanned > MAX_SCHEDULE_JOBS or len(completed_jobs) + len(pending_paths) > MAX_SCHEDULE_JOBS:
+                raise ScheduleError("SOURCE_INVENTORY_LIMIT")
+    except OSError:
+        raise ScheduleError("SOURCE_INVENTORY_UNAVAILABLE") from None
+
+
+def _scan_cleanup_receipts(scan_result, added_ids):
+    if not added_ids:
+        return []
+    receipts = scan_result.get("cleanup_receipts")
+    if (not isinstance(receipts, list) or len(receipts) != len(added_ids)
+            or any(not isinstance(receipt, dict) or not _integer(receipt.get("queue_id"))
+                   or not isinstance(receipt.get("proof"), str)
+                   or not re.fullmatch(r"[a-f0-9]{64}", receipt["proof"]) for receipt in receipts)
+            or {receipt["queue_id"] for receipt in receipts} != set(added_ids)):
+        raise ScheduleError("QUEUE_SCAN_FAILED")
+    return receipts
+
+
+def _cleanup_failed_scan(api, receipts):
+    try:
+        result = api.cleanup_scan_rows(receipts)
+        deleted_ids = result.get("deleted_ids") if isinstance(result, dict) else None
+        if (isinstance(deleted_ids, list) and result.get("ok") is True and result.get("retained_ids") == []
+                and all(_integer(queue_id) for queue_id in deleted_ids)
+                and sorted(deleted_ids) == sorted(receipt["queue_id"] for receipt in receipts)):
+            return
+    except (ScheduleError, OSError, TypeError, ValueError):
+        pass
+    raise ScheduleError("QUEUE_SCAN_CLEANUP_INCOMPLETE")
+
+
+def _check_unowned_sources(rows, allowed_ids, source_root):
+    for queue_id, row in rows.items():
+        if queue_id not in allowed_ids and row.get("status") == "Pending":
+            path = Path(str(row.get("input_video_path") or ""))
+            if _source_file_in_root(path, source_root):
+                raise ScheduleError("UNSCHEDULED_SOURCE_ITEMS")
+
+
+def _publish_schedule_json(directory, manifest_data, state_data):
+    manifest_path = directory / "manifest.json"
+    state_path = directory / "state.json"
+    old_manifest = manifest_path.read_bytes()
+    old_state = state_path.read_bytes()
+    backup_parent = directory.resolve()
+    backup_dir = Path(tempfile.mkdtemp(prefix="sync-recovery-", dir=backup_parent))
+    backup_paths = (backup_dir / "manifest.json", backup_dir / "state.json")
+    keep_backup = False
+    try:
+        for path, data in zip(backup_paths, (old_manifest, old_state)):
+            with path.open("xb") as target:
+                _write_synced_bytes(target, data)
+        with (_stage_json(manifest_path, manifest_data) as staged_manifest,
+              _stage_json(state_path, state_data) as staged_state,
+              _stage_json(manifest_path, old_manifest) as original_manifest,
+              _stage_json(state_path, old_state) as original_state):
+            # Restoration can consume the staged copies without touching the recovery pair.
+            keep_backup = True
+            try:
+                os.replace(staged_manifest, manifest_path)
+                os.replace(staged_state, state_path)
+            except OSError:
+                try:
+                    if manifest_path.read_bytes() != old_manifest:
+                        os.replace(original_manifest, manifest_path)
+                    if state_path.read_bytes() != old_state:
+                        os.replace(original_state, state_path)
+                except OSError:
+                    raise ScheduleError("RECOVERY_REQUIRED") from None
+                keep_backup = False
+                raise
+            keep_backup = False
+    finally:
+        if not keep_backup:
+            try:
+                if backup_dir.parent == backup_parent and backup_dir.resolve() == backup_dir:
+                    for path in backup_paths:
+                        path.unlink(missing_ok=True)
+                    backup_dir.rmdir()
+            except (OSError, RuntimeError):
+                # Cleanup must not change whether the schedule was published or restored.
+                pass
+
+
+def _check_stale_rows(api, manifest, expected_rows, source_root):
+    latest_rows = api.project_rows(manifest["project"])
+    latest_by_id = {row["id"]: row for row in latest_rows if _integer(row.get("id"))}
+    for expected in expected_rows:
+        row = latest_by_id.get(expected["id"])
+        path = Path(str(expected.get("input_video_path") or ""))
+        if row != expected or _source_file_in_root(path, source_root):
+            raise ScheduleError("PENDING_ITEM_CHANGED")
+
+
 def sync_schedule_folder(state_dir, runtime_dir, *, api_factory=LocalAPI, base_url="http://127.0.0.1:8686", check_release=True):
     """Synchronize source_directory drift safely without resetting next_index or cadence."""
     directory, runtime = Path(state_dir), Path(runtime_dir)
     if not directory.is_dir():
         raise ScheduleError("SCHEDULE_UNINITIALIZED")
-    with single_instance(directory):
+    with runtime_operation_lock(runtime), single_instance(directory):
         manifest = load_json(directory / "manifest.json")
         validate_manifest(manifest)
         state = load_json(directory / "state.json")
@@ -498,6 +668,8 @@ def sync_schedule_folder(state_dir, runtime_dir, *, api_factory=LocalAPI, base_u
         if check_release:
             validate_release(release, runtime)
         api = api_factory(base_url, runtime, release)
+        cleanup_receipts = []
+        published = False
         try:
             if api_factory is LocalAPI:
                 api.connect(auto_start=True)
@@ -507,62 +679,70 @@ def sync_schedule_folder(state_dir, runtime_dir, *, api_factory=LocalAPI, base_u
             api.verify_channel(manifest)
 
             index = state["next_index"]
-            completed_jobs = list(manifest["jobs"][:index])
-            completed_ids = {job["queue_id"] for job in completed_jobs}
-            source_root = Path(manifest["source_directory"]).resolve()
+            completed_jobs = manifest["jobs"][:index]
+            owned_pending = {job["queue_id"]: job for job in manifest["jobs"][index:]}
+            owned_ids = {job["queue_id"] for job in manifest["jobs"]}
+            source_directory = Path(manifest["source_directory"])
+            source_root = source_directory.resolve()
 
             rows = api.project_rows(manifest["project"])
-            by_id = {int(row["id"]): row for row in rows if _integer(row.get("id"))}
+            by_id = {row["id"]: row for row in rows if _integer(row.get("id"))}
+            _check_unowned_sources(by_id, owned_ids, source_root)
             for job in completed_jobs:
                 row = by_id.get(job["queue_id"])
                 if not row or row.get("status") != "Completed" or not row.get("published_url") or row.get("is_claimed") or row.get("requires_review"):
                     raise ScheduleError("COMPLETED_ITEM_CHANGED")
 
             stale_ids = []
-            for qid, row in sorted(by_id.items()):
-                if qid in completed_ids:
+            retained_paths = {}
+            for queue_id, job in owned_pending.items():
+                row = by_id.get(queue_id)
+                if row is None:
                     continue
-                if row.get("status") != "Pending" or row.get("published_url") or row.get("is_claimed") or row.get("requires_review"):
+                if not _pending_queue_row(row):
                     raise ScheduleError("PENDING_ITEM_CHANGED")
                 candidate = Path(str(row.get("input_video_path") or ""))
-                in_root = False
-                if candidate.is_file():
-                    try:
-                        candidate.resolve().relative_to(source_root)
-                        in_root = True
-                    except (ValueError, OSError):
-                        in_root = False
-                if not in_root:
-                    stale_ids.append(qid)
+                if (not candidate.is_absolute() or candidate.resolve() != Path(job["path"]).resolve()
+                        or row.get("visibility") != "private" or row.get("schedule_time")
+                        or row.get("target_channel_id") != manifest["channel"]["id"]):
+                    raise ScheduleError("QUEUE_BINDING_CHANGED")
+                if _source_file_in_root(candidate, source_root):
+                    retained_paths[queue_id] = candidate.resolve()
+                else:
+                    stale_ids.append(queue_id)
 
-            if stale_ids:
-                api.delete_rows(stale_ids)
-
+            _check_sync_inventory(source_directory, completed_jobs, retained_paths.values())
             scan_res = api.scan_folder(manifest)
+            added_ids = scan_res.get("added_ids") if isinstance(scan_res, dict) else None
+            if (not isinstance(added_ids, list) or scan_res.get("ok") is not True
+                    or not _integer(scan_res.get("added"), 0) or len(added_ids) != scan_res["added"]
+                    or any(not _integer(queue_id) for queue_id in added_ids)
+                    or len(set(added_ids)) != len(added_ids)
+                    or any(queue_id in by_id or queue_id in owned_ids for queue_id in added_ids)):
+                raise ScheduleError("QUEUE_SCAN_FAILED")
+            cleanup_receipts = _scan_cleanup_receipts(scan_res, added_ids)
             updated_rows = api.project_rows(manifest["project"])
-            updated_by_id = {int(row["id"]): row for row in updated_rows if _integer(row.get("id"))}
+            updated_by_id = {row["id"]: row for row in updated_rows if _integer(row.get("id"))}
+            if any(queue_id not in updated_by_id for queue_id in added_ids):
+                raise ScheduleError("QUEUE_SCAN_FAILED")
+            _check_unowned_sources(updated_by_id, owned_ids.union(added_ids), source_root)
 
-            prior_pending_order = [job["queue_id"] for job in manifest["jobs"][index:] if job["queue_id"] in updated_by_id]
-            seen_pending = set(prior_pending_order)
-            extra_pending = sorted(
-                qid for qid in updated_by_id
-                if qid not in completed_ids and qid not in seen_pending
-            )
-            ordered_pending_ids = prior_pending_order + extra_pending
+            ordered_pending_ids = [*retained_paths, *sorted(added_ids)]
             if not completed_jobs and not ordered_pending_ids:
                 raise ScheduleError("MANIFEST_JOBS")
 
             pending_jobs = []
-            for qid in ordered_pending_ids:
-                row = updated_by_id[qid]
-                file_path = Path(str(row.get("input_video_path") or ""))
-                if (not file_path.is_file() or row.get("status") != "Pending" or row.get("published_url")
-                        or row.get("visibility") != "private" or row.get("schedule_time")
-                        or row.get("target_channel_id") != manifest["channel"]["id"]):
+            for queue_id in ordered_pending_ids:
+                row = updated_by_id.get(queue_id)
+                file_path = Path(str(row.get("input_video_path") or "")) if row else None
+                if (file_path is None or not _source_file_in_root(file_path, source_root)
+                        or file_path.suffix.lower() not in VIDEO_SUFFIXES
+                        or (queue_id in retained_paths and file_path.resolve() != retained_paths[queue_id])
+                        or not _pending_queue_row(row) or row.get("visibility") != "private"
+                        or row.get("schedule_time") or row.get("target_channel_id") != manifest["channel"]["id"]):
                     raise ScheduleError("QUEUE_BINDING_CHANGED")
-                pending_jobs.append({"queue_id": qid, "path": str(file_path), "sha256": sha256(file_path)})
+                pending_jobs.append({"queue_id": queue_id, "path": str(file_path), "sha256": sha256(file_path)})
 
-            api.preview_batch(manifest, ordered_pending_ids)
             new_jobs = completed_jobs + pending_jobs
             new_manifest = {**manifest, "jobs": new_jobs}
             validate_manifest(new_manifest)
@@ -573,15 +753,33 @@ def sync_schedule_folder(state_dir, runtime_dir, *, api_factory=LocalAPI, base_u
             elif new_state_obj["status"] in {"finished", "error"}:
                 new_state_obj["status"] = "waiting" if new_state_obj.get("last_started_at") else "ready"
             validate_state(new_state_obj, new_manifest)
+            manifest_data = _encode_json(new_manifest)
+            state_data = _encode_json(new_state_obj)
+            api.preview_batch(manifest, ordered_pending_ids)
 
-            save_json(directory / "manifest.json", new_manifest)
-            save_json(directory / "state.json", new_state_obj)
-            return {
-                "ok": True,
-                "removed_pending_count": len(stale_ids),
-                "added_count": int(scan_res.get("added") or 0),
-                "schedule": read_schedule_status(directory),
-            }
+            expected_stale = [by_id[queue_id] for queue_id in stale_ids]
+            if expected_stale:
+                _check_stale_rows(api, manifest, expected_stale, source_root)
+            _publish_schedule_json(directory, manifest_data, state_data)
+            published = True
+
+            result = {"ok": True, "removed_pending_count": 0, "added_count": len(added_ids)}
+            if expected_stale:
+                try:
+                    _check_stale_rows(api, manifest, expected_stale, source_root)
+                    deleted = api.delete_rows(stale_ids, expected_rows=expected_stale)
+                    if not isinstance(deleted, dict) or not deleted.get("ok") or deleted.get("deleted") != len(stale_ids):
+                        raise ScheduleError("QUEUE_DELETE_FAILED")
+                    result["removed_pending_count"] = len(stale_ids)
+                except (ScheduleError, OSError, TypeError, ValueError):
+                    result["warning_code"] = "STALE_CLEANUP_INCOMPLETE"
+            result["schedule"] = read_schedule_status(directory)
+            return result
+        except Exception as error:
+            recovery_required = isinstance(error, ScheduleError) and error.code == "RECOVERY_REQUIRED"
+            if cleanup_receipts and not published and not recovery_required:
+                _cleanup_failed_scan(api, cleanup_receipts)
+            raise
         finally:
             session = getattr(api, "session", None)
             if session is not None:
@@ -604,6 +802,16 @@ class ScheduleRunner:
         self.state["last_checked_at"] = stamp(self.now())
         self.state["error_code"] = code
         save_json(self.directory / "state.json", self.state)
+
+    @staticmethod
+    def _check_source(job):
+        path = Path(job["path"])
+        try:
+            if path.is_file() and sha256(path) == job["sha256"].lower():
+                return
+        except OSError:
+            pass  # The source can disappear or become unreadable during the hash.
+        raise ScheduleError("SOURCE_CHANGED")
 
     def _check_rows(self, rows):
         index, inflight = self.state["next_index"], self.state.get("inflight_queue_id")
@@ -657,7 +865,7 @@ class ScheduleRunner:
     def run(self, *, dry_run=False, observe_only=False):
         if not self.directory.is_dir():
             raise ScheduleError("SCHEDULE_UNINITIALIZED")
-        with single_instance(self.directory):
+        with runtime_operation_lock(self.runtime), single_instance(self.directory):
             self.manifest = load_json(self.directory / "manifest.json")
             jobs = validate_manifest(self.manifest)
             # Missing state is a hard stop, never permission to restart from job 0.
@@ -665,6 +873,16 @@ class ScheduleRunner:
             validate_state(self.state, self.manifest)
             release = load_json(self.directory / "release.json")
             validate_release(release, self.runtime)
+            index = self.state["next_index"]
+            if (not observe_only and index < len(jobs) and not self.state.get("inflight_queue_id")
+                    and self.state["submission_state"] == "ready"):
+                # Reject bad input before creating the API client or starting its server.
+                try:
+                    self._check_source(jobs[index])
+                except ScheduleError as error:
+                    if not dry_run:
+                        self._save("error", error.code)
+                    raise
             self.api = self.api_factory(self.base_url, self.runtime, release)
             try:
                 if self.api_factory is LocalAPI and not dry_run:
@@ -694,10 +912,12 @@ class ScheduleRunner:
                     slot = diagnostics.get("upload_slot") or {}
                     if not slot.get("available") or slot.get("state") == "recovery_required":
                         raise ScheduleError("UPLOAD_SLOT_UNAVAILABLE")
-                    for pending_job in jobs[self.state["next_index"]:]:
-                        if not Path(pending_job["path"]).is_file() or sha256(pending_job["path"]) != pending_job["sha256"].lower():
-                            raise ScheduleError("SOURCE_CHANGED")
-                    self.api.preview(self.manifest, jobs[self.state["next_index"]]["queue_id"])
+                    for pending_job in jobs[index:]:
+                        self._check_source(pending_job)
+                    # The HTTP preview persists an approval in the runtime database.
+                    # Only injected adapters may supply a read-only preview here.
+                    if not isinstance(self.api, LocalAPI):
+                        self.api.preview(self.manifest, jobs[index]["queue_id"])
                     return 0
                 due = next_due(self.manifest, self.state)
                 remaining = (due - self.now()).total_seconds()
@@ -720,10 +940,11 @@ class ScheduleRunner:
                     raise ScheduleError("UPLOAD_SLOT_UNAVAILABLE")
                 if slot.get("state") == "active" or (slot.get("remaining_seconds") or 0) > 0:
                     raise ScheduleError("UPLOAD_SLOT_BUSY")
-                job = jobs[self.state["next_index"]]
-                if not Path(job["path"]).is_file() or sha256(job["path"]) != job["sha256"].lower():
-                    raise ScheduleError("SOURCE_CHANGED")
+                job = jobs[index]
+                self._check_source(job)
                 payload = self.api.preview(self.manifest, job["queue_id"])
+                # The file can change during preview. Check before recording a submission.
+                self._check_source(job)
                 submitted = stamp(self.now())
                 self.state.update(inflight_queue_id=job["queue_id"], submission_state="submitting", submitted_at=submitted,
                                   last_started_at=submitted)
@@ -736,10 +957,13 @@ class ScheduleRunner:
                 self.state["submission_state"] = "started"
                 self._save("running")
                 return self._observe()
-            except (ScheduleError, OSError, ValueError, TypeError, KeyError):
+            except (ScheduleError, OSError, ValueError, TypeError, KeyError) as error:
                 # Keep inflight/submitting intact: an uncertain response cannot authorize resend.
                 if not dry_run:
-                    self._save("error", "SCHEDULE_CHECK_FAILED")
+                    code = "SCHEDULE_CHECK_FAILED"
+                    if isinstance(error, ScheduleError) and error.code == "SOURCE_CHANGED":
+                        code = error.code
+                    self._save("error", code)
                 raise
             finally:
                 session = getattr(self.api, "session", None)

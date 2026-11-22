@@ -438,18 +438,37 @@
       ['Cần đối soát', data.needs_review_count ?? '—', 'Mở hàng đợi để xem bằng chứng từng video'],
       ['Dung lượng trống', typeof window.storageFormatBytes === 'function' && data.storage?.free_bytes != null ? window.storageFormatBytes(data.storage.free_bytes) : 'Chưa rõ', data.database?.available ? 'Database sẵn có' : 'Chưa xác nhận database'],
     ];
-    if (data.scheduled_uploads?.configured) {
+    if (data.scheduled_uploads?.configured === true) {
       const sched = data.scheduled_uploads;
+      const rawDrift = sched.folder_drift;
+      const drift = rawDrift && typeof rawDrift === 'object' && !Array.isArray(rawDrift) ? rawDrift : {};
+      const validCount = value => Number.isSafeInteger(value) && value >= 0;
+      const malformedDrift = rawDrift != null && (rawDrift !== drift
+        || ['detected', 'next_source_exists'].some(key => drift[key] !== undefined && typeof drift[key] !== 'boolean')
+        || ['missing_future_count', 'new_files_count'].some(key => drift[key] !== undefined && !validCount(drift[key])));
+      const missingCount = validCount(drift.missing_future_count) ? drift.missing_future_count : 0;
+      const newCount = validCount(drift.new_files_count) ? drift.new_files_count : 0;
+      const nextMissing = drift.next_source_exists === false;
+      const sourceChanged = drift.detected === true || missingCount > 0 || newCount > 0 || nextMissing;
+      const statusText = nextMissing ? 'Cần xử lý nguồn' : (sourceChanged || malformedDrift ? 'Cần kiểm tra nguồn' : sched.status);
       const prog = Number.isInteger(sched.completed_count) && Number.isInteger(sched.total_count)
-        ? `${sched.completed_count}/${sched.total_count} video · ${sched.status}`
-        : String(sched.status || 'Đã cấu hình');
+        ? `${sched.completed_count}/${sched.total_count} video · ${statusText}`
+        : String(statusText || 'Đã cấu hình');
       const nextText = sched.next_due_at
         ? `Kế tiếp: ${new Date(sched.next_due_at).toLocaleString('vi-VN')}`
         : (sched.message || 'Xem trong Quy trình đăng tự động');
-      const driftHint = sched.folder_drift?.detected
-        ? 'Có thay đổi thư mục nguồn — mở Quy trình đăng để đồng bộ'
-        : nextText;
-      values.push(['Lịch đăng Private', prog, sched.action_required ? `Cần kiểm tra: ${sched.message || sched.status}` : driftHint]);
+      const sourceDetails = [];
+      if (nextMissing) sourceDetails.push('File kế tiếp không còn trên đĩa');
+      if (missingCount) sourceDetails.push(`${missingCount} file chờ không còn trên đĩa`);
+      if (newCount) sourceDetails.push(`${newCount} file mới chưa nạp vào lịch`);
+      let hint = sched.action_required ? `Cần kiểm tra: ${sched.message || sched.status}` : nextText;
+      if (sourceChanged || malformedDrift) {
+        hint = sourceDetails.length ? sourceDetails.join(' · ') + '. ' : '';
+        hint += malformedDrift ? 'Dữ liệu kiểm tra nguồn không hợp lệ; tải lại trạng thái trước khi đồng bộ hoặc chạy tiếp.'
+          : 'Mở Quy trình đăng tự động để kiểm tra nguồn trước khi đồng bộ.';
+        if (newCount) hint += ' File mới không mặc nhiên là file đổi tên; đối chiếu nội dung để tránh đăng trùng.';
+      }
+      values.push(['Lịch đăng Private', prog, hint]);
     }
     host.replaceChildren();
     values.forEach(([label, value, description]) => {
