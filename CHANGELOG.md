@@ -1,5 +1,13 @@
 # CHANGELOG — DHB Reup YouTube Studio
 
+## 2026-11-22 — Tích hợp các bản sửa hiệu năng, upload và lịch đăng
+
+- Build `2026.11.22-integration`, gồm PR #44–#52: tăng tốc `/api/queue` và cache settings (#44); làm mới tiêu đề dự án khi tạo/đổi tên (#45); tải/render trước trong lúc chờ khoảng cách upload (#46); render intro/outro trong một lượt FFmpeg (#47).
+- Lỗi kết nối CDP Antidetect và lỗi OAuth trước khi gửi file được ghi là chưa gửi thay vì NeedsReview (#48, #49); Antidetect mở trang trắng trước rồi mới mở Google ở tab mới (#51).
+- Đồng bộ lịch báo rõ `UNSCHEDULED_SOURCE_ITEMS` và hiển thị đúng thông điệp lỗi dạng object (#50); gồm gia cố receipt, phạm vi đồng bộ và gate phát hành (#52).
+- Nghiệm thu/CI/soak phải gắn với đúng revision của build này.
+
+
 ## 2026-11-21 — Giới hạn phạm vi đồng bộ và hoàn thiện gate phát hành
 
 - Đồng bộ chỉ xử lý pending ID thuộc manifest; giữ hàng đợi ngoài lịch trong cùng project. ID mới phải do chính lần scan trả về và vượt qua kiểm tra binding/nguồn; không tự nhận hàng được tạo đồng thời bởi thao tác khác. Đồng bộ lấy khóa runtime trước khóa lịch và kiểm tra dung lượng danh sách trước khi có thay đổi.
