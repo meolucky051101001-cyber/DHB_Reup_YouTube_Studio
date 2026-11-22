@@ -366,12 +366,58 @@ class AntidetectLeaseTests(unittest.TestCase):
         lease._playwright = fake_pw
         lease.port = 9333
         with mock.patch.object(ac.time, "sleep"):
-            with self.assertRaises(ac.AntidetectError) as ctx:
+            with self.assertRaises(ac.AntidetectNotReady) as ctx:
                 lease._connect_cdp()
         message = str(ctx.exception)
         self.assertIn("9333", message)
         self.assertIn("sau 3 lần thử", message)
         self.assertEqual(len(fake_pw.chromium.calls), 3)
+
+    def test_lease_cdp_attach_failure_is_not_ready_and_cleans_owned_profile(self):
+        start = {
+            "success": True,
+            "port": 9222,
+            "launched_now": True,
+            "cdp_ready": True,
+            "configuration_verified": True,
+            "cdp_health": {"state": "healthy", "launch_id": "launch-1"},
+        }
+        lease, fake_pw, client, _ = self._lease(start, failures=99)
+        with mock.patch("playwright.sync_api.sync_playwright", return_value=fake_pw), \
+                mock.patch.object(ac.time, "sleep") as sleep:
+            with self.assertRaises(ac.AntidetectNotReady) as ctx:
+                lease.__enter__()
+
+        self.assertIn("9222", str(ctx.exception))
+        self.assertIn("sau 3 lần thử", str(ctx.exception))
+        self.assertEqual(len(fake_pw.chromium.calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(client.stop_calls, [("ad-1", "launch-1")])
+        self.assertTrue(fake_pw.stopped)
+
+    def test_lease_without_browser_context_is_not_ready_and_cleans_owned_profile(self):
+        start = {
+            "success": True,
+            "port": 9222,
+            "launched_now": True,
+            "cdp_ready": True,
+            "configuration_verified": True,
+            "cdp_health": {"state": "healthy", "launch_id": "launch-1"},
+        }
+        lease, fake_pw, client, context = self._lease(start)
+        browser = _FakeBrowser(context)
+        browser.contexts = []
+        with mock.patch("playwright.sync_api.sync_playwright", return_value=fake_pw), \
+                mock.patch.object(fake_pw.chromium, "connect_over_cdp", return_value=browser):
+            with self.assertRaises(ac.AntidetectNotReady) as ctx:
+                lease.__enter__()
+
+        self.assertEqual(
+            str(ctx.exception),
+            "Không tìm thấy context trình duyệt của profile Antidetect.",
+        )
+        self.assertEqual(client.stop_calls, [("ad-1", "launch-1")])
+        self.assertTrue(fake_pw.stopped)
 
     def test_hidden_lease_moves_started_window_offscreen(self):
         start = {
@@ -426,6 +472,71 @@ class AntidetectConfigTests(unittest.TestCase):
     def test_invalid_base_url_is_rejected(self):
         with self.assertRaises(ac.AntidetectError):
             ac._normalize_base_url("127.0.0.1:8000")
+
+
+class AntidetectOpenUrlTests(unittest.TestCase):
+    def test_open_url_starts_default_page_then_opens_tab_for_both_start_states(self):
+        url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=fixture"
+        for launched_now in (True, False):
+            with self.subTest(launched_now=launched_now):
+                client = ac.AntidetectClient()
+                start_result = {"port": 9222, "launched_now": launched_now}
+                page = mock.Mock()
+                context = mock.Mock()
+                context.new_page.return_value = page
+                browser = mock.Mock(contexts=[context])
+                playwright = mock.Mock()
+                playwright.chromium.connect_over_cdp.return_value = browser
+                manager = mock.MagicMock()
+                manager.__enter__.return_value = playwright
+                manager.__exit__.return_value = False
+
+                with mock.patch.object(client, "start_profile", return_value=start_result) as start, \
+                        mock.patch("playwright.sync_api.sync_playwright", return_value=manager) as sync_playwright:
+                    result = client.open_url("ad-profile", url)
+
+                self.assertEqual(result, start_result)
+                start.assert_called_once_with("ad-profile")
+                sync_playwright.assert_called_once_with()
+                playwright.chromium.connect_over_cdp.assert_called_once_with(
+                    "http://127.0.0.1:9222", timeout=15000
+                )
+                context.new_page.assert_called_once_with()
+                page.goto.assert_called_once_with(url, wait_until="domcontentloaded", timeout=30000)
+                page.bring_to_front.assert_called_once_with()
+
+    def test_open_url_rejects_browser_without_contexts(self):
+        client = ac.AntidetectClient()
+        browser = mock.Mock(contexts=[])
+        playwright = mock.Mock()
+        playwright.chromium.connect_over_cdp.return_value = browser
+        manager = mock.MagicMock()
+        manager.__enter__.return_value = playwright
+        manager.__exit__.return_value = False
+
+        with mock.patch.object(client, "start_profile", return_value={"port": 9222}) as start, \
+                mock.patch("playwright.sync_api.sync_playwright", return_value=manager):
+            with self.assertRaises(ac.AntidetectNotReady):
+                client.open_url("ad-profile", "https://accounts.google.com/")
+
+        start.assert_called_once_with("ad-profile")
+        playwright.chromium.connect_over_cdp.assert_called_once_with(
+            "http://127.0.0.1:9222", timeout=15000
+        )
+
+    def test_open_login_uses_open_url_and_preserves_result(self):
+        client = ac.AntidetectClient()
+        with mock.patch.object(client, "open_url", return_value={"port": 9222}) as open_url:
+            result = client.open_login("ad-profile", "https://studio.youtube.com")
+
+        open_url.assert_called_once_with("ad-profile", "https://studio.youtube.com")
+        self.assertEqual(result, {
+            "ok": True,
+            "antidetect": True,
+            "profile_id": "ad-profile",
+            "port": 9222,
+            "message": "Đã mở Profile bằng Antidetect tại studio.youtube.com",
+        })
 
 
 class SyncDatabaseTests(unittest.TestCase):

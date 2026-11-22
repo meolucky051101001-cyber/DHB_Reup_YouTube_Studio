@@ -1,3 +1,4 @@
+import copy
 import csv
 import json
 import os
@@ -5,6 +6,7 @@ import re
 import shutil
 import sqlite3
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -547,6 +549,10 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_upload_attempts_queue "
             "ON upload_attempts(queue_id, attempt_no DESC)"
         )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_video_queue_project_id ON video_queue(project_name, id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_video_queue_status ON video_queue(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_system_logs_queue ON system_logs(queue_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_system_logs_run ON system_logs(run_id)")
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_published_history_content_channel "
             "ON published_history(content_key, channel_id) "
@@ -1062,6 +1068,23 @@ def collect_secret_values(settings: Optional[Dict[str, Any]] = None, connection:
     return result
 
 
+_SECRET_KEYWORDS = (
+    r"api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|"
+    r"oauth[_-]?token|token|password|proxy[_-]?password|passwd|client[_-]?secret|secret|cookie"
+)
+# Every pattern below needs one of these substrings, so text without them can skip the regex pass.
+_REDACT_PREFILTER_RE = re.compile(r"(?i)bearer|basic|key|token|passw|secret|cookie|@|\.\d{1,3}:\d")
+_REDACT_PATTERNS = (
+    (re.compile(r"(?i)(authorization:\s*(?:bearer|basic)\s+|\b(?:bearer|basic)\s+)[^\s,;]+"), r"\1***"),
+    (re.compile(r"(?i)([?&](?:key|" + _SECRET_KEYWORDS + r")=)[^&\s#]+"), r"\1***"),
+    (re.compile(r"(?i)(\b(?:" + _SECRET_KEYWORDS + r")\b\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&]+)"), r"\1***"),
+    (re.compile(r"(?i)(\"(?:" + _SECRET_KEYWORDS + r"|oauth_token_json)\"\s*:\s*\")[^\"]*(\")"), r"\1***\2"),
+    (re.compile(r"(?i)(https?://[^/@\s:]+:)[^/@\s]+@"), r"\1***@"),
+    (re.compile(r"(?i)(cookie(?:\s+header)?\s*:\s*)[^\r\n]+"), r"\1***"),
+    (re.compile(r"(?i)((?:\d{1,3}\.){3}\d{1,3}:\d{2,5}:[^:\s]+:)[^\s]+"), r"\1***"),
+)
+
+
 def redact_secrets(text: Any, secrets: Optional[List[str]] = None) -> str:
     out = str(text or "")
     if secrets is None:
@@ -1072,24 +1095,12 @@ def redact_secrets(text: Any, secrets: Optional[List[str]] = None) -> str:
     else:
         values = secrets
     for secret in values:
-        if secret:
+        if secret and secret in out:
             out = out.replace(secret, "***")
-    out = re.sub(r"(?i)(authorization:\s*(?:bearer|basic)\s+|\b(?:bearer|basic)\s+)[^\s,;]+", r"\1***", out)
-    out = re.sub(
-        r"(?i)([?&](?:key|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|oauth[_-]?token|token|password|proxy[_-]?password|passwd|client[_-]?secret|secret|cookie)=)[^&\s#]+",
-        r"\1***", out,
-    )
-    out = re.sub(
-        r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|oauth[_-]?token|token|password|proxy[_-]?password|passwd|client[_-]?secret|secret|cookie)\b\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&]+)",
-        r"\1***", out,
-    )
-    out = re.sub(
-        r"(?i)(\"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|session[_-]?token|oauth[_-]?token|token|password|proxy[_-]?password|passwd|client[_-]?secret|secret|cookie|oauth_token_json)\"\s*:\s*\")[^\"]*(\")",
-        r"\1***\2", out,
-    )
-    out = re.sub(r"(?i)(https?://[^/@\s:]+:)[^/@\s]+@", r"\1***@", out)
-    out = re.sub(r"(?i)(cookie(?:\s+header)?\s*:\s*)[^\r\n]+", r"\1***", out)
-    out = re.sub(r"(?i)((?:\d{1,3}\.){3}\d{1,3}:\d{2,5}:[^:\s]+:)[^\s]+", r"\1***", out)
+    if not _REDACT_PREFILTER_RE.search(out):
+        return out
+    for pattern, replacement in _REDACT_PATTERNS:
+        out = pattern.sub(replacement, out)
     return out
 
 
@@ -1173,7 +1184,29 @@ def remove_managed_artifact(artifact_id: int) -> None:
         conn.close()
 
 
+_SETTINGS_CACHE_TTL_SECONDS = 2.0
+_SETTINGS_CACHE_LOCK = threading.Lock()
+_SETTINGS_CACHE: Optional[tuple] = None
+_SETTINGS_CACHE_GENERATION = 0
+
+
+def _invalidate_settings_cache() -> None:
+    global _SETTINGS_CACHE, _SETTINGS_CACHE_GENERATION
+    with _SETTINGS_CACHE_LOCK:
+        _SETTINGS_CACHE = None
+        _SETTINGS_CACHE_GENERATION += 1
+
+
 def get_settings() -> Dict[str, Any]:
+    """Short-lived cache: hot loops reread settings constantly; writes in this process invalidate it."""
+    global _SETTINGS_CACHE
+    source = (str(APP_DB_PATH), get_conn)
+    now = time.monotonic()
+    with _SETTINGS_CACHE_LOCK:
+        cached = _SETTINGS_CACHE
+        generation = _SETTINGS_CACHE_GENERATION
+    if cached and cached[0] == source and now - cached[1] < _SETTINGS_CACHE_TTL_SECONDS:
+        return copy.deepcopy(cached[2])
     conn = get_conn()
     rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
     conn.close()
@@ -1183,7 +1216,11 @@ def get_settings() -> Dict[str, Any]:
             res[r["key"]] = json.loads(r["value"])
         except Exception:
             res[r["key"]] = r["value"]
-    return res
+    with _SETTINGS_CACHE_LOCK:
+        # A save during this read invalidated the cache; don't republish the pre-save snapshot.
+        if generation == _SETTINGS_CACHE_GENERATION:
+            _SETTINGS_CACHE = (source, now, res)
+    return copy.deepcopy(res)
 
 
 def save_settings(new_settings: Dict[str, Any]):
@@ -1196,6 +1233,7 @@ def save_settings(new_settings: Dict[str, Any]):
         )
     conn.commit()
     conn.close()
+    _invalidate_settings_cache()
     if any(is_secret_setting_key(key) for key in new_settings):
         _invalidate_secret_cache()
 
@@ -1279,6 +1317,7 @@ def sync_from_dhb_facebook(initial_only: bool = False) -> Dict[str, int]:
 
     conn.commit()
     conn.close()
+    _invalidate_settings_cache()
     add_log(
         "Sync",
         f"Đã cập nhật cài đặt API và {stats['profiles']} Profile Chrome cho YouTube (Loại trừ toàn bộ dữ liệu Facebook).",

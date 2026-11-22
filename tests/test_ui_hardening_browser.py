@@ -237,7 +237,7 @@ class UploadWorkflowHardeningBrowserTests(unittest.TestCase):
         self.assertIn("2 file mới chưa nạp vào lịch", banner.inner_text())
 
         outside_message = (
-            "Dự án lịch đăng có video thêm tay nằm ngoài thư mục nguồn (#271, #272). "
+            "Thư mục nguồn có video đã được thêm vào dự án lịch đăng nhưng không thuộc lịch. "
             "Hãy chuyển các video này sang dự án khác rồi đồng bộ lại. Chưa xóa video nào."
         )
 
@@ -250,8 +250,7 @@ class UploadWorkflowHardeningBrowserTests(unittest.TestCase):
                 body=json.dumps({
                     "detail": {
                         "message": outside_message,
-                        "code": "PENDING_OUTSIDE_SOURCE",
-                        "queue_ids": [271, 272],
+                        "code": "UNSCHEDULED_SOURCE_ITEMS",
                     }
                 }),
             )

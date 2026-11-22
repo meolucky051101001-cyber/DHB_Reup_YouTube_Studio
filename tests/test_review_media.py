@@ -99,8 +99,23 @@ class RealMediaMatrix(unittest.TestCase):
         self.run_case('short-audio','shorts_9_16',.5,True,source=source)
 
     def test_edge_intro_outro(self):
-        self.run_case('intro-outro','shorts_9_16',2,expected=4,
-                      extra={'intro_enabled':True,'intro_name':'intro.mp4','outro_enabled':True,'outro_name':'outro.mp4'})
+        cases = (
+            ('intro-outro','shorts_9_16',2,False,False,4,{'intro_enabled':True,'intro_name':'intro.mp4','outro_enabled':True,'outro_name':'outro.mp4'}),
+            ('outro-music','shorts_9_16',2,False,True,3,{'outro_enabled':True,'outro_name':'outro.mp4'}),
+            ('intro-full-audio','full_16_9',1,True,False,5,{'intro_enabled':True,'intro_name':'intro.mp4'}),
+        )
+        for name,mode,speed,audio,music,expected,extra in cases:
+            with self.subTest(name=name),                     mock.patch.object(render,'_run_ffmpeg_with_progress',wraps=render._run_ffmpeg_with_progress) as run:
+                self.run_case(name,mode,speed,audio,music,expected=expected,extra=extra)
+                self.assertEqual(run.call_count,1,'intro/outro must be encoded in the main pass')
+
+    def test_edge_intro_outro_after_cut_removes_all_audio(self):
+        source=self.root/'audio-first-second.mp4'
+        self.ffmpeg(['-i',str(self.root/'silent.mp4'),'-f','lavfi','-i','sine=frequency=440:duration=1','-c:v','copy','-c:a','aac',str(source)])
+        for name,mode,music in (('cut-no-audio-outro','full_16_9',False),('cut-no-audio-outro-music','shorts_9_16',True)):
+            with self.subTest(name=name):
+                self.run_case(name,mode,1,music=music,expected=3,source=source,cut_start='00:00:02',
+                              extra={'outro_enabled':True,'outro_name':'outro.mp4'})
 
     def test_edge_autofit(self):
         self.run_case('autofit','shorts_9_16',1,expected=4/1.34,

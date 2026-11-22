@@ -4,7 +4,7 @@
 
 The first event for an attempt must be `verification_state="received"`; this records the ID before readback. Later events may transition to exactly one terminal state: `verified`, `mismatch`, or `unknown`. Terminal events are immutable and idempotent only when backend, ID, expected metadata, observed metadata and code match. A different ID, backend, expectation, code or terminal state is rejected. A stale claim, wrong attempt, wrong channel/content, missing/changed reservation or non-`InProgress` attempt is rejected without a write.
 
-Event input is strict and sanitized:
+Event input is strict and sanitized. The example below is the legacy v1 category/language contract, which remains readable. The current JSON v2 contract is described after the example:
 
 ```json
 {
@@ -15,9 +15,15 @@ Event input is strict and sanitized:
 }
 ```
 
-Only `youtube_api`/`playwright`, 11-character YouTube IDs, category IDs, language tags, `observed` metadata and an uppercase bounded error code are accepted. The stored object derives `https://youtu.be/<id>` and UTC timestamps from the trusted callback; caller-supplied URLs, raw responses, cookies, OAuth, proxies and arbitrary fields never enter evidence. Malformed input, corrupt existing evidence, connection/write failures and oversized JSON return stable `EvidenceError` codes without echoing values.
+Only `youtube_api`/`playwright`, 11-character YouTube IDs, approved metadata and an uppercase bounded error code are accepted. The stored object derives `https://youtu.be/<id>` and UTC timestamps from the trusted callback; caller-supplied URLs, raw responses, cookies, OAuth, proxies and arbitrary fields never enter evidence. Malformed input, corrupt existing evidence, connection/write failures and oversized JSON return stable `EvidenceError` codes without echoing values.
 
-G21a extends expected metadata to a nonempty subset of `category_id` and `video_language`; explicit nulls and empty expectations are rejected. This lets a language-only contract preserve category intent `keep` without inventing an expected category. Every expected field still requires matching observed data before `verified`. API expectations continue to include category. Studio's production capability remains disabled; future adapter wiring must derive expectations from the actual requested fields.
+The JSON evidence `version` is independent of the SQLite migration version. Legacy v1 stores a nonempty subset of `category_id` and `video_language`; a language-only contract preserves category intent `keep`. JSON v2 also allows `privacy_status`, `made_for_kids`, `altered_content`, `youtube_channel_id` and `publish_at` in the approved expectation, and `upload_status`/`processing_status` in observed readback. Empty expectations remain invalid. Explicit null is allowed only for `publish_at` to represent no scheduled publication. No other arbitrary fields or secret values are accepted.
+
+V2 records `field_states` (`present`, `missing`, `null`, `invalid`) independently of observed values, plus derived `upload_state` and `metadata_state`. A receipt has pending metadata; later evidence distinguishes verified, partial, mismatch and unknown metadata. Missing, null and invalid values must not be silently converted into a matching boolean. One explicit policy permits `altered_content=false` with an omitted API field when processing has succeeded and all other required metadata match: keep the field missing, retain the warning and report `metadata_state=partial`. Required AI=true, explicit null/invalid values or mismatches remain verification failures. V1 records remain validated as v1; reading does not rewrite old evidence.
+
+The read-only receipt recheck independently compares the exact video ID, destination and expected metadata. Provider upload states `failed`, `rejected`, `deleted` or processing states `failed`, `terminated` take precedence over a success indicator in the other field: return `upload_state=failed`, `matches_expected=false` and the failed fields. Recheck does not submit a video, update metadata, resolve NeedsReview or change the stored receipt/history.
+
+Studio's metadata capability remains governed by the capability matrix; evidence does not enable unsupported uploader fields. The worker must derive the expectation from the actual approved request.
 
 The additive `upload_evidence=1` migration adds `upload_attempts.evidence_json TEXT NOT NULL DEFAULT '{}'`. It runs in a savepoint, stamps last, is idempotent and respects an outer transaction. A future/invalid stamp, stamped-but-incomplete column or wrong column contract stops without repair. Existing attempt rows/evidence are preserved.
 
@@ -25,7 +31,7 @@ Read APIs use `read_evidence(raw, queue_id, attempt_id, channel_id)` with truste
 
 The sink is durable evidence, not proof that a video is published. `received` means only that the uploader returned an ID; the pipeline must separately read back required metadata and choose `verified`, `mismatch` or `unknown`, retaining `NeedsReview`/reservation semantics when verification is uncertain.
 
-The worker supplies the selected backend and expected category/language from validated metadata when constructing the sink. A callback cannot replace that expectation. Completion checks the evidence against those same values and the normalized result URL. API completion requires `verified` evidence; a returned URL alone is insufficient. Existing Studio results retain their prior verification path while new Studio metadata capabilities remain disabled.
+The worker supplies the selected backend and the version-appropriate approved expectation from validated metadata when constructing the sink. A callback cannot replace that expectation. Completion checks the evidence against those same values and the normalized result URL. API completion requires `verified` evidence; a returned URL alone is insufficient. Existing Studio results retain their prior verification path while new Studio metadata capabilities remain disabled.
 
 Successful completion commits queue, attempt, published history and reservation release in one `synchronous=FULL` transaction, after checking claim/attempt/channel/content ownership. A failure at any write rolls back all completion writes and retains the earlier evidence for review. Logging or optional cleanup after a committed completion cannot downgrade the result. A late `UploadNotSent`/Antidetect exception cannot clear an attempt that already contains evidence.
 
@@ -33,4 +39,4 @@ Successful completion commits queue, attempt, published history and reservation 
 
 `tests/test_upload_evidence.py` covers receipt before readback and fresh-process persistence, monotonic transitions/idempotency, mismatch observations, identity/ownership/reservation races, secret omission, corrupt/oversized records, full durability ordering, write/lock failure, connection failures and migration rollback/future-schema behavior.
 
-Final local acceptance: **533 unittest methods, 524 passed and 9 opt-in media tests skipped**, with Chromium enabled, in 82.6 seconds. API fixtures are exercised through the real worker/SQLite sink as well as directly. Fault tests cover each completion write, restart, late NotSent and logging failures. Browser tests verify the read-only evidence dialog and updated capability matrix. Compilation, JavaScript syntax and diff checks pass. All provider boundaries are mocked; this is not live YouTube acceptance or runtime rollout. CI results are recorded on the PR.
+Historical acceptance for the original G19 snapshot (not the current release result): **533 unittest methods, 524 passed and 9 opt-in media tests skipped**, with Chromium enabled, in 82.6 seconds. API fixtures are exercised through the real worker/SQLite sink as well as directly. Fault tests cover each completion write, restart, late NotSent and logging failures. Browser tests verify the read-only evidence dialog and updated capability matrix. Compilation, JavaScript syntax and diff checks pass. All provider boundaries are mocked; this is not live YouTube acceptance or runtime rollout. CI results are recorded on the PR.

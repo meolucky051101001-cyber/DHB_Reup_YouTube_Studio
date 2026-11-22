@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -263,6 +264,94 @@ class ManualReconcileAndReceiptRecheckTests(unittest.TestCase):
         self.assertEqual(fake_session.post_calls, [])
         self.assertEqual(fake_session.put_calls, [])
 
+    def test_readonly_recheck_does_not_accept_terminal_provider_failures(self):
+        self.seed_receipt_review()
+        before = self.row()
+        with closing(database.get_conn()) as conn:
+            tables = ("upload_attempts", "published_history", "content_reservations")
+            snapshot = {table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+                        for table in tables}
+        cases = [
+            ("failed", "succeeded", ["upload_status"]),
+            ("rejected", "succeeded", ["upload_status"]),
+            ("deleted", "succeeded", ["upload_status"]),
+            ("processed", "failed", ["processing_status"]),
+            ("processed", "terminated", ["processing_status"]),
+            ("rejected", "failed", ["upload_status", "processing_status"]),
+        ]
+        for upload_status, processing_status, mismatches in cases:
+            with self.subTest(upload=upload_status, processing=processing_status):
+                payload = api_fixtures.video_payload()
+                payload["items"][0]["status"]["uploadStatus"] = upload_status
+                payload["items"][0]["processingDetails"]["processingStatus"] = processing_status
+                session = api_fixtures.MetadataSession(readbacks=[api_fixtures.JsonResponse(payload)])
+                with mock.patch.object(yu, "_http_session_for_channel", return_value=session), \
+                        mock.patch.object(yu, "_refresh_google_access_token", return_value="offline-token"), \
+                        mock.patch.object(yu, "_fetch_oauth_channel_identity", return_value={"channel_id": CHANNEL_ID}):
+                    response = self.client.post("/api/queue/901/recheck-receipt", headers=self.headers, json={})
+                self.assertEqual(response.status_code, 200, response.text)
+                report = response.json()
+                self.assertTrue(report["found"])
+                self.assertFalse(report["matches_expected"])
+                self.assertEqual(report["upload_state"], "failed")
+                self.assertEqual(report["mismatches"], mismatches)
+                self.assertEqual(len(session.get_calls), 1)
+                self.assertEqual(session.get_calls[0][1]["params"]["id"], VIDEO_ID)
+                self.assertEqual(session.post_calls, [])
+                self.assertEqual(session.put_calls, [])
+                self.assertEqual(self.row(), before)
+                with closing(database.get_conn()) as conn:
+                    self.assertEqual(
+                        {table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+                         for table in tables}, snapshot)
+
+
+class ScheduledUploadCliEncodingTests(unittest.TestCase):
+    def test_json_output_is_safe_for_legacy_windows_console_encoding(self):
+        report = {"configured": True, "status": "waiting",
+                  "message": "Đang chờ đủ khoảng cách giữa hai lượt đăng.", "video": "视频"}
+        with tempfile.TemporaryDirectory() as directory:
+            for command in ("status", "sync-folder", "run", "observe"):
+                with self.subTest(command=command):
+                    arguments = [command, "--state-dir", directory]
+                    if command != "status":
+                        arguments += ["--runtime-dir", directory]
+                    buffer = io.BytesIO()
+                    output = io.TextIOWrapper(buffer, encoding="cp1252", errors="strict", write_through=True)
+                    try:
+                        with mock.patch("sys.stdout", output), \
+                                mock.patch.object(schedule_cli, "read_schedule_status", return_value=report), \
+                                mock.patch.object(schedule_cli, "sync_schedule_folder", return_value=report), \
+                                mock.patch.object(schedule_cli, "ScheduleRunner") as runner:
+                            runner.return_value.run.return_value = 0
+                            result = schedule_cli.main(arguments)
+                        output.flush()
+                        self.assertEqual(result, 0)
+                        self.assertEqual(json.loads(buffer.getvalue().decode("cp1252")), report)
+                    finally:
+                        output.close()
+
+    def test_runner_failure_exit_codes_survive_legacy_console_output(self):
+        report = {"configured": True, "status": "needs_review", "message": "Cần đối soát lượt đăng."}
+        with tempfile.TemporaryDirectory() as directory:
+            for command in ("run", "observe"):
+                for code in (1, 2, 3):
+                    with self.subTest(command=command, code=code):
+                        buffer = io.BytesIO()
+                        output = io.TextIOWrapper(buffer, encoding="cp1252", errors="strict", write_through=True)
+                        try:
+                            with mock.patch("sys.stdout", output), \
+                                    mock.patch.object(schedule_cli, "read_schedule_status", return_value=report), \
+                                    mock.patch.object(schedule_cli, "ScheduleRunner") as runner:
+                                runner.return_value.run.return_value = code
+                                result = schedule_cli.main([command, "--state-dir", directory,
+                                                            "--runtime-dir", directory])
+                            output.flush()
+                            self.assertEqual(result, code)
+                            self.assertEqual(json.loads(buffer.getvalue().decode("cp1252")), report)
+                        finally:
+                            output.close()
+
 
 class PackagedScheduleAndTaskTests(unittest.TestCase):
     def setUp(self):
@@ -501,12 +590,11 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
             self.assertFalse(data["folder_drift"]["detected"])
             self.assertNotIn(str(self.sources), json.dumps(data))
 
-    def test_schedule_sync_endpoint_reports_outside_pending_queue_ids(self):
+    def test_schedule_sync_endpoint_reports_unscheduled_source_items(self):
         import app as studio_app
         from fastapi.testclient import TestClient
 
-        error = su.ScheduleError("PENDING_OUTSIDE_SOURCE")
-        error.queue_ids = [271, 272]
+        error = su.ScheduleError("UNSCHEDULED_SOURCE_ITEMS")
         with mock.patch.dict(os.environ, {"DHB_SCHEDULE_STATE_DIR": str(self.state_dir)}), \
                 mock.patch.object(studio_app, "sync_schedule_folder", side_effect=error), \
                 mock.patch.object(studio_app, "collect_secret_values", return_value=[]):
@@ -518,11 +606,10 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409, response.text)
         self.assertEqual(response.json()["detail"], {
             "message": (
-                "Dự án lịch đăng có video thêm tay nằm ngoài thư mục nguồn (#271, #272). "
+                "Thư mục nguồn có video đã được thêm vào dự án lịch đăng nhưng không thuộc lịch. "
                 "Hãy chuyển các video này sang dự án khác rồi đồng bộ lại. Chưa xóa video nào."
             ),
-            "code": "PENDING_OUTSIDE_SOURCE",
-            "queue_ids": [271, 272],
+            "code": "UNSCHEDULED_SOURCE_ITEMS",
         })
 
     def test_folder_drift_detection_and_sync_folder_preserves_cursor(self):
@@ -557,7 +644,8 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
             def project_rows(self_api, _project):
                 return [dict(r) for r in db_rows]
 
-            def delete_rows(self_api, ids):
+            def delete_rows(self_api, ids, *, expected_rows=None):
+                self.assertEqual([row["id"] for row in expected_rows or []], list(ids))
                 deleted_batches.append(list(ids))
                 db_rows[:] = [r for r in db_rows if r["id"] not in set(ids)]
                 return {"ok": True, "deleted": len(ids)}
@@ -574,7 +662,8 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
                     "is_claimed": False,
                     "requires_review": False,
                 })
-                return {"ok": True, "added": 1, "skipped": 1}
+                return {"ok": True, "added": 1, "skipped": 1, "added_ids": [242],
+                        "cleanup_receipts": [{"queue_id": 242, "proof": "f" * 64}]}
 
             def preview_batch(self_api, _manifest, queue_ids):
                 previewed_batches.append(list(queue_ids))
@@ -594,10 +683,10 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
         self.assertEqual(after["last_started_at"], "2026-11-17T16:13:10+00:00")
         self.assertNotIn(str(self.sources), json.dumps(res))
 
-    def test_sync_fails_closed_for_existing_pending_file_outside_source(self):
+    def test_sync_fails_closed_for_unscheduled_pending_file_in_source(self):
         self.file2.unlink()
-        outside_file = self.root / "manual.mp4"
-        outside_file.write_bytes(b"manual-video")
+        manual_file = self.sources / "manual.mp4"
+        manual_file.write_bytes(b"manual-video")
         manifest_path = self.state_dir / "manifest.json"
         state_path = self.state_dir / "state.json"
         manifest_before = manifest_path.read_bytes()
@@ -608,7 +697,7 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
             "id": 243,
             "status": "Pending",
             "published_url": "",
-            "input_video_path": str(outside_file),
+            "input_video_path": str(manual_file),
             "visibility": "private",
             "schedule_time": "",
             "target_channel_id": 66,
@@ -648,8 +737,7 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
         with self.assertRaises(su.ScheduleError) as raised:
             su.sync_schedule_folder(self.state_dir, self.runtime_dir, api_factory=FakeSyncAPI)
 
-        self.assertEqual(raised.exception.code, "PENDING_OUTSIDE_SOURCE")
-        self.assertEqual(raised.exception.queue_ids, [243])
+        self.assertEqual(raised.exception.code, "UNSCHEDULED_SOURCE_ITEMS")
         self.assertEqual(deleted_batches, [])
         self.assertEqual(scan_calls, [])
         self.assertEqual(previewed_batches, [])

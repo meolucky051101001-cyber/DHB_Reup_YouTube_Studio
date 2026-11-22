@@ -18,6 +18,24 @@ Dùng hướng dẫn này để chạy một lô có giám sát, đối soát k�
 5. Theo dõi lô. Mỗi lần chỉ một video giữ lượt upload. Cooldown tối thiểu 30 phút dùng chung giữa các profile, tính từ khi lượt trước kết thúc. Lịch là giờ YouTube phát hành, không tự bật lô vào giờ đó; giá trị được máy chạy DHB diễn giải theo múi giờ hệ điều hành, gợi ý của trình duyệt không chuyển múi giờ. Với `Completed`, mở link và kiểm tra ID, kênh, hiển thị/lịch trong Studio bằng phiên có quyền xem. Completed không đồng nghĩa Công khai: video Riêng tư hoặc đã lên lịch cũng có thể hoàn tất.
 6. Để kết thúc sớm, bấm **Dừng lô hiện tại**. Tool ngừng nhận video batch kế tiếp và chờ lượt upload đã bắt đầu hoàn tất. Đợi thông báo **Đang dừng lô** biến mất và Chẩn đoán báo worker batch đã dừng, active bằng 0. Nút này không dừng Monitor; dừng riêng từng luồng trong **Theo dõi nguồn** rồi kiểm tra worker và heartbeat trước khi tắt máy hoặc dịch vụ.
 
+## Lịch đăng Private định kỳ: kiểm tra nguồn
+
+Trong **Quy trình đăng tự động**, lịch có thể vẫn ở `waiting` vì chưa đến lượt, đồng thời nguồn đã thay đổi. Nếu thấy **Cần xử lý nguồn trước lượt đăng tiếp**, file kế tiếp trong lịch không còn trên đĩa; cần kiểm tra nguồn trước lượt đăng, không chỉ chờ đến giờ. Cảnh báo hiển thị riêng số file chờ bị thiếu và số file mới chưa nạp vào lịch.
+
+Ví dụ **7 file chờ không còn trên đĩa** và **7 file mới chưa nạp vào lịch** là hai số đếm độc lập, không chứng minh bảy file đã được đổi tên hay có cùng nội dung. Kiểm tra đúng thư mục/file nguồn, đối chiếu nội dung để tránh đăng trùng. Có thể khôi phục file ở đường dẫn lịch đang dùng; chỉ bấm **Đồng bộ thư mục nguồn** khi đã kiểm tra và muốn cập nhật danh sách lịch. Khi lượt đăng đang xử lý, đợi kết thúc rồi kiểm tra và đồng bộ. Sau đồng bộ, kiểm tra lại tiến độ, ID kế tiếp và cảnh báo nguồn. Đồng bộ chỉ xử lý các mục của lịch và nhận ID mới do chính lần quét tạo; các hàng khác cùng dự án được giữ nguyên. Thư mục vượt phạm vi 1.000 file hoặc khiến lịch vượt 1.000 mục phải được chia/đối chiếu lại, không quét cắt bớt im lặng.
+
+Đồng bộ gồm nhiều bước API và lưu JSON. Công cụ kiểm tra cả số mục và kích thước UTF-8, chuẩn bị hai file trước khi công bố và chỉ dọn slot cũ sau khi lịch mới đã lưu. Hàng mới có biên nhận ký riêng; khi lỗi trước công bố, chỉ hàng do chính lượt scan tạo và còn nguyên trạng, chưa được dùng/phê duyệt mới được gỡ để lần thử lại không bỏ sót file.
+
+Nếu hàng đã bị sửa, claim, có evidence/phê duyệt hoặc không xác minh được biên nhận, công cụ giữ hàng và báo `QUEUE_SCAN_CLEANUP_INCOMPLETE`; file trong thư mục đã thuộc hàng Pending ngoài manifest sẽ bị chặn bởi `UNSCHEDULED_SOURCE_ITEMS`. Khi không khôi phục được cặp file JSON, `RECOVERY_REQUIRED` giữ các hàng và cặp file JSON gốc trong thư mục `sync-recovery-*` bên dưới thư mục lịch để đối soát; không tự chạy hoặc xóa chúng. Lỗi dọn slot cũ sau công bố trả `STALE_CLEANUP_INCOMPLETE` và vẫn giữ lịch mới hợp lệ. Kiểm tra queue và trạng thái trước khi thử lại.
+
+Mở cảnh báo chỉ đọc trạng thái; giao diện không tự đồng bộ hay gửi lệnh chạy. Đồng bộ cập nhật lịch, còn lô thủ công vẫn qua Preview và **Xác nhận và chạy**. Nếu dữ liệu kiểm tra nguồn không hợp lệ, tải lại trạng thái và kiểm tra nguồn trước khi đồng bộ hoặc chạy tiếp.
+
+Dry-run production sau cập nhật chỉ kiểm tra nguồn, binding của lịch, Chẩn đoán và slot upload. Không gọi `/api/queue/preview-distribution` trong dry-run vì endpoint này tạo approval trong DB. Dry-run không thay thế Preview và phê duyệt metadata cho lượt đăng thật.
+
+Runner và rollout dùng chung khóa thao tác theo runtime, sau đó mới đến khóa thư mục lịch và khóa app. Nếu báo `RUNTIME_OPERATION_ACTIVE`, chờ thao tác đang sở hữu khóa kết thúc và kiểm tra trạng thái; không xóa file khóa hoặc ép chạy song song. Lock/log chẩn đoán có thể được tạo ngay cả khi chỉ dry-run, nhưng manifest/state/release và DB không được cập nhật bởi dry-run scheduler.
+
+Khi rollout, thư mục lịch được chọn theo thứ tự: `--schedule-state-dir`, biến môi trường `DHB_SCHEDULE_STATE_DIR`, rồi thư mục mặc định của runtime. Đường dẫn tương đối từ biến môi trường được tính theo thư mục runtime; tham số CLI theo thư mục gọi lệnh. Đường dẫn đã chọn được truyền rõ cho app mới và quá trình khôi phục. Lịch đã có manifest nhưng thiếu release pin phải được kiểm tra/khởi tạo đúng quy trình trước khi rollout; không tự suy ra hoặc tạo pin để bỏ qua preflight.
+
 ## Nguồn tự động (Monitor)
 
 1. Mở **Theo dõi nguồn → Tạo luồng**. Cấu hình Nguồn → Đích đăng → Xử lý → Chu kỳ, gồm kênh/nhóm kênh và chính sách metadata. Lưu chỉ tạo luồng ở trạng thái dừng.
