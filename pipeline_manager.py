@@ -528,6 +528,30 @@ def insert_monitor_queue_item(
     return cur.lastrowid
 
 
+class _WorkerCapacity:
+    """A batch worker's slot: held while downloading/rendering, then swapped for a bounded
+    "ready" slot while waiting for the upload gap so other items can be prepared meanwhile."""
+
+    def __init__(self, prepare: threading.Semaphore, ready: threading.Semaphore, stop_event: threading.Event):
+        self._prepare = prepare
+        self._ready = ready
+        self._stop_event = stop_event
+        self._handed_off = False
+
+    def hand_off(self) -> bool:
+        if self._handed_off:
+            return True
+        while not self._stop_event.is_set():
+            if self._ready.acquire(timeout=0.25):
+                self._handed_off = True
+                self._prepare.release()
+                return True
+        return False
+
+    def release(self):
+        (self._ready if self._handed_off else self._prepare).release()
+
+
 class RenderQueue:
     """Pool render riêng: FFmpeg đã chạy ở process con, lớp này giới hạn số render đồng thời
     độc lập với số luồng tải/đăng của pipeline."""
@@ -1365,6 +1389,8 @@ class PipelineManager:
         delay_value = settings.get("upload_delay_seconds", 5)
         delay_sec = max(0, int(5 if delay_value in (None, "") else delay_value))
         sem = threading.Semaphore(max_workers)
+        # Items already rendered and waiting for the global upload gap; bounds disk use and threads.
+        ready_sem = threading.Semaphore(max_workers)
         threads = []
         launch_failure = None
 
@@ -1396,7 +1422,10 @@ class PipelineManager:
             try:
                 worker_t = threading.Thread(
                     target=self._process_single_item_safe,
-                    args=(item_id, idx, do_download, do_render, do_upload, sem, batch_token, force_reupload),
+                    args=(
+                        item_id, idx, do_download, do_render, do_upload,
+                        _WorkerCapacity(sem, ready_sem, self._stop_event), batch_token, force_reupload,
+                    ),
                     daemon=True,
                 )
                 worker_t.start()
@@ -1456,7 +1485,7 @@ class PipelineManager:
         do_download: bool,
         do_render: bool,
         do_upload: bool,
-        sem: threading.Semaphore,
+        sem,
         batch_token: str = "",
         force_reupload: bool = False,
         stop_event: Optional[threading.Event] = None,
@@ -1470,6 +1499,7 @@ class PipelineManager:
                 item_id, row_idx, do_download, do_render, do_upload,
                 claim_token=batch_token, force_reupload=force_reupload,
                 stop_event=stop_event, upload_counter=upload_counter, owner=owner,
+                capacity=sem if isinstance(sem, _WorkerCapacity) else None,
             )
         except Exception as exc:
             try:
@@ -1505,6 +1535,7 @@ class PipelineManager:
         stop_event: Optional[threading.Event] = None,
         upload_counter: Optional[Dict[str, int]] = None,
         owner: str = "batch",
+        capacity: Optional[_WorkerCapacity] = None,
     ):
         conn = get_conn()
         row = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
@@ -1936,6 +1967,10 @@ class PipelineManager:
                     )
                     return
                 reservation_owned = reservation_result == "acquired"
+
+                if capacity is not None and not capacity.hand_off():
+                    _update_row(status="Stopped", error_message="Đã dừng khi đang chờ giãn cách đăng.")
+                    return
 
                 # P0-7: giãn cách bắt buộc >= 30 phút, tính từ mốc muộn hơn giữa
                 # lúc bắt đầu và kết thúc lượt upload trước. Fail closed nếu mốc không đọc được.
