@@ -604,8 +604,8 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
             response = client.post("/api/scheduled-uploads/sync", headers=headers, json={})
 
         self.assertEqual(response.status_code, 409, response.text)
-        self.assertEqual(response.json()["detail"], {
-            "message": (
+        self.assertEqual(response.json(), {
+            "detail": (
                 "Thư mục nguồn có video đã được thêm vào dự án lịch đăng nhưng không thuộc lịch. "
                 "Hãy chuyển các video này sang dự án khác rồi đồng bộ lại. Chưa xóa video nào."
             ),

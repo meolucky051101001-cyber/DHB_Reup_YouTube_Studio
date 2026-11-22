@@ -245,7 +245,7 @@ class UploadWorkflowHardeningBrowserTests(unittest.TestCase):
             if parsed.path != "/api/scheduled-uploads/sync":
                 return False
             route.fulfill(
-                status=409,
+                status=500,
                 content_type="application/json",
                 body=json.dumps({
                     "detail": {
