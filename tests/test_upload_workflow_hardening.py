@@ -590,6 +590,28 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
             self.assertFalse(data["folder_drift"]["detected"])
             self.assertNotIn(str(self.sources), json.dumps(data))
 
+    def test_schedule_sync_endpoint_reports_unscheduled_source_items(self):
+        import app as studio_app
+        from fastapi.testclient import TestClient
+
+        error = su.ScheduleError("UNSCHEDULED_SOURCE_ITEMS")
+        with mock.patch.dict(os.environ, {"DHB_SCHEDULE_STATE_DIR": str(self.state_dir)}), \
+                mock.patch.object(studio_app, "sync_schedule_folder", side_effect=error), \
+                mock.patch.object(studio_app, "collect_secret_values", return_value=[]):
+            client = TestClient(studio_app.app, base_url="http://127.0.0.1:8686")
+            token = client.get("/api/auth/token").json()["token"]
+            headers = {"X-DHB-Token": token, "Origin": "http://127.0.0.1:8686"}
+            response = client.post("/api/scheduled-uploads/sync", headers=headers, json={})
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json(), {
+            "detail": (
+                "Thư mục nguồn có video đã được thêm vào dự án lịch đăng nhưng không thuộc lịch. "
+                "Hãy chuyển các video này sang dự án khác rồi đồng bộ lại. Chưa xóa video nào."
+            ),
+            "code": "UNSCHEDULED_SOURCE_ITEMS",
+        })
+
     def test_folder_drift_detection_and_sync_folder_preserves_cursor(self):
         self.file2.unlink()
         file3 = self.sources / "brand_new.mp4"
@@ -660,6 +682,67 @@ class PackagedScheduleAndTaskTests(unittest.TestCase):
         self.assertEqual(after["next_queue_id"], 240)
         self.assertEqual(after["last_started_at"], "2026-11-17T16:13:10+00:00")
         self.assertNotIn(str(self.sources), json.dumps(res))
+
+    def test_sync_fails_closed_for_unscheduled_pending_file_in_source(self):
+        self.file2.unlink()
+        manual_file = self.sources / "manual.mp4"
+        manual_file.write_bytes(b"manual-video")
+        manifest_path = self.state_dir / "manifest.json"
+        state_path = self.state_dir / "state.json"
+        manifest_before = manifest_path.read_bytes()
+        state_before = state_path.read_bytes()
+
+        db_rows = list(self.base_rows().values())
+        db_rows.append({
+            "id": 243,
+            "status": "Pending",
+            "published_url": "",
+            "input_video_path": str(manual_file),
+            "visibility": "private",
+            "schedule_time": "",
+            "target_channel_id": 66,
+            "is_claimed": False,
+            "requires_review": False,
+        })
+        deleted_batches = []
+        scan_calls = []
+        previewed_batches = []
+
+        class FakeSyncAPI:
+            def __init__(self_api, _base, _rt, _rel):
+                self_api.session = None
+
+            def connect(self_api):
+                return None
+
+            def diagnostics(self_api, *, idle=False):
+                return {"workers": {"pipeline_running": False, "active_batch_threads": 0, "monitor_workers": 0}}
+
+            def verify_channel(self_api, _m):
+                return None
+
+            def project_rows(self_api, _project):
+                return [dict(row) for row in db_rows]
+
+            def delete_rows(self_api, ids):
+                deleted_batches.append(list(ids))
+
+            def scan_folder(self_api, _manifest):
+                scan_calls.append(True)
+                return {"ok": True, "added": 0}
+
+            def preview_batch(self_api, _manifest, queue_ids):
+                previewed_batches.append(list(queue_ids))
+
+        with self.assertRaises(su.ScheduleError) as raised:
+            su.sync_schedule_folder(self.state_dir, self.runtime_dir, api_factory=FakeSyncAPI)
+
+        self.assertEqual(raised.exception.code, "UNSCHEDULED_SOURCE_ITEMS")
+        self.assertEqual(deleted_batches, [])
+        self.assertEqual(scan_calls, [])
+        self.assertEqual(previewed_batches, [])
+        self.assertEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(state_path.read_bytes(), state_before)
 
     def test_webserver_autostart_plan_xml_contract(self):
         plan_dir = self.root / "webserver-plan"

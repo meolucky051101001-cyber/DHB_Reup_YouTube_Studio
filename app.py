@@ -825,6 +825,17 @@ def api_scheduled_uploads_sync():
         )
         return result
     except ScheduleError as exc:
+        if exc.code == "UNSCHEDULED_SOURCE_ITEMS":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "Thư mục nguồn có video đã được thêm vào dự án lịch đăng nhưng không thuộc lịch. "
+                        "Hãy chuyển các video này sang dự án khác rồi đồng bộ lại. Chưa xóa video nào."
+                    ),
+                    "code": exc.code,
+                },
+            ) from exc
         raise HTTPException(
             status_code=409,
             detail={"message": f"Không thể đồng bộ thư mục lịch đăng ({exc.code}).", "code": exc.code},
