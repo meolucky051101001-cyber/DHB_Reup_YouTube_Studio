@@ -1,5 +1,6 @@
 import json
 import hashlib
+import logging
 import math
 import os
 import threading
@@ -10,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Callable, List, Dict, Any, Optional
 
 from database import (
     get_conn, add_log, get_settings, register_managed_artifact,
@@ -1101,6 +1102,7 @@ class PipelineManager:
         do_upload: bool = True,
         force_reupload: bool = False,
         preview_token: str = "",
+        on_finished: Optional[Callable[[], None]] = None,
     ):
         item_ids = list(dict.fromkeys(item_ids))
         options = [do_download, do_render, do_upload]
@@ -1149,7 +1151,7 @@ class PipelineManager:
             try:
                 t = threading.Thread(
                     target=self._batch_worker_guarded,
-                    args=(item_ids, do_download, do_render, do_upload, batch_token, force_reupload),
+                    args=(item_ids, do_download, do_render, do_upload, batch_token, force_reupload, on_finished),
                     daemon=True,
                 )
                 t.start()
@@ -1244,7 +1246,7 @@ class PipelineManager:
             conn.close()
 
     @staticmethod
-    def preview_distribution(item_ids: List[int], options=None):
+    def preview_distribution(item_ids: List[int], options=None, *, persist=True, expected=None):
         options = options if options is not None else [True, True, True]
         conn = get_conn()
         previews: List[Dict[str, Any]] = []
@@ -1287,6 +1289,8 @@ class PipelineManager:
                     entry["channel_name"] = str(channel.get("name") or "")
                     snapshot = approval_item(conn, item, channel, groups)
                     snapshots[item_id] = encode(snapshot)
+                    if expected is not None and expected.get(item_id) != snapshots[item_id]:
+                        raise PreviewStale("Nguồn, metadata hoặc liên kết kênh đã đổi. Hãy xem trước lại chiến dịch.")
                     for key in ("youtube_channel_id", "profile_name", "antidetect_profile_id"):
                         entry[key] = snapshot[key]
                     entry["upload_mode"] = channel.get("upload_mode") or "playwright"
@@ -1324,7 +1328,7 @@ class PipelineManager:
                         entry["reason_codes"] = [issue['code'] for issue in exc.issues]
                 entry["blocked"] = bool(entry["reasons"])
                 previews.append(entry)
-            if previews and not any(item["blocked"] for item in previews):
+            if persist and previews and not any(item["blocked"] for item in previews):
                 token = uuid.uuid4().hex
                 now = time.time()
                 conn.execute("DELETE FROM upload_approvals WHERE state IN ('preview','launch_failed') AND created_at < ?", (now - 900,))
@@ -1339,7 +1343,10 @@ class PipelineManager:
                 conn.commit()
         finally:
             conn.close()
-        return {"items": previews, "preview_token": token}
+        result = {"items": previews, "preview_token": token}
+        if not persist:
+            result["snapshots"] = snapshots
+        return result
 
     def _batch_worker_guarded(
         self,
@@ -1349,6 +1356,7 @@ class PipelineManager:
         do_upload: bool,
         batch_token: str = "",
         force_reupload: bool = False,
+        on_finished: Optional[Callable[[], None]] = None,
     ):
         try:
             self._batch_worker(item_ids, do_download, do_render, do_upload, batch_token, force_reupload)
@@ -1368,8 +1376,11 @@ class PipelineManager:
                             (batch_token,),
                         )
                     conn.commit()
+                if on_finished:
+                    on_finished()
             except Exception:
-                pass
+                if on_finished:
+                    logging.getLogger(__name__).exception("Could not record scheduled batch completion")
             finally:
                 with self._lifecycle_lock:
                     self._is_running = False

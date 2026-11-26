@@ -92,6 +92,8 @@ function switchTab(tabId, btnEl) {
   if (target) target.classList.add('active');
   if (btnEl) btnEl.classList.add('active');
   window.StudioUI?.navigation(tabId, true);
+  if (tabId === 'tab-campaigns') window.DhbCampaigns?.refresh(true);
+  else window.DhbCampaigns?.closeRunLog();
 }
 
 function switchSubTab(subtab) {
@@ -1646,7 +1648,7 @@ async function openChannelOauthWizard(channelId) {
 
       <div id="oauth-new-client-section" style="display:${info.same_profile_client_available ? 'none' : 'flex'};flex-direction:column;gap:12px;padding:12px 14px;border-radius:10px;background:rgba(30,41,59,0.7);border:1px solid var(--border-color);">
         <div style="font-size:13px;line-height:1.55;">
-          <b>Bước 1: Tạo OAuth Client riêng ngay trong cửa sổ Antidetect của Profile này</b> (chống liên đới tài khoản & có riêng ~6 lượt upload/ngày):
+          <b>Bước 1. Tạo OAuth Client trong Google Cloud</b>
           <ol style="margin:6px 0 8px 18px;padding:0;font-size:12.5px;color:var(--text-muted);">
             <li>Bấm nút bên dưới để mở Google Cloud ngay trong trình duyệt Antidetect của Profile này → tạo Project mới → bấm <b>ENABLE</b> cho <i>YouTube Data API v3</i>.</li>
             <li>Vào <b>Google Auth Platform / OAuth consent screen</b> → chọn <b>External</b> → điền tên app → bấm <b>Publish App (In production)</b> để token không hết hạn sau 7 ngày.</li>
@@ -1660,6 +1662,8 @@ async function openChannelOauthWizard(channelId) {
         </div>
       </div>
 
+      <label><input type="checkbox" id="oauth-workspace"> Cấp thêm quyền Analytics, trả lời bình luận và quản lý playlist</label>
+      <label><input type="checkbox" id="oauth-activate" checked> Chuyển phương thức đăng sang YouTube Data API</label>
       <div id="oauth-wizard-status" role="status" aria-live="polite" style="font-size:13px;padding:10px 12px;border-radius:8px;background:rgba(15,23,42,0.7);border:1px solid var(--border-color);color:var(--text-muted);">
         Sẵn sàng kết nối. Cửa sổ xin quyền sẽ mở <b>trực tiếp bên trong trình duyệt Antidetect</b> của Profile này (không dùng Chrome ngoài).
       </div>
@@ -1721,14 +1725,17 @@ async function openChannelOauthWizard(channelId) {
     statusBox.style.color = '#fbbf24';
     statusBox.textContent = `⏳ Đang mở cửa sổ Antidetect cho "${info.channel_name}" (${info.youtube_channel_id})... Hãy chọn ĐÚNG kênh này trên màn hình Google và bấm Cho phép (Allow)!`;
     try {
+      const activate = dialog.querySelector('#oauth-activate').checked;
       const res = await apiFetch(`/api/channels/${channelId}/connect-oauth`, {
         method: 'POST',
-        body: JSON.stringify({use_same_profile_client: useSame, client_json: clientJsonText, activate: true}),
+        body: JSON.stringify({use_same_profile_client: useSame, client_json: clientJsonText, activate,
+          channel_workspace: dialog.querySelector('#oauth-workspace').checked}),
       });
       statusBox.style.color = '#34d399';
-      statusBox.textContent = `✅ Đã kết nối thành công kênh "${res.identity_name}" (${res.youtube_channel_id}) và bật chế độ YouTube Data API!`;
+      statusBox.textContent = `Đã kết nối kênh "${res.identity_name}" (${res.youtube_channel_id}).`
+        + (activate ? ' Đã bật phương thức đăng YouTube Data API.' : '');
       await loadChannels();
-      if (typeof showToast === 'function') showToast(`Đã bật YouTube API cho kênh ${res.identity_name}!`, 'success');
+      if (typeof showToast === 'function') showToast(`Đã kết nối kênh ${res.identity_name}.`, 'success');
       setTimeout(() => { if (dialog.open) dialog.close(); }, 1400);
     } catch (err) {
       statusBox.style.color = '#f87171';

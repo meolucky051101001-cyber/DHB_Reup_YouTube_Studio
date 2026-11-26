@@ -26,6 +26,10 @@ NEW_DEFAULTS = {
     'upload_option_groups': {'metadata_intent_json': '{}'},
     'upload_attempts': {'evidence_json': '{}'},
 }
+CAMPAIGN_TABLES = (
+    'campaign_content_lists', 'publishing_campaigns', 'publishing_campaign_runs',
+    'channel_comment_replies', 'campaign_playlist_jobs',
+)
 NEW_STAMPS = {module.SCHEMA_KEY: module.SCHEMA_VERSION
               for module in (metadata_intent_schema, upload_evidence_schema)}
 
@@ -80,6 +84,10 @@ def snapshot(path, columns=None):
         if columns is None:
             columns = {table: [row[1] for row in conn.execute(f'PRAGMA table_info({_identifier(table)})')]
                        for table in TABLES}
+            for table in CAMPAIGN_TABLES:
+                fields = [row[1] for row in conn.execute(f'PRAGMA table_info({_identifier(table)})')]
+                if fields:
+                    columns[table] = fields
         result = {}
         for table, fields in columns.items():
             if not fields:
@@ -162,6 +170,12 @@ def verify_transition(before, after, *, startup=False):
                 raise RuntimeError('Migration changed monitors outside the existing confirmation guard.')
         elif rows != previous:
             raise RuntimeError(f'Migration changed existing data in {table}.')
+    for table in CAMPAIGN_TABLES:
+        if table in old_columns:
+            if old_columns[table] != new_columns.get(table) or old_rows[table] != new_rows.get(table):
+                raise RuntimeError(f'Migration changed existing data in {table}.')
+        elif new_rows.get(table):
+            raise RuntimeError(f'Migration inserted unexpected data in {table}.')
     return changes
 
 
@@ -188,7 +202,8 @@ def rehearse(source):
             raise RuntimeError('Restored rows differ from backup.')
         return {
             'quick_check': 'ok', 'migration_idempotent': True, 'existing_evidence_preserved': True,
-            'restore_verified': True, 'counts': {table: len(rows) for table, rows in before[1].items()},
+            'restore_verified': True, 'counts': {table: len(before[1][table]) for table in TABLES},
+            'campaign_counts': {table: len(before[1].get(table, ())) for table in CAMPAIGN_TABLES},
             'changes': changes, 'backup_sha256': sha256_file(original),
         }
 

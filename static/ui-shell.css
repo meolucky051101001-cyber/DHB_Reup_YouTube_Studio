@@ -11,3 +11,45 @@ dialog{color:var(--text-main)}dialog::backdrop{background:rgba(3,8,18,.76)}dialo
 @media(max-width:1023px){.app-sidebar{visibility:hidden}.navigation-open .app-sidebar{visibility:visible}}
 
 input::placeholder,textarea::placeholder{color:var(--text-muted);opacity:1}
+/* Campaign forms follow the local dashboard's controls and spacing. */
+#tab-campaigns .card {
+  margin-block: 1rem;
+  padding: 1rem;
+  overflow-x: auto;
+}
+
+#tab-campaigns form,
+#campaign-sheet {
+  display: grid;
+  gap: 0.75rem;
+  align-items: end;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+}
+
+#campaign-sheet:not([open]) > :not(summary) {
+  display: none;
+}
+
+#tab-campaigns label {
+  display: grid;
+  gap: 0.3rem;
+}
+
+#tab-campaigns [type="checkbox"] {
+  justify-self: start;
+}
+
+#campaign-notice:empty {
+  display: none;
+}
+
+#campaign-summary,
+#campaign-notice {
+  margin-block: 0.75rem;
+}
+
+#campaign-sheet-results,
+#campaign-preview-items {
+  max-height: 14rem;
+  overflow: auto;
+}

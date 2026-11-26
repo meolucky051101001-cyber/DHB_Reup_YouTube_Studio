@@ -350,6 +350,29 @@ def read_schedule_status(state_dir, *, now=None):
         return {"configured": True, "status": "error", "message": "Cấu hình hoặc trạng thái lịch không hợp lệ; cần kiểm tra trước khi đăng.", "action_required": True}
 
 
+def check_next_schedule_source(state_dir):
+    """Check only the file for the next manifest job, when requested by the operator."""
+    directory = Path(state_dir)
+    manifest = load_json(directory / "manifest.json")
+    validate_manifest(manifest)
+    state = load_json(directory / "state.json")
+    validate_state(state, manifest)
+    index = state["next_index"]
+    if index == len(manifest["jobs"]):
+        return {"status": "finished"}
+    job = manifest["jobs"][index]
+    path = Path(job["path"])
+    try:
+        matched = sha256(path) == job["sha256"].lower()
+    except FileNotFoundError:
+        status = "missing"
+    except OSError:
+        status = "unreadable"
+    else:
+        status = "matched" if matched else "changed"
+    return {"status": status, "queue_id": job["queue_id"], "name": path.name}
+
+
 class LocalAPI:
     """Loopback-only client. Credentials and provider bodies never leave this class."""
     def __init__(self, base_url, runtime_dir, release, *, session=None):

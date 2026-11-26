@@ -258,6 +258,26 @@
         details.push(`Lượt gần nhất: #${sched.last_result.queue_id} (${sched.last_result.status})`);
       }
       if (details.length) box.append(node('p', 'publish-schedule-meta', details.join(' · ')));
+      if (sched.action_required === true && sched.next_queue_id) {
+        const check = node('button', 'btn btn-outline btn-sm', 'Kiểm tra tệp tới lượt');
+        check.type = 'button';
+        const result = node('p', 'publish-schedule-note');
+        check.addEventListener('click', async () => {
+          check.disabled = true;
+          try {
+            const source = await apiFetch('/api/scheduled-uploads/source-check');
+            const labels = { missing: 'Tệp bị thiếu', unreadable: 'Không đọc được tệp',
+              changed: 'SHA-256 khác manifest', matched: 'SHA-256 khớp manifest', finished: 'Lịch đã hoàn tất' };
+            result.textContent = [source.queue_id && '#' + source.queue_id, source.name,
+              labels[source.status] || 'Chưa rõ trạng thái'].filter(Boolean).join(' · ');
+          } catch (error) {
+            result.textContent = error.message;
+          } finally {
+            check.disabled = false;
+          }
+        });
+        box.append(check, result);
+      }
       if (sourceChanged) {
         const parts = [];
         if (missingCount) parts.push(`${missingCount} file chờ không còn trên đĩa`);

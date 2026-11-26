@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DHB Reup YouTube Studio — Hệ Thống Tự Động Hóa Reup & Đăng YouTube</title>
   <link rel="stylesheet" href="/static/styles.css?v=ui-20261117" />
-  <link rel="stylesheet" href="/static/ui-shell.css?v=ui-20261117" />
+  <link rel="stylesheet" href="/static/ui-shell.css?v=campaigns-1" />
   <link rel="stylesheet" href="/static/ui-queue.css?v=ui-20261117" />
   <link rel="stylesheet" href="/static/ui-content.css?v=ui-20261117" />
   <link rel="stylesheet" href="/static/ui-admin.css?v=ui-20261117" />
@@ -22,6 +22,7 @@
       <a class="nav-tab" href="#tab-render" data-tab="tab-render" onclick="switchTab('tab-render', this); return false;"  title="Render & preset"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg><span class="nav-label">Render & preset</span></a>
       <a class="nav-tab" href="#tab-channels" data-tab="tab-channels" onclick="switchTab('tab-channels', this); return false;"  title="Kênh & profile"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="13" rx="2"/><path d="M8 21h8m-4-5v5"/></svg><span class="nav-label">Kênh & profile</span></a>
       <a class="nav-tab" href="#tab-monitor" data-tab="tab-monitor" onclick="switchTab('tab-monitor', this); return false;"  title="Theo dõi nguồn"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="2"/><path d="M6 6a8 8 0 0 0 0 12m12-12a8 8 0 0 1 0 12M9 9a4 4 0 0 0 0 6m6-6a4 4 0 0 1 0 6"/></svg><span class="nav-label">Theo dõi nguồn</span></a>
+      <a class="nav-tab" href="#tab-campaigns" data-tab="tab-campaigns" onclick="switchTab('tab-campaigns', this); return false;" title="Chiến dịch"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4m8-4v4m-7 9h6"/></svg><span class="nav-label">Chiến dịch</span></a>
       <a class="nav-tab" href="#tab-settings" data-tab="tab-settings" onclick="switchTab('tab-settings', this); return false;"  title="Hệ thống"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg><span class="nav-label">Hệ thống</span></a>
     </nav>
     <div class="sidebar-foot"><span>Ứng dụng cục bộ</span><span>Giao diện tiếng Việt</span></div>
@@ -1291,6 +1292,114 @@
     <!-- ==========================================
          TAB 7: CÀI ĐẶT HỆ THỐNG & NHẬT KÝ (LOGS)
          ========================================== -->
+    <section id="tab-campaigns" class="tab-pane">
+      <p id="campaign-notice" role="status" aria-live="polite"></p>
+      <div class="card">
+        <h3>Danh sách nội dung</h3>
+        <form id="campaign-list-form">
+          <label>Danh sách <select id="campaign-edit-list"></select></label>
+          <label>Tên <input id="campaign-list-name" maxlength="150" required></label>
+          <label>ID video theo thứ tự <textarea id="campaign-list-ids" rows="2" required></textarea></label>
+          <button class="btn" type="button" id="campaign-use-selection">Dùng video đang chọn trong dự án</button>
+          <button class="btn" type="submit">Lưu danh sách</button>
+        </form>
+        <details id="campaign-sheet">
+          <summary>Nhập video Google Drive</summary>
+          <p>Chọn dự án trong Video &amp; dự án, rồi chọn kênh và quyền hiển thị trong mục Cấu hình bên dưới.</p>
+          <label>Nguồn <select id="campaign-import-source"><option value="sheet">Google Sheets</option><option value="links">Liên kết Drive</option></select></label>
+          <div id="campaign-sheet-fields">
+            <label>Liên kết bảng <input id="campaign-sheet-url" type="url" maxlength="2048"></label>
+            <button class="btn" type="button" id="campaign-sheet-columns">Đọc các cột</button>
+            <label>Cột liên kết Drive <select id="campaign-sheet-source"></select></label>
+            <label>Cột tiêu đề <select id="campaign-sheet-title"></select></label>
+            <label>Cột mô tả <select id="campaign-sheet-description"></select></label>
+            <label>Cột thẻ <select id="campaign-sheet-tags"></select></label>
+          </div>
+          <div id="campaign-links-fields" hidden>
+            <label>Mỗi liên kết một dòng <textarea id="campaign-drive-links" rows="4" maxlength="262144"></textarea></label>
+          </div>
+          <button class="btn" type="button" id="campaign-sheet-preview">Xem trước danh sách nhập</button>
+          <button class="btn" type="button" id="campaign-sheet-import" disabled>Nhập các dòng hợp lệ</button>
+          <ul id="campaign-sheet-results"></ul>
+        </details>
+      </div>
+      <div class="card">
+        <h3>Cấu hình</h3>
+        <form id="campaign-form">
+          <label>Chiến dịch <select id="campaign-edit"></select></label>
+          <label>Tên <input id="campaign-name" maxlength="150" required></label>
+          <label>Profile <select id="campaign-profile" required></select></label>
+          <label>Kênh <select id="campaign-channel" required></select></label>
+          <label>Danh sách video <select id="campaign-list" required></select></label>
+          <label>Thứ tự <select id="campaign-order"><option value="sequential">Từ trên xuống</option><option value="random">Ngẫu nhiên</option></select></label>
+          <label>Quyền hiển thị <select id="campaign-visibility"><option value="private">Riêng tư</option><option value="unlisted">Không công khai</option><option value="public">Công khai</option></select></label>
+          <label>Ngày bắt đầu <input id="campaign-start" type="date"></label>
+          <label>Múi giờ lệch UTC (phút) <input id="campaign-offset" type="number" min="-720" max="840" required></label>
+          <label>Mốc bắt đầu gửi mỗi ngày <input id="campaign-times" placeholder="09:00, 16:00" required></label>
+          <details>
+            <summary>Tạo mốc tự động</summary>
+            <label>Số bài mỗi ngày <input id="campaign-slot-count" type="number" min="1" max="15" value="5"></label>
+            <label>Từ <input id="campaign-slot-start" type="time" value="06:00"></label>
+            <label>Đến <input id="campaign-slot-end" type="time" value="21:00"></label>
+            <button class="btn" type="button" id="campaign-suggest">Tạo mốc giờ</button>
+          </details>
+          <label><input id="campaign-render" type="checkbox"> Render theo từng video</label>
+          <label>Playlist sau khi đăng <input id="campaign-target-playlist" maxlength="100" placeholder="Playlist ID tùy chọn"></label>
+          <button class="btn" type="submit">Lưu cấu hình</button>
+        </form>
+        <p id="campaign-summary"></p>
+        <button class="btn" type="button" id="campaign-preview">Xem trước</button>
+        <button class="btn" type="button" id="campaign-enable" disabled>Bật cấu hình đã xem</button>
+        <button class="btn" type="button" id="campaign-pause">Tạm dừng</button>
+        <ul id="campaign-preview-items"></ul>
+      </div>
+      <div class="card">
+        <h3>Lượt thực thi</h3>
+        <table class="data-table">
+          <thead><tr><th>Mốc đã đặt</th><th>Chiến dịch</th><th>Video</th><th>Bắt đầu</th><th>Trạng thái</th><th>Chi tiết</th><th>Nhật ký</th></tr></thead>
+          <tbody id="campaign-run-rows"></tbody>
+        </table>
+        <section id="campaign-log" hidden>
+          <h4 id="campaign-log-title"></h4>
+          <button type="button" class="btn" id="campaign-log-close">Đóng nhật ký</button>
+          <pre id="campaign-log-lines"></pre>
+        </section>
+      </div>
+      <div class="card">
+        <h3>Kênh đã chọn</h3>
+        <button class="btn" type="button" id="campaign-channel-connect">Kết nối OAuth</button>
+        <button class="btn" type="button" id="campaign-analytics">Lấy số liệu kênh</button>
+        <dl id="campaign-metrics"></dl>
+        <button class="btn" type="button" id="campaign-realtime">Đọc lượt xem 48 giờ từ Studio</button>
+        <p id="campaign-realtime-result" role="status"></p>
+        <label>Video ID <input id="campaign-channel-video" maxlength="11" placeholder="ID video của kênh"></label>
+        <button class="btn" type="button" id="campaign-comments">Đọc bình luận</button>
+        <button class="btn" type="button" id="campaign-comment-more" hidden>Trang tiếp theo</button>
+        <ul id="campaign-comment-items"></ul>
+        <label>Playlist ID <input id="campaign-playlist-id" maxlength="100"></label>
+        <button class="btn" type="button" id="campaign-playlist-add">Thêm video vào playlist</button>
+        <p id="campaign-channel-notice" role="status"></p>
+      </div>
+      <div class="card">
+        <h3>Mô phỏng tương tác</h3>
+        <p>Chạy bằng dữ liệu giả lập trên máy.</p>
+        <form id="campaign-simulation-form">
+          <label>Hoạt động <select name="activity">
+            <option value="watch">Xem video</option><option value="like">Thích</option>
+            <option value="subscribe">Đăng ký</option><option value="reply">Bình luận</option>
+          </select></label>
+          <label>Mốc giờ <input name="slots" placeholder="09:00, 16:00" required></label>
+          <label>Kết quả giả lập <select name="outcome">
+            <option value="success">Thành công</option><option value="error">Lỗi dịch vụ</option>
+          </select></label>
+          <button class="btn" type="submit">Chạy mô phỏng</button>
+          <button class="btn" type="button" id="campaign-simulation-next" disabled>Tiến tới mốc tiếp theo</button>
+        </form>
+        <p id="campaign-simulation-status" role="status"></p>
+        <ol id="campaign-simulation-runs"></ol>
+      </div>
+    </section>
+
     <section id="tab-settings" class="tab-pane">
       <div class="grid-2">
         <div class="card">
@@ -1929,12 +2038,14 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=sync-msg-20261122"></script>
-  <script src="/static/ui-shared.js?v=publish-20261117"></script>
+  <script src="/static/app.js?v=campaigns-1"></script>
+  <script src="/static/ui-shared.js?v=campaigns-1"></script>
   <script src="/static/ui-queue.js?v=publish-20261117"></script>
   <script src="/static/ui-content.js?v=ui-20261117"></script>
   <script src="/static/ui-admin.js?v=hardening-20261120"></script>
-  <script src="/static/ui-publish.js?v=hardening2-20261120"></script>
+  <script src="/static/ui-publish.js?v=campaigns-1"></script>
+  <script src="/static/ui-campaigns.js?v=2"></script>
+  <script src="/static/ui-campaign-simulation.js?v=1"></script>
 </body>
 </html>
 
