@@ -92,6 +92,8 @@ function switchTab(tabId, btnEl) {
   if (target) target.classList.add('active');
   if (btnEl) btnEl.classList.add('active');
   window.StudioUI?.navigation(tabId, true);
+  if (tabId === 'tab-campaigns') window.DhbCampaigns?.refresh(true);
+  else window.DhbCampaigns?.closeRunLog();
 }
 
 function switchSubTab(subtab) {
@@ -759,10 +761,21 @@ async function loadProfiles() {
     const profOpts = gProfiles.map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)} (${escapeHtml(p.source || 'DHB')})</option>`).join('');
 
     const bulkProf = document.getElementById('bulk-profile');
-    if (bulkProf) bulkProf.innerHTML = `<option value="">-- Giữ nguyên Profile --</option>` + profOpts;
+    if (bulkProf) {
+      const previous = bulkProf.value;
+      bulkProf.innerHTML = `<option value="">-- Giữ nguyên Profile --</option>` + profOpts;
+      bulkProf.value = gProfiles.some(profile => profile.name === previous) ? previous : '';
+      onBulkProfileChange();
+    }
 
     const edProf = document.getElementById('ed-vid-profile');
-    if (edProf) edProf.innerHTML = `<option value="">-- Mặc định (Tự chọn) --</option>` + profOpts;
+    if (edProf) {
+      const previous = edProf.selectedOptions[0]?.cloneNode(true);
+      edProf.innerHTML = `<option value="">-- Mặc định (Tự chọn) --</option>` + profOpts;
+      if (previous?.value && !gProfiles.some(profile => profile.name === previous.value)) edProf.add(previous);
+      edProf.value = previous?.value || '';
+      onModalProfileChange();
+    }
 
     const filterProf = document.getElementById('filter-channel-profile');
     if (filterProf) filterProf.innerHTML = `<option value="">-- Tất cả Profile --</option>` + profOpts;
@@ -1042,46 +1055,31 @@ async function checkChannelLogin(channelId) {
   await profileCheckLogin(ch.profile_name);
 }
 
-async function onBulkProfileChange() {
-  const profName = document.getElementById('bulk-profile').value;
-  const chSel = document.getElementById('bulk-channel');
-  if (!profName) {
-    chSel.innerHTML = `<option value="">-- Giữ nguyên kênh --</option>` +
-      gChannels.map(c => `<option value="${c.id}">${escapeHtml(c.name)} (${escapeHtml(c.group_name)})</option>`).join('');
-    return;
+function fillTargetChannels(profileId, channelId, defaultLabel) {
+  const profile = document.getElementById(profileId)?.value || '';
+  const select = document.getElementById(channelId);
+  if (!select) return;
+  const previous = select.value;
+  const channels = profile ? gChannels.filter(channel => channel.profile_name === profile) : gChannels;
+  const label = profile
+    ? (channels.length ? '-- Chọn kênh của profile này --' : 'Profile này chưa có kênh YouTube')
+    : defaultLabel;
+  select.replaceChildren(new Option(label, ''));
+  for (const channel of channels) {
+    const detail = profile ? channel.handle : (channel.group_names || [channel.group_name]).filter(Boolean).join(', ');
+    const name = detail ? `${channel.name} (${detail})` : channel.name;
+    select.add(new Option(channel.channel_id ? name : name + ' ⚠️ thiếu Channel ID', String(channel.id)));
   }
-  try {
-    const subChannels = await apiFetch(`/api/profiles/${encodeURIComponent(profName)}/channels`);
-    if (subChannels.length > 0) {
-      chSel.innerHTML = `<option value="">-- Chọn kênh thuộc [${escapeHtml(profName)}] --</option>` +
-        subChannels.map(c => `<option value="${c.id}">📺 ${escapeHtml(c.name)} (${escapeHtml(c.handle || '')})</option>`).join('');
-    } else {
-      chSel.innerHTML = `<option value="">(Chưa có kênh nào gán cho ${escapeHtml(profName)})</option>`;
-    }
-  } catch (e) {
-    console.error("Lỗi onBulkProfileChange:", e);
-  }
+  if (channels.some(channel => String(channel.id) === previous)) select.value = previous;
+  select.disabled = Boolean(profile && !channels.length);
 }
 
-async function onModalProfileChange() {
-  const profName = document.getElementById('ed-vid-profile').value;
-  const chSel = document.getElementById('ed-vid-channel');
-  if (!profName) {
-    chSel.innerHTML = `<option value="">-- Theo nhóm mặc định --</option>` +
-      gChannels.map(c => `<option value="${c.id}">${escapeHtml(c.name)} (${escapeHtml((c.group_names || [c.group_name]).filter(Boolean).join(', '))}</option>`).join('');
-    return;
-  }
-  try {
-    const subChannels = await apiFetch(`/api/profiles/${encodeURIComponent(profName)}/channels`);
-    if (subChannels.length > 0) {
-      chSel.innerHTML = `<option value="">-- Chọn kênh của [${escapeHtml(profName)}] --</option>` +
-        subChannels.map(c => `<option value="${c.id}">📺 ${escapeHtml(c.name)} (${escapeHtml(c.handle || '')})</option>`).join('');
-    } else {
-      chSel.innerHTML = `<option value="">(Chưa có kênh nào gán cho ${escapeHtml(profName)})</option>`;
-    }
-  } catch (e) {
-    console.error("Lỗi onModalProfileChange:", e);
-  }
+function onBulkProfileChange() {
+  fillTargetChannels('bulk-profile', 'bulk-channel', '-- Giữ nguyên kênh --');
+}
+
+function onModalProfileChange() {
+  fillTargetChannels('ed-vid-profile', 'ed-vid-channel', '-- Theo nhóm mặc định --');
 }
 
 function _applyChannelProfileMode(found) {
@@ -1162,8 +1160,8 @@ async function loadChannels() {
   gChannels = await apiFetch('/api/channels');
   const allChOpts = gChannels.map(c => `<option value="${c.id}">${escapeHtml(c.name)} (${escapeHtml((c.group_names || [c.group_name]).filter(Boolean).join(', '))})${c.channel_id ? '' : ' ⚠️ thiếu Channel ID'}</option>`).join('');
   const chOpts = `<option value="">-- Chia đều theo Nhóm Kênh --</option>` + allChOpts;
-  const bulkCh = document.getElementById('bulk-channel');
-  if (bulkCh) bulkCh.innerHTML = `<option value="">-- Giữ nguyên kênh --</option>` + allChOpts;
+  onBulkProfileChange();
+  onModalProfileChange();
   const monCh = document.getElementById('mon-channel');
   if (monCh) monCh.innerHTML = chOpts;
 
@@ -1646,7 +1644,7 @@ async function openChannelOauthWizard(channelId) {
 
       <div id="oauth-new-client-section" style="display:${info.same_profile_client_available ? 'none' : 'flex'};flex-direction:column;gap:12px;padding:12px 14px;border-radius:10px;background:rgba(30,41,59,0.7);border:1px solid var(--border-color);">
         <div style="font-size:13px;line-height:1.55;">
-          <b>Bước 1: Tạo OAuth Client riêng ngay trong cửa sổ Antidetect của Profile này</b> (chống liên đới tài khoản & có riêng ~6 lượt upload/ngày):
+          <b>Bước 1. Tạo OAuth Client trong Google Cloud</b>
           <ol style="margin:6px 0 8px 18px;padding:0;font-size:12.5px;color:var(--text-muted);">
             <li>Bấm nút bên dưới để mở Google Cloud ngay trong trình duyệt Antidetect của Profile này → tạo Project mới → bấm <b>ENABLE</b> cho <i>YouTube Data API v3</i>.</li>
             <li>Vào <b>Google Auth Platform / OAuth consent screen</b> → chọn <b>External</b> → điền tên app → bấm <b>Publish App (In production)</b> để token không hết hạn sau 7 ngày.</li>
@@ -1660,6 +1658,8 @@ async function openChannelOauthWizard(channelId) {
         </div>
       </div>
 
+      <label><input type="checkbox" id="oauth-workspace"> Cấp thêm quyền Analytics, trả lời bình luận và quản lý playlist</label>
+      <label><input type="checkbox" id="oauth-activate" checked> Chuyển phương thức đăng sang YouTube Data API</label>
       <div id="oauth-wizard-status" role="status" aria-live="polite" style="font-size:13px;padding:10px 12px;border-radius:8px;background:rgba(15,23,42,0.7);border:1px solid var(--border-color);color:var(--text-muted);">
         Sẵn sàng kết nối. Cửa sổ xin quyền sẽ mở <b>trực tiếp bên trong trình duyệt Antidetect</b> của Profile này (không dùng Chrome ngoài).
       </div>
@@ -1721,14 +1721,17 @@ async function openChannelOauthWizard(channelId) {
     statusBox.style.color = '#fbbf24';
     statusBox.textContent = `⏳ Đang mở cửa sổ Antidetect cho "${info.channel_name}" (${info.youtube_channel_id})... Hãy chọn ĐÚNG kênh này trên màn hình Google và bấm Cho phép (Allow)!`;
     try {
+      const activate = dialog.querySelector('#oauth-activate').checked;
       const res = await apiFetch(`/api/channels/${channelId}/connect-oauth`, {
         method: 'POST',
-        body: JSON.stringify({use_same_profile_client: useSame, client_json: clientJsonText, activate: true}),
+        body: JSON.stringify({use_same_profile_client: useSame, client_json: clientJsonText, activate,
+          channel_workspace: dialog.querySelector('#oauth-workspace').checked}),
       });
       statusBox.style.color = '#34d399';
-      statusBox.textContent = `✅ Đã kết nối thành công kênh "${res.identity_name}" (${res.youtube_channel_id}) và bật chế độ YouTube Data API!`;
+      statusBox.textContent = `Đã kết nối kênh "${res.identity_name}" (${res.youtube_channel_id}).`
+        + (activate ? ' Đã bật phương thức đăng YouTube Data API.' : '');
       await loadChannels();
-      if (typeof showToast === 'function') showToast(`Đã bật YouTube API cho kênh ${res.identity_name}!`, 'success');
+      if (typeof showToast === 'function') showToast(`Đã kết nối kênh ${res.identity_name}.`, 'success');
       setTimeout(() => { if (dialog.open) dialog.close(); }, 1400);
     } catch (err) {
       statusBox.style.color = '#f87171';
@@ -2519,7 +2522,8 @@ async function openEditModal(id) {
     edProf.value = profileValue;
   }
 
-  await onModalProfileChange();
+  document.getElementById('ed-vid-channel').value = '';
+  onModalProfileChange();
   const groupSelect = document.getElementById('ed-vid-groups');
   if (groupSelect) {
     selectGroupValues(
@@ -2531,14 +2535,14 @@ async function openEditModal(id) {
     const chSel = document.getElementById('ed-vid-channel');
     if (chSel) {
       const idValue = String(item.target_channel_id);
-      if (!Array.from(chSel.options).some(option => option.value === idValue)) {
+      if (!edProf?.value && !Array.from(chSel.options).some(option => option.value === idValue)) {
         const missing = document.createElement('option');
         missing.value = idValue;
         missing.textContent = `⚠️ Kênh #${idValue} (không còn trong danh sách)`;
         missing.dataset.missing = 'true';
         chSel.appendChild(missing);
       }
-      chSel.value = idValue;
+      if (Array.from(chSel.options).some(option => option.value === idValue)) chSel.value = idValue;
     }
   }
 
@@ -3364,8 +3368,9 @@ function findChannelIdBlockers(ids, forceReupload) {
   return blockers;
 }
 
-async function startPipeline(doDownload, doRender, doUpload, overrideIds = null) {
+async function startPipeline(doDownload, doRender, doUpload, overrideIds = null, {direct = false} = {}) {
   if (gPipelineStartPending) return;
+  if (direct && (!doUpload || !Array.isArray(overrideIds) || !overrideIds.length)) return;
   gPipelineStartPending = true;
   try {
     let previewToken = '';
@@ -3385,6 +3390,10 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
       const published = gQueueItems.filter(v => ids.includes(v.id)
         && (v.status === 'Completed' || (v.published_url || '').trim()));
       if (published.length > 0) {
+        if (direct) {
+          alert('Lô có video đã đăng. Hãy bỏ chọn video đó trước khi đăng lô.');
+          return;
+        }
         alert(
           `${published.length} video đã đăng cần được cho phép đăng lại riêng từng dòng bằng nút 🔁. ` +
           `Các video đó sẽ bị bỏ qua trong lượt chạy này.`
@@ -3399,7 +3408,18 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
           body: JSON.stringify({ ids, do_download: doDownload, do_render: doRender, do_upload: doUpload }),
         });
         const operation = doRender ? 'Render và đăng' : 'Đăng file có sẵn';
-        if (!await showDistributionDialog(preview, operation, true)) return;
+        if (direct) {
+          const rows = Array.isArray(preview.items) ? preview.items : [];
+          const approvedIds = new Set(rows.map(row => row.id));
+          if (rows.length !== ids.length || !ids.every(id => approvedIds.has(id))) {
+            alert('Danh sách máy chủ trả về khác danh sách đã chọn. Hãy tải lại hàng đợi.');
+            return;
+          }
+          if (preview.blocked || rows.some(row => row.blocked) || !preview.preview_id || preview.ok === false) {
+            await showDistributionDialog(preview, operation, false);
+            return;
+          }
+        } else if (!await showDistributionDialog(preview, operation, true)) return;
         previewToken = preview.preview_id;
       } catch (e) {
         alert('Không xem được preview phân phối: ' + e.message);
@@ -3417,6 +3437,7 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
           do_upload: doUpload,
           force_reupload: false,
           preview_id: previewToken,
+          start_immediately: doUpload,
         }),
       });
       if (!res.ok) {
@@ -3428,6 +3449,8 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
       }
       if (res.skipped && res.skipped.length) {
         showToast(res.message || `Đã bỏ qua ${res.skipped.length} video đã đăng/đang upload dở.`, 'warning');
+      } else if (direct && !res.replayed) {
+        showToast(`Đã bắt đầu lô ${ids.length} video. Xem tiến độ ở hàng đợi.`, 'success');
       }
     } catch (e) {
       alert('Lỗi khởi chạy: ' + e.message);
@@ -3513,7 +3536,7 @@ function showDistributionDialog(preview, operation, allowStart = false) {
         <h2 id="upload-preview-title">Xem trước lô đăng YouTube</h2>
         <p>${escapeHtml(operation)} · ${items.length} video</p>
         <p>Bước cuối trước khi chạy. Kiểm tra file, kênh và chế độ của từng video bên dưới.</p>
-        <p>Upload bắt đầu sau xác nhận và chờ lượt chung tối thiểu 30 phút tính từ khi lượt trước kết thúc. Lịch bên dưới là giờ YouTube phát hành, không phải giờ tool tự bắt đầu lô.</p>
+        <p>Sau khi xác nhận, DHB tải video lên khi tệp sẵn sàng và lượt upload trống. Lịch bên dưới là giờ YouTube phát hành.</p>
         ${blocked ? `<p class="upload-preview-error">${blocked} video cần xử lý. Sửa các dòng bên dưới rồi xem trước lại.</p>` : ''}
         ${publicCount ? `<p class="upload-preview-warning">${publicCount} video đặt Công khai.</p>` : ''}
       </header>
@@ -3571,14 +3594,14 @@ async function reviewUploadSlot() {
       const confirmed = confirm(
         `Lượt upload của video #${slot.queue_id} cần phục hồi.\n\n` +
         'Hãy kiểm tra Studio và đóng tab của lượt upload cũ trước khi xác nhận. ' +
-        'Sau khi xác nhận, tool chờ 30 phút. Video cần đối soát vẫn giữ nguyên trạng thái.\n\n' +
+        'Sau khi xác nhận, lượt tự động chờ 30 phút. Video cần đối soát vẫn giữ nguyên trạng thái.\n\n' +
         'Bạn đã kiểm tra và phiên upload cũ đã kết thúc?'
       );
       if (!confirmed) return;
       await apiFetch('/api/pipeline/upload-slot/acknowledge', {
         method: 'POST', body: JSON.stringify({ recovery_id: slot.recovery_id, previous_session_closed: true }),
       });
-      showToast('Đã xác nhận phục hồi. Lượt tiếp theo chờ ít nhất 30 phút.');
+      showToast('Đã xác nhận phục hồi. Lượt tự động tiếp theo chờ 30 phút.');
       return;
     }
     if (slot.state === 'active') {
@@ -3586,8 +3609,8 @@ async function reviewUploadSlot() {
     } else if (slot.state === 'cooldown') {
       const seconds = slot.remaining_seconds;
       alert(seconds > 0
-        ? `Còn ${Math.floor(seconds / 60)} phút ${seconds % 60} giây trước lượt upload tiếp theo. Khoảng nghỉ dùng chung cho mọi profile. Sau khi khởi động lại, tool có thể áp dụng lại 30 phút để xác nhận an toàn.`
-        : 'Lượt upload đã đủ khoảng nghỉ.');
+        ? `Lượt tự động còn chờ ${Math.floor(seconds / 60)} phút ${seconds % 60} giây. Lượt bấm chạy có thể bắt đầu khi tệp sẵn sàng.`
+        : 'Lượt tự động đã đủ khoảng nghỉ.');
     } else {
       alert('Lượt upload đang trống.');
     }

@@ -61,14 +61,17 @@ def smoke(python):
                 health=response.json()
                 diag=session.get(base+'/api/diagnostics',headers=headers,timeout=30).json()
                 overview=session.get(base+'/api/overview',headers=headers,timeout=5).json()
+                campaign_state=session.get(base+'/api/campaigns',headers=headers,timeout=5).json()
                 assert health['source_root']==str(root)
                 assert not diag['runtime']['restart_required']
                 assert diag['runtime']['revision'] is None  # deliberately copied without .git
                 assert diag['version']==expected_build
                 assert diag['runtime']['startup_fingerprint']==source_fingerprint(root)==source_identity['startup_fingerprint']
                 assert overview['total_videos']==0 and not overview['pipeline_running'] and overview['monitors_running']==0
+                assert campaign_state['campaigns']==campaign_state['lists']==campaign_state['runs']==[]
                 assert all(tool['available'] for tool in diag['tools'][:2]),diag['tools'][:2]
                 return {'startup':'ok','fresh_database':True,'auto_run':False,'correct_source_root':True,
+                        'campaigns_empty':True,
                         'version':diag['version'],'fingerprint':diag['runtime']['startup_fingerprint'],
                         'source_revision':source_identity['revision'],'runtime_revision':None,
                         'ffmpeg_path_fallback':True,'schemas':diag['database']['schemas']}

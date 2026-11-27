@@ -27,6 +27,10 @@ SCOPES = (
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube.readonly",
 )
+CHANNEL_WORKSPACE_SCOPES = (*SCOPES,
+    "https://www.googleapis.com/auth/yt-analytics.readonly",
+    "https://www.googleapis.com/auth/youtube.force-ssl",
+)
 
 
 def parse_desktop_client_json(raw_text: str) -> tuple[str, str]:
@@ -101,6 +105,7 @@ def authorize(
     *,
     open_url: Optional[Callable[[str], Any]] = None,
     timeout_seconds: int = 240,
+    requested_scopes=SCOPES,
 ) -> tuple[str, str, str]:
     state = secrets.token_urlsafe(32)
     verifier = secrets.token_urlsafe(48)
@@ -154,7 +159,7 @@ def authorize(
             "client_id": client_id,
             "redirect_uri": redirect,
             "response_type": "code",
-            "scope": " ".join(SCOPES),
+            "scope": " ".join(requested_scopes),
             "access_type": "offline",
             "prompt": "select_account consent",
             "state": state,
@@ -188,8 +193,12 @@ def authorized_credentials(
     open_url: Optional[Callable[[str], Any]] = None,
     timeout_seconds: int = 240,
     return_identity: bool = False,
+    requested_scopes=SCOPES,
 ):
-    code, redirect, verifier = authorize(client_id, open_url=open_url, timeout_seconds=timeout_seconds)
+    code, redirect, verifier = authorize(
+        client_id, open_url=open_url, timeout_seconds=timeout_seconds,
+        **({"requested_scopes": requested_scopes} if requested_scopes != SCOPES else {}),
+    )
     client = {"client_id": client_id, "client_secret": client_secret}
     granted = google_json(http.post(TOKEN_URL, data={
         **client,
@@ -199,8 +208,8 @@ def authorized_credentials(
         "grant_type": "authorization_code",
     }, timeout=20), "Đổi mã OAuth")
     scopes = granted.get("scope")
-    if scopes is not None and not set(SCOPES) <= set(scopes.split()):
-        raise RuntimeError("Google chưa cấp đủ quyền đăng và đọc thông tin kênh (hãy tích đủ các ô quyền trên màn hình Google).")
+    if scopes is not None and not set(requested_scopes) <= set(scopes.split()):
+        raise RuntimeError("Google chưa cấp đủ quyền YouTube đã chọn. Hãy kiểm tra các quyền trên màn hình Google.")
     refresh_token = granted.get("refresh_token")
     if not refresh_token:
         raise RuntimeError("Google không trả refresh_token cho kết nối dài hạn.")

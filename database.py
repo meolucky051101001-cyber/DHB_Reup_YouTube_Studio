@@ -512,6 +512,62 @@ def init_db():
         conn.close()
         raise
     init_approval_schema(conn)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS campaign_content_lists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            queue_ids_json TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS publishing_campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            config_json TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'draft',
+            snapshots_json TEXT NOT NULL DEFAULT '{}',
+            checked_at REAL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS publishing_campaign_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id INTEGER NOT NULL,
+            local_day TEXT NOT NULL,
+            local_time TEXT NOT NULL,
+            due_at REAL NOT NULL,
+            state TEXT NOT NULL,
+            queue_id INTEGER,
+            preview_token TEXT,
+            started_at REAL,
+            finished_at REAL,
+            message TEXT NOT NULL DEFAULT '',
+            UNIQUE(campaign_id, local_day, local_time)
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS publishing_campaign_runs_ready
+        ON publishing_campaign_runs(state, due_at, id)
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS channel_comment_replies (
+            channel_id INTEGER NOT NULL,
+            video_id TEXT NOT NULL,
+            comment_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            reply_id TEXT,
+            PRIMARY KEY (channel_id,video_id,comment_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS campaign_playlist_jobs (
+            run_id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL,
+            video_id TEXT NOT NULL,
+            playlist_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            message TEXT NOT NULL DEFAULT ''
+        )
+    """)
     conn.execute("INSERT OR IGNORE INTO app_schema_versions (schema_key, version) VALUES ('upload_hardening', 1)")
 
     # Nhóm kênh mặc định chỉ có MỘT tên chuẩn 'Mặc định'; dữ liệu cũ ghi 'Default'

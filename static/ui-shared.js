@@ -16,6 +16,7 @@
     'tab-render': ['Render & preset', 'Chọn preset, chỉnh thông số và áp dụng cho video.'],
     'tab-channels': ['Kênh & profile', 'Quản lý đích đăng, phiên đăng nhập và bộ tùy chọn.'],
     'tab-monitor': ['Theo dõi nguồn', 'Quản lý nguồn video và trạng thái các luồng tự động.'],
+    'tab-campaigns': ['Chiến dịch đăng video', 'Quản lý danh sách nội dung và các mốc đăng theo kênh.'],
     'tab-settings': ['Hệ thống', 'Cài đặt, hoạt động, lưu trữ và chẩn đoán.'],
   };
 

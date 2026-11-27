@@ -130,6 +130,14 @@ def verify_idle_db(path):
             "SELECT COUNT(*) FROM upload_approvals WHERE state='accepted'",
         ):
             require(conn.execute(query).fetchone()[0] == 0, 'Database has active work or upload recovery.')
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for table, query in (
+            ("publishing_campaigns", "SELECT COUNT(*) FROM publishing_campaigns WHERE state='enabled'"),
+            ("publishing_campaign_runs", "SELECT COUNT(*) FROM publishing_campaign_runs WHERE state='submitting'"),
+            ("campaign_playlist_jobs", "SELECT COUNT(*) FROM campaign_playlist_jobs WHERE state IN ('queued','submitting')"),
+        ):
+            if table in tables:
+                require(conn.execute(query).fetchone()[0] == 0, 'Pause campaigns and wait for active uploads before rollout.')
 
 
 def launch(root, python, port, log_path, *, schedule_dir=None):
@@ -285,7 +293,8 @@ def verify_readonly_ui(base):
             page.on('response', lambda response: errors.append(response.status) if response.status >= 400 else None)
             page.goto(base + '/', wait_until='networkidle')
             tabs = page.locator('.nav-tab').evaluate_all('(elements) => elements.map(el => el.dataset.tab)')
-            require(len(tabs) == 6 and len(set(tabs)) == 6, 'Unexpected dashboard tabs.')
+            expected = {'tab-workspace', 'tab-ai', 'tab-render', 'tab-channels', 'tab-monitor', 'tab-campaigns', 'tab-settings'}
+            require(len(tabs) == len(expected) and set(tabs) == expected, 'Unexpected dashboard tabs.')
             for tab in tabs:
                 page.locator(f'.nav-tab[data-tab="{tab}"]').click()
                 require(page.locator('#' + tab).is_visible(), 'Dashboard tab did not open.')

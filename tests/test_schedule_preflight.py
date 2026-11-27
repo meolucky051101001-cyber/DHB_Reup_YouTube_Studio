@@ -14,6 +14,20 @@ import scheduled_uploads as su
 
 
 class SchedulePreflightTests(unittest.TestCase):
+    def test_on_demand_source_check_distinguishes_missing_changed_and_unreadable(self):
+        job = self.manifest["jobs"][1]
+        state_path = self.directory / "state.json"
+        before = state_path.read_bytes()
+        source = self.paths[job["queue_id"]]
+        self.assertEqual(su.check_next_schedule_source(self.directory)["status"], "matched")
+        with mock.patch.object(su, "sha256", side_effect=PermissionError):
+            self.assertEqual(su.check_next_schedule_source(self.directory)["status"], "unreadable")
+        source.write_bytes(b"different")
+        self.assertEqual(su.check_next_schedule_source(self.directory)["status"], "changed")
+        source.unlink()
+        self.assertEqual(su.check_next_schedule_source(self.directory)["status"], "missing")
+        self.assertEqual(state_path.read_bytes(), before)
+
     def setUp(self):
         fixture = tempfile.TemporaryDirectory()
         self.addCleanup(fixture.cleanup)

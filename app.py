@@ -10,7 +10,7 @@ import monitor_policy
 import threading
 import subprocess
 import sqlite3
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 from functools import lru_cache
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -80,7 +80,7 @@ from youtube_uploader import (
     normalize_published_video_url,
     recheck_api_video_receipt,
 )
-from scheduled_uploads import MAX_SCHEDULE_JOBS, ScheduleError, read_schedule_status, sync_schedule_folder
+from scheduled_uploads import MAX_SCHEDULE_JOBS, ScheduleError, check_next_schedule_source, read_schedule_status, sync_schedule_folder
 from pipeline_manager import pipeline_manager, upload_slot_recovery_status, acknowledge_upload_slot_recovery
 from group_distribution import target_group_names
 from phase4_rules import (
@@ -103,6 +103,8 @@ from storage_manager import (
     ensure_disk_space,
     storage_overview,
 )
+from campaigns import router as campaign_router, start_campaign_worker
+from channel_workspace import router as channel_workspace_router
 
 BACKGROUND_TASKS_DISABLED = os.environ.get("DHB_DISABLE_BACKGROUND_TASKS", "").strip().lower() in {
     "1", "true", "yes", "on",
@@ -389,14 +391,29 @@ if not BACKGROUND_TASKS_DISABLED:
     threading.Thread(target=_housekeeping_worker, daemon=True, name="DHB-Housekeeping").start()
     pipeline_manager.start_monitor_supervisor()
 
-APP_BUILD_VERSION = "2026.11.22-integration"
+APP_BUILD_VERSION = "2026.11.27-campaigns"
 
 
 def get_schedule_state_dir() -> Path:
     custom = os.environ.get("DHB_SCHEDULE_STATE_DIR", "").strip()
     return Path(custom) if custom else (APP_DATA_DIR / "scheduled_uploads" / "default")
 RUNTIME_IDENTITY = capture_runtime(APP_ROOT)
-app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION)
+
+
+@asynccontextmanager
+async def app_lifespan(_app):
+    worker = None if BACKGROUND_TASKS_DISABLED else start_campaign_worker()
+    try:
+        yield
+    finally:
+        if worker:
+            worker[0].set()
+            await run_in_threadpool(worker[1].join, 5)
+
+
+app = FastAPI(title="DHB Reup YouTube Studio", version=APP_BUILD_VERSION, lifespan=app_lifespan)
+app.include_router(campaign_router)
+app.include_router(channel_workspace_router)
 
 API_TOKEN = generate_api_token()
 _SCHEDULE_SCAN_PROOF_KEY = os.urandom(32)
@@ -595,7 +612,7 @@ def index():
 @app.get("/health/dhb", include_in_schema=False)
 def dhb_health():
     return JSONResponse(
-        {key: RUNTIME_IDENTITY[key] for key in ("application", "source_root")},
+        {key: RUNTIME_IDENTITY[key] for key in ("application", "source_root", "revision", "startup_fingerprint")},
         headers={"Cache-Control": "no-store"},
     )
 
@@ -724,6 +741,14 @@ def api_diagnostics():
 @app.get("/api/scheduled-uploads/status")
 def api_scheduled_uploads_status():
     return read_schedule_status(get_schedule_state_dir())
+
+
+@app.get("/api/scheduled-uploads/source-check")
+def api_check_next_schedule_source():
+    try:
+        return check_next_schedule_source(get_schedule_state_dir())
+    except (OSError, ScheduleError, TypeError, ValueError, KeyError) as exc:
+        raise HTTPException(409, "Không đọc được manifest hoặc trạng thái lịch Private.") from exc
 
 
 class _InProcessScheduleAPI:
@@ -4047,6 +4072,7 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
         preview_token = data.get("preview_id")
         result = pipeline_manager.start_batch(
             ids, do_dl, do_rd, do_up, preview_token=preview_token if isinstance(preview_token, str) else "",
+            wait_for_cooldown=data.get("start_immediately") is not True,
         )
         if result.get("code") in {"PREVIEW_STALE", "REVIEW_REQUIRED"}:
             return JSONResponse({**result, "detail": result["message"]}, status_code=409)
@@ -4880,6 +4906,7 @@ def api_open_channel_gcloud_console(channel_id: int):
 @app.post("/api/channels/{channel_id}/connect-oauth")
 def api_connect_channel_oauth(channel_id: int, data: Dict[str, Any] = Body(...)):
     from connect_youtube_oauth import (
+        CHANNEL_WORKSPACE_SCOPES,
         authorized_credentials,
         open_url_in_channel_browser,
         parse_desktop_client_json,
@@ -4929,6 +4956,7 @@ def api_connect_channel_oauth(channel_id: int, data: Dict[str, Any] = Body(...))
             open_url=lambda url: open_url_in_channel_browser(channel_data, url, prof),
             timeout_seconds=240,
             return_identity=True,
+            **({"requested_scopes": CHANNEL_WORKSPACE_SCOPES} if data.get("channel_workspace") is True else {}),
         )
     except RuntimeError as exc:
         add_log("Channel", f"Kết nối OAuth kênh #{channel_id} chưa hoàn tất: {exc}", "WARNING", channel_name=channel_data.get("name") or "")

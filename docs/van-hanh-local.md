@@ -1,6 +1,6 @@
 # Vận hành DHB trên Windows
 
-Dùng hướng dẫn này để chạy một lô có giám sát, đối soát kết quả trên YouTube Studio và quyết định khi nào tăng quy mô. [Quy trình đăng tự động](quy-trinh-dang-tu-dong.md) trình bày từng bước theo giao diện sáu màn, gồm lô file có sẵn, toàn trình và Monitor.
+Dùng hướng dẫn này để chạy một lô có giám sát, đối soát kết quả trên YouTube Studio và quyết định khi nào tăng quy mô. [Quy trình đăng tự động](quy-trinh-dang-tu-dong.md) trình bày các bước cho lô file có sẵn, toàn trình và Monitor.
 
 ## Trước khi nhận lô
 
@@ -15,10 +15,19 @@ Dùng hướng dẫn này để chạy một lô có giám sát, đối soát k�
 2. Dùng **Sửa nhanh** hoặc **Gán cấu hình** để đặt tiêu đề, đích và chế độ hiển thị. Với lượt thử, chọn Riêng tư. Dùng **Chi tiết → Chỉnh sửa video** để chỉnh mô tả, lịch và các tùy chọn của từng dòng. Gán cấu hình luôn áp dụng checkbox giả lập điện thoại theo giá trị hiện tại; bỏ tích đặt Desktop.
 3. Kiểm tra các dòng đang tích, kể cả dòng bị bộ lọc ẩn. Mở **Quy trình đăng tự động**, chọn file có sẵn hoặc toàn trình rồi **Tiếp tục xem trước lô**. Cũng có thể dùng **Xem trước & đăng** hoặc **Chạy toàn trình**. Nếu chưa tích dòng nào, giao diện có thể đề nghị chạy tất cả dòng đang hiển thị; hủy nếu phạm vi rộng hơn dự kiến. Khi cần giữ thứ tự lô như Preview, đặt số luồng pipeline thành 1 trong **Hệ thống → Cài đặt** trước khi chạy.
 4. Đọc Preview của nút chạy vừa chọn. So khớp ID hàng đợi, kênh, profile, chế độ hiển thị, lịch và file. Với **Xem trước & đăng**, một bản render có sẵn có thể được ưu tiên hơn file nguồn. Nếu thay đổi đích, file hoặc cấu hình, lưu rồi xem Preview mới. Xác nhận một lần khi các dòng đều đúng.
-5. Theo dõi lô. Mỗi lần chỉ một video giữ lượt upload. Cooldown tối thiểu 30 phút dùng chung giữa các profile, tính từ khi lượt trước kết thúc. Lịch là giờ YouTube phát hành, không tự bật lô vào giờ đó; giá trị được máy chạy DHB diễn giải theo múi giờ hệ điều hành, gợi ý của trình duyệt không chuyển múi giờ. Với `Completed`, mở link và kiểm tra ID, kênh, hiển thị/lịch trong Studio bằng phiên có quyền xem. Completed không đồng nghĩa Công khai: video Riêng tư hoặc đã lên lịch cũng có thể hoàn tất.
+5. Theo dõi lô. Mỗi lần chỉ một video giữ lượt upload. Lượt bấm chạy upload khi tệp sẵn sàng và lượt upload trống. Lượt tự động chờ tối thiểu 30 phút tính từ khi lượt trước kết thúc. Lịch là giờ YouTube phát hành, không tự bật lô vào giờ đó; giá trị được máy chạy DHB diễn giải theo múi giờ hệ điều hành, gợi ý của trình duyệt không chuyển múi giờ. Với `Completed`, mở link và kiểm tra ID, kênh, hiển thị/lịch trong Studio bằng phiên có quyền xem. Completed không đồng nghĩa Công khai: video Riêng tư hoặc đã lên lịch cũng có thể hoàn tất.
 6. Để kết thúc sớm, bấm **Dừng lô hiện tại**. Tool ngừng nhận video batch kế tiếp và chờ lượt upload đã bắt đầu hoàn tất. Đợi thông báo **Đang dừng lô** biến mất và Chẩn đoán báo worker batch đã dừng, active bằng 0. Nút này không dừng Monitor; dừng riêng từng luồng trong **Theo dõi nguồn** rồi kiểm tra worker và heartbeat trước khi tắt máy hoặc dịch vụ.
 
-## Lịch đăng Private định kỳ: kiểm tra nguồn
+## Chiến dịch đăng theo mốc giờ
+
+1. Nạp video trong **Video & dự án**, chọn các dòng và gán trực tiếp kênh đích cùng quyền hiển thị. Mở **Chiến dịch → Dùng video đang chọn trong dự án**, đặt tên và lưu danh sách. Có thể sửa thứ tự bằng danh sách ID video.
+2. Với video Drive, mở **Nhập video Drive từ Google Sheets**. Chọn dự án hiện tại, kênh và quyền hiển thị, rồi đọc cột từ tab Sheets đã chia sẻ quyền xem. Ánh xạ liên kết và tiêu đề, kiểm tra các dòng hợp lệ, trùng và lỗi trước khi nhập.
+3. Đặt tên chiến dịch, chọn profile, kênh, danh sách, thứ tự, ngày bắt đầu và các mốc giờ. Múi giờ nhập theo số phút lệch UTC. Ví dụ Việt Nam dùng `420`. **Tạo mốc giờ** tạo gợi ý dựa trên khung đã chọn và khoảng cách gửi tối thiểu.
+4. **Lưu cấu hình → Xem trước → Bật cấu hình đã xem**. Kiểm tra kênh đích và quyền hiển thị trước khi bật. Backend phải đang chạy khi tới giờ. Các mốc trong lúc máy ngủ xuất hiện dưới trạng thái **Lỡ mốc**. Bấm **Chạy bù** trên đúng dòng nếu muốn đưa lượt đó vào hàng đợi.
+5. Lịch đặt là mốc bắt đầu xử lý trên máy. Thời gian gửi còn phụ thuộc vào pipeline, file nguồn và giãn cách upload chung. Dùng **Lượt thực thi → Xem log** để xem từng lượt. Nếu thấy **Cần đối soát**, dùng bằng chứng của video trong hàng đợi và xử lý trước khi bật lại chiến dịch.
+6. Muốn thêm playlist sau khi đăng, nhập Playlist ID của kênh trong cấu hình. Bước playlist dùng OAuth và có trạng thái riêng trong dòng thực thi. Chọn **Thử lại playlist** khi bước này báo lỗi.
+
+## Lịch đăng Private định kỳ
 
 Trong **Quy trình đăng tự động**, lịch có thể vẫn ở `waiting` vì chưa đến lượt, đồng thời nguồn đã thay đổi. Nếu thấy **Cần xử lý nguồn trước lượt đăng tiếp**, file kế tiếp trong lịch không còn trên đĩa; cần kiểm tra nguồn trước lượt đăng, không chỉ chờ đến giờ. Cảnh báo hiển thị riêng số file chờ bị thiếu và số file mới chưa nạp vào lịch.
 

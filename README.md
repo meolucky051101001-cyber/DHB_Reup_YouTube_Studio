@@ -19,7 +19,7 @@ Tool được thiết kế theo hướng **fail-closed**: khi một bước khô
 | Nạp nguồn | Dán link (YouTube, TikTok, Douyin, Facebook) hoặc quét thư mục video có sẵn; import/export CSV và Excel; sửa metadata hàng loạt. |
 | AI metadata | Viết lại tiêu đề/mô tả/tags, tìm-thay hàng loạt (Gemini), dùng key gửi qua header chứ không gắn vào URL. |
 | Render | Dựng video dọc 1080x1920 bằng FFmpeg: intro/outro, filter, logo, âm thanh; preset Shorts (ép thời lượng, hashtag). |
-| Đăng tự động | Lô file có sẵn hoặc toàn trình tải → render → đăng qua Studio/API; xem trước và xác nhận đích/metadata, kiểm tra kết quả, dùng chung cooldown upload tối thiểu 30 phút. Lịch phát hành YouTube là thiết lập riêng. |
+| Đăng tự động | Lô file có sẵn hoặc toàn trình tải → render → đăng qua Studio/API; xem trước và xác nhận đích/metadata, kiểm tra kết quả, lượt tự động chờ tối thiểu 30 phút sau lượt trước. Lịch phát hành YouTube là thiết lập riêng. |
 | Monitor | Theo dõi kênh/thư mục định thời, chống trùng nguồn, hàng đợi render chạy nền độc lập với lô thủ công. |
 | Vận hành | Log hệ thống trong DB, xuất CSV/log, backup, token API cục bộ cho dashboard. |
 
@@ -70,7 +70,7 @@ Mở Antidetect trước nếu dùng profile Antidetect. Lô thủ công chỉ b
 1. Trong **Kênh & profile**, xác nhận Channel ID và quyền nhận video: phiên profile nếu dùng Studio, OAuth nếu dùng API. Kiểm tra Bộ tùy chọn/Khả năng đăng; lưu metadata chưa có nghĩa yêu cầu đó đã được hỗ trợ.
 2. Trong **Video & dự án**, chọn dự án rồi **Thêm video**. Tool tự chọn các video mới thêm. Dùng **Sửa nhanh**, **Gán cấu hình** hoặc **Chi tiết** để chỉnh metadata, đích và hiển thị; đọc cả số video đang chọn nhưng bị bộ lọc ẩn.
 3. Mở **Quy trình đăng tự động**, chọn file có sẵn hoặc toàn trình rồi **Tiếp tục xem trước lô**. Đọc bản xem trước máy chủ về file sẽ gửi, kênh/profile/phương thức, metadata, hiển thị và lịch rồi xác nhận chạy. Mở hướng dẫn hoặc tiếp tục xem trước chưa gửi video.
-4. Theo dõi hàng đợi và **Xử lý → Kiểm tra lượt đăng**. Cooldown tối thiểu 30 phút dùng chung cho mọi profile, tính từ khi lượt trước kết thúc. Lịch là giờ YouTube phát hành, không phải giờ tự bật batch. Completed có thể là Riêng tư, Không công khai hoặc Đã lên lịch; mở link đối chiếu kết quả. Với **Cần đối soát** (`NeedsReview`), kiểm tra đúng kênh trước khi quyết định cho phép đăng lại.
+4. Theo dõi hàng đợi và **Xử lý → Kiểm tra lượt đăng**. Lượt bấm chạy upload khi tệp sẵn sàng và không có lượt khác đang upload. Lượt tự động dùng khoảng nghỉ 30 phút tính từ khi lượt trước kết thúc. Lịch là giờ YouTube phát hành, không phải giờ tự bật batch. Completed có thể là Riêng tư, Không công khai hoặc Đã lên lịch; mở link đối chiếu kết quả. Với **Cần đối soát** (`NeedsReview`), kiểm tra đúng kênh trước khi quyết định cho phép đăng lại.
 5. Bấm **Dừng lô hiện tại** để ngừng nhận video batch kế tiếp; upload đã bắt đầu được chờ hoàn tất. Dừng Monitor riêng trong **Theo dõi nguồn**. Đợi lifecycle Stopped và Chẩn đoán xác nhận worker liên quan đã dừng trước khi tắt DHB hoặc máy.
 
 Với nguồn theo dõi tự động: **Theo dõi nguồn → Tạo luồng → lưu → Bật nguồn → Xem trước nguồn tự động → Xác nhận và bật nguồn**. Lưu hoặc hủy bản xem trước không bật luồng. Monitor đã được bật có thể được supervisor khôi phục sau sự cố; dừng đúng luồng và đợi worker thoát nếu muốn ngừng tự động.

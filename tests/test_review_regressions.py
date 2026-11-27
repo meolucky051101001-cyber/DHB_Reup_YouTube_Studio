@@ -4,6 +4,7 @@ import io
 from openpyxl import load_workbook
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -83,6 +84,91 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.row()['status'], 'Completed')
 
+    def test_manual_http_batch_uploads_during_existing_cooldown(self):
+        previous = pm.reserve_upload_slot(threading.Event(), 902)
+        pm._mark_slot_entered(previous, 1)
+        pm._record_upload_finished_safely("previous", previous, entered_uploader=True)
+        token = self.manager.preview_distribution([901], [False, False, True])['preview_token']
+        called = threading.Event()
+
+        def upload(*args, **kwargs):
+            called.set()
+            return {'url': 'https://youtu.be/dQw4w9WgXcQ'}
+
+        with mock.patch.object(pm, 'upload_video_to_youtube', side_effect=upload):
+            try:
+                response = self.client.post('/api/pipeline/start', headers=self.headers, json={
+                    'ids': [901], 'do_download': False, 'do_render': False, 'do_upload': True,
+                    'preview_id': token, 'start_immediately': True,
+                })
+                self.assertTrue(response.json()['ok'], response.text)
+                self.assertTrue(called.wait(5), 'Manual batch waited for the existing cooldown')
+            finally:
+                if not called.is_set():
+                    self.manager._stop_event.set()
+                deadline = time.monotonic() + 5
+                while self.manager.is_running and time.monotonic() < deadline:
+                    time.sleep(0.02)
+        self.assertFalse(self.manager.is_running)
+        self.assertEqual(self.row()['status'], 'Completed')
+
+    def test_direct_batch_uses_existing_files_once_and_contains_upload_failures(self):
+        ids = list(range(1001, 1025))
+        files = {}
+        database.save_settings({'upload_delay_seconds': 0, 'max_concurrent_threads': 4})
+        with closing(database.get_conn()) as conn, conn:
+            for index, queue_id in enumerate(ids):
+                source = self.root / f'source-{queue_id}.mp4'
+                source.write_bytes(f'original {queue_id}'.encode())
+                output = self.root / f'rendered-{queue_id}.mp4' if index % 2 else None
+                if output:
+                    output.write_bytes(f'rendered {queue_id}'.encode())
+                files[queue_id] = (output or source).read_bytes()
+                conn.execute("""
+                    INSERT INTO video_queue(id, project_name, title, target_type, target_channel_id,
+                        source_type, platform, input_video_path, output_video_path, visibility)
+                    VALUES (?, 'review', ?, 'CHANNEL', ?, 'File', 'LocalFile', ?, ?, 'private')
+                """, (queue_id, str(queue_id), 901 + index % 2, str(source), str(output) if output else ''))
+
+        seen = []
+        def upload(*, video_item, channel, progress_callback, **kwargs):
+            queue_id = video_item['id']
+            path = Path(pm.upload_source_path(video_item))
+            seen.append((queue_id, path.read_bytes(), channel['id']))
+            progress_callback(50, 'Upload 50%')
+            if queue_id == ids[10]:
+                return {'published_uncertain': True}
+            return {'url': f'https://youtu.be/{queue_id:011d}'}
+
+        options = {'ids': ids, 'do_download': False, 'do_render': False, 'do_upload': True}
+        preview = self.client.post('/api/queue/preview-distribution', headers=self.headers, json=options).json()
+        self.assertEqual(preview['blocked'], 0)
+        with mock.patch.object(pm, 'download_video') as download, mock.patch.object(pm, 'render_video') as render, \
+                mock.patch.object(pm, 'upload_video_to_youtube', side_effect=upload):
+            try:
+                response = self.client.post('/api/pipeline/start', headers=self.headers, json={
+                    **options, 'preview_id': preview['preview_id'], 'start_immediately': True,
+                })
+                self.assertTrue(response.json()['ok'], response.text)
+                deadline = time.monotonic() + 45
+                while self.manager.is_running and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(self.manager.is_running, 'Batch did not finish in the local mock')
+            finally:
+                if self.manager.is_running:
+                    self.manager._stop_event.set()
+                    deadline = time.monotonic() + 10
+                    while self.manager.is_running and time.monotonic() < deadline:
+                        time.sleep(0.05)
+            download.assert_not_called()
+            render.assert_not_called()
+        failures = [(qid, row['status'], row['error_message']) for qid in ids
+                    if (row := self.row(qid))['status'] != 'Completed']
+        self.assertCountEqual(seen, [(qid, files[qid], 901 + i % 2) for i, qid in enumerate(ids)], failures)
+        for qid in ids:
+            expected = 'NeedsReview' if qid == ids[10] else 'Completed'
+            self.assertEqual(self.row(qid)['status'], expected, qid)
+
     def test_shared_source_remains_after_success(self):
         options = [False,False,True]
         token = self.manager.preview_distribution([901], options)['preview_token']
@@ -102,12 +188,12 @@ class ReviewRegressions(unittest.TestCase):
         capacity = pm._WorkerCapacity(prepare, ready, threading.Event())
         seen = {}
         real_reserve = pm.reserve_upload_slot
-        def reserve(stop_event, queue_id=None):
+        def reserve(stop_event, queue_id=None, **kwargs):
             seen['prepare_free'] = prepare.acquire(timeout=0)
             if seen['prepare_free']:
                 prepare.release()
             seen['ready_held'] = not ready.acquire(timeout=0)
-            return real_reserve(stop_event, queue_id)
+            return real_reserve(stop_event, queue_id, **kwargs)
         with mock.patch.object(pm,'upload_video_to_youtube', return_value={'url':'https://youtu.be/dQw4w9WgXcQ'}),                 mock.patch.object(pm,'reserve_upload_slot', side_effect=reserve):
             self.manager._process_single_item_safe(901,0,*options,capacity,'capacity-test')
         self.assertEqual(self.row()['status'],'Completed')

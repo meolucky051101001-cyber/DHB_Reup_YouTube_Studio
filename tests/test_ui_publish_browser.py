@@ -48,6 +48,7 @@ class PublishWorkflowBrowserTests(unittest.TestCase):
         self.page.evaluate('ids => {gSelectedIds = new Set(ids); updateQueueSelectionSummary();}', list(ids))
 
     def open_workflow(self):
+        self.fixture.open_more_actions()
         self.page.locator('#publish-workflow-open').click()
         self.page.locator('#publish-workflow-dialog').wait_for(state='visible')
 
@@ -70,6 +71,55 @@ class PublishWorkflowBrowserTests(unittest.TestCase):
                                 'preview_id': '' if blocked else 'approved-preview-token'})
             return True
         self.fixture.handler = handler
+
+    def test_row_publish_starts_only_clicked_video_without_render(self):
+        self.select(1, 3)
+        self.prepare_preview()
+        with self.page.expect_response('**/api/pipeline/start', timeout=4000):
+            self.page.locator('tr[data-queue-id="2"] [data-queue-action="publish"]').click()
+        request = self.requests('/api/queue/preview-distribution')[-1]
+        self.assertEqual(json.loads(request['body'])['ids'], [2])
+        start = json.loads(self.requests('/api/pipeline/start')[0]['body'])
+        self.assertEqual(start['ids'], [2])
+        self.assertFalse(start['do_render'] or start['do_download'])
+        self.assertTrue(start['do_upload'] and start['start_immediately'])
+        self.assertEqual(start['preview_id'], 'approved-preview-token')
+        self.assert_isolated()
+
+    def test_quick_batch_requires_selection_and_starts_selected_render_mode_once(self):
+        button = self.page.locator('#queue-publish-now')
+        self.assertTrue(button.is_disabled(timeout=4000))
+        self.select(1, 3)
+        self.prepare_preview()
+        self.page.locator('#queue-publish-mode').select_option('full')
+        with self.page.expect_response('**/api/pipeline/start'):
+            button.evaluate('(button) => { button.click(); button.click(); }')
+        starts = self.requests('/api/pipeline/start')
+        self.assertEqual(len(starts), 1)
+        start = json.loads(starts[0]['body'])
+        self.assertEqual(start['ids'], [1, 3])
+        self.assertTrue(start['do_download'] and start['do_render'] and start['do_upload'])
+        self.assert_isolated()
+
+    def test_quick_batch_blocked_shows_reason_and_does_not_start(self):
+        self.select(1, 3)
+        self.prepare_preview(blocked=True)
+        self.page.locator('#queue-publish-now').click(timeout=4000)
+        self.page.locator('#upload-preview-title').wait_for()
+        self.assertIn('Không tìm thấy file', self.page.locator('.upload-preview-dialog').inner_text())
+        self.assertFalse(self.requests('/api/pipeline/start'))
+        self.assert_isolated()
+
+    def test_quick_batch_rejects_partial_preview_even_with_token(self):
+        self.select(1, 3)
+        self.fixture.responses['/api/queue/preview-distribution'] = {
+            'ok': True, 'blocked': 0, 'items': [{'id': 1, 'blocked': False}], 'preview_id': 'partial',
+        }
+        self.page.locator('#queue-publish-now').click()
+        self.page.wait_for_function('!gPipelineStartPending')
+        self.assertEqual(len(self.requests('/api/queue/preview-distribution')), 1)
+        self.assertFalse(self.requests('/api/pipeline/start'))
+        self.assert_isolated()
 
     def test_open_cancel_and_escape_are_readonly_and_restore_focus(self):
         self.select(1)
@@ -157,7 +207,7 @@ class PublishWorkflowBrowserTests(unittest.TestCase):
         self.assertEqual(len(starts), 1)
         self.assertEqual(json.loads(starts[0]['body']), {
             'ids': [3], 'do_download': True, 'do_render': True, 'do_upload': True,
-            'force_reupload': False, 'preview_id': 'approved-preview-token',
+            'force_reupload': False, 'preview_id': 'approved-preview-token', 'start_immediately': True,
         })
         self.assert_isolated()
 

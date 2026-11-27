@@ -49,6 +49,20 @@ class UploadGapTests(unittest.TestCase):
         self.assertEqual(pm.upload_slot_recovery_status()["queue_id"], 102)
         self.assertEqual(pm.upload_slot_recovery_status()["state"], "active")
 
+    def test_manual_upload_can_start_during_cooldown_without_taking_an_active_slot(self):
+        owner = pm.reserve_upload_slot(threading.Event(), 101)
+        pm._mark_slot_entered(owner, 201)
+        pm._record_upload_finished_safely("previous", owner, entered_uploader=True)
+        self.assertFalse(pm.reserve_upload_slot(self.stop_after_wait(), 102))
+
+        manual = pm.reserve_upload_slot(threading.Event(), 102, wait_for_cooldown=False)
+        self.assertTrue(manual)
+        self.assertFalse(pm.reserve_upload_slot(self.stop_after_wait(), 103, wait_for_cooldown=False))
+
+        pm._record_upload_finished_safely("cancelled before upload", manual, entered_uploader=False)
+        self.assertEqual(pm.upload_slot_recovery_status()["remaining_seconds"], 1800)
+        self.assertFalse(pm.reserve_upload_slot(self.stop_after_wait(), 103))
+
     def test_concurrent_workers_only_one_owner(self):
         barrier = threading.Barrier(2)
         owners = []
@@ -72,6 +86,8 @@ class UploadGapTests(unittest.TestCase):
             pm._recover_upload_slot(conn)
         with self.assertRaises(pm.UploadGapStateError):
             pm.reserve_upload_slot(threading.Event())
+        with self.assertRaises(pm.UploadGapStateError):
+            pm.reserve_upload_slot(threading.Event(), wait_for_cooldown=False)
         status = pm.upload_slot_recovery_status()
         self.assertEqual(status["attempt_id"], 201)
         self.assertFalse(pm.acknowledge_upload_slot_recovery("old-approval"))
