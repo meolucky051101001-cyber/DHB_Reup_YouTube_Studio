@@ -103,6 +103,7 @@ class QueueUIBrowserTests(unittest.TestCase):
         self.page.evaluate('Promise.all([loadProfiles(), loadChannels()])')
         self.page.locator('tr[data-queue-id="1"] .uq-title').click()
         self.page.get_by_role('button', name='Chỉnh sửa video', exact=True).click()
+        self.page.locator('#modal-edit-video').wait_for(state='visible')
         for prefix in ('ed-vid', 'bulk'):
             profile = self.page.locator(f'#{prefix}-profile')
             channel = self.page.locator(f'#{prefix}-channel')
