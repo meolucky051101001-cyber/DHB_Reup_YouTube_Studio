@@ -176,6 +176,7 @@ class UploadWorkflowHardeningBrowserTests(unittest.TestCase):
             "task_disable_recommended": False,
         }
         self.fixture.responses["/api/scheduled-uploads/status"] = sched_payload
+        self.fixture.open_more_actions()
         self.page.locator("#publish-workflow-open").click()
         banner = self.page.locator("#publish-schedule-status")
         banner.wait_for(state="visible")
@@ -229,6 +230,7 @@ class UploadWorkflowHardeningBrowserTests(unittest.TestCase):
             "added_count": 2,
             "schedule": synced_payload,
         }
+        self.fixture.open_more_actions()
         self.page.locator("#publish-workflow-open").click()
         banner = self.page.locator("#publish-schedule-status")
         banner.wait_for(state="visible")

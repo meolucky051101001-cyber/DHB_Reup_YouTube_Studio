@@ -142,7 +142,7 @@
         <div class="publish-notes"><h3>4. Xem trước rồi xác nhận</h3><p>Nút tiếp tục mở bản xem trước có file, kênh/profile, phương thức, metadata, chế độ hiển thị và lý do bị chặn. Kiểm tra đúng tất cả video rồi bấm “Xác nhận và chạy”.</p><p>Lịch phát hành là giờ YouTube công bố video. Upload bắt đầu sau khi duyệt và đến lượt; không đợi tới giờ phát hành mới gửi file. Cần đủ thời gian tải, render, upload và xác minh trước lịch.</p></div>
       </section>
       <section id="publish-monitor-panel" aria-labelledby="publish-monitor-title" hidden><h3 id="publish-monitor-title">Tự động xử lý video mới từ nguồn</h3><ol class="publish-steps"><li>Trong Theo dõi nguồn, chọn nguồn và kênh/nhóm đích; cấu hình nội dung, render, metadata và chu kỳ quét.</li><li>Lưu luồng. Tạo hoặc lưu luồng chưa khởi chạy đăng.</li><li>Bấm Bật nguồn, đọc và duyệt metadata hiệu lực cho các kênh. Cấu hình thay đổi cần được xem trước và xác nhận lại.</li><li>Sau khi bật, luồng quét nguồn mới → AI nếu đã chọn → tạo hàng đợi → tải → render → chờ lượt → đăng và xác minh.</li><li>Theo dõi dự án “Monitor - tên luồng” cùng trạng thái worker. Video lỗi được giữ trong hàng đợi để xử lý riêng; không mặc định tự thử lại video đã có. NeedsReview cần đối soát từng dòng.</li></ol><p class="publish-help">Giới hạn video mỗi lần quét, chu kỳ quét và khoảng nghỉ đăng là các thiết lập khác nhau. Dừng từng luồng tại Theo dõi nguồn và đợi worker kết thúc trước khi tắt máy.</p><button type="button" id="publish-go-monitor" class="btn btn-primary">Mở Theo dõi nguồn</button></section>
-      <aside class="publish-notes publish-runtime"><h3>Khi tool đang chạy</h3><ul><li>Giữ server DHB hoạt động và máy thức để worker tiếp tục xử lý.</li><li>Mỗi lần chỉ một video được upload. Khoảng nghỉ chung tối thiểu 30 phút tính sau khi lượt trước kết thúc, áp dụng cả các profile và luồng khác nhau. Nhiều worker giúp xử lý tải/render song song, không tăng số upload cùng lúc.</li><li>Completed là lượt upload đã được xác minh; video Riêng tư hoặc có lịch phát hành chưa đồng nghĩa đã công khai.</li><li>NeedsReview giữ bằng chứng và chống trùng. Kiểm tra YouTube trước khi xác nhận đã đăng hoặc cho phép đăng lại riêng dòng đó.</li></ul></aside></div>
+      <aside class="publish-notes publish-runtime"><h3>Khi tool đang chạy</h3><ul><li>Giữ server DHB hoạt động và máy thức để worker tiếp tục xử lý.</li><li>Mỗi lần chỉ một video được upload. Lượt bạn bấm chạy bắt đầu upload khi tệp sẵn sàng và lượt upload trống. Các lượt tự động có khoảng nghỉ 30 phút sau lượt trước.</li><li>Completed là lượt upload đã được xác minh; video Riêng tư hoặc có lịch phát hành chưa đồng nghĩa đã công khai.</li><li>NeedsReview giữ bằng chứng và chống trùng. Kiểm tra YouTube trước khi xác nhận đã đăng hoặc cho phép đăng lại riêng dòng đó.</li></ul></aside></div>
       <footer class="publish-footer"><p>Máy chủ luôn kiểm tra lại bản xem trước và điều kiện đăng.</p><button type="button" id="publish-continue" class="btn btn-success">Tiếp tục xem trước lô</button></footer>`;
     const state = {dialog, opener: document.activeElement, continuing: false, followup: null};
     session = state; capture(state); document.body.append(dialog);
@@ -303,9 +303,9 @@
   }
   function mount() {
     if (byId('publish-workflow-open')) return;
-    const heading = byId('workspace-heading') || document.querySelector('#tab-workspace .ui-page-heading');
+    const heading = byId('queue-publish-actions') || byId('workspace-heading') || document.querySelector('#tab-workspace .ui-page-heading');
     if (!heading) return;
-    const button = node('button', 'btn btn-primary', 'Quy trình đăng tự động');
+    const button = node('button', 'btn btn-outline btn-sm', 'Quy trình đăng tự động');
     button.type = 'button'; button.id = 'publish-workflow-open'; button.addEventListener('click', open); heading.append(button);
   }
   window.StudioPublish = {open, refreshValidity, mount};

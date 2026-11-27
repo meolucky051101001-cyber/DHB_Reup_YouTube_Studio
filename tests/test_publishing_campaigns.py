@@ -68,7 +68,8 @@ class PublishingCampaignTests(TestCase):
         done = Event()
         sent = []
 
-        def fake_worker(ids, *_args):
+        def fake_worker(ids, *_args, wait_for_cooldown):
+            self.assertTrue(wait_for_cooldown)
             sent.extend(ids)
             with closing(database.get_conn()) as conn, conn:
                 conn.execute("UPDATE video_queue SET status='Completed',published_url=? WHERE id=?",
@@ -76,13 +77,14 @@ class PublishingCampaignTests(TestCase):
             done.set()
 
         class InlineThread:
-            def __init__(self, *, target, args, daemon):
+            def __init__(self, *, target, args, kwargs, daemon):
                 self.target = target
                 self.args = args
+                self.kwargs = kwargs
 
             def start(self):
                 # A synchronous worker would deadlock the lifecycle lock. This stub runs outside it.
-                self.__class__.pending.append((self.target, self.args))
+                self.__class__.pending.append((self.target, self.args, self.kwargs))
 
         InlineThread.pending = []
         with (
@@ -93,8 +95,8 @@ class PublishingCampaignTests(TestCase):
                 due = self.clock.timestamp() + offset
                 c.run_campaign_tick(due)
                 self.assertEqual(len(InlineThread.pending), 1)
-                target, args = InlineThread.pending.pop()
-                target(*args)
+                target, args, kwargs = InlineThread.pending.pop()
+                target(*args, **kwargs)
                 self.assertTrue(done.is_set())
                 done.clear()
                 c.run_campaign_tick(due + 15)

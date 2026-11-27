@@ -56,5 +56,9 @@ class UIPage:
         self.responses['/api/queue'] = items
         self.page.evaluate('items => {gQueueItems=items; gSelectedIds.clear(); StudioQueue.render(items);}', items)
 
+    def open_more_actions(self):
+        if self.page.locator('#queue-more-actions').is_hidden():
+            self.page.locator('#queue-more-toggle').click()
+
     def close(self):
         self.context.close()

@@ -4072,6 +4072,7 @@ def api_start_pipeline(data: Dict[str, Any] = Body(...)):
         preview_token = data.get("preview_id")
         result = pipeline_manager.start_batch(
             ids, do_dl, do_rd, do_up, preview_token=preview_token if isinstance(preview_token, str) else "",
+            wait_for_cooldown=data.get("start_immediately") is not True,
         )
         if result.get("code") in {"PREVIEW_STALE", "REVIEW_REQUIRED"}:
             return JSONResponse({**result, "detail": result["message"]}, status_code=409)

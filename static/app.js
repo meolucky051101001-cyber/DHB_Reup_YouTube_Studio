@@ -761,10 +761,21 @@ async function loadProfiles() {
     const profOpts = gProfiles.map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)} (${escapeHtml(p.source || 'DHB')})</option>`).join('');
 
     const bulkProf = document.getElementById('bulk-profile');
-    if (bulkProf) bulkProf.innerHTML = `<option value="">-- Giữ nguyên Profile --</option>` + profOpts;
+    if (bulkProf) {
+      const previous = bulkProf.value;
+      bulkProf.innerHTML = `<option value="">-- Giữ nguyên Profile --</option>` + profOpts;
+      bulkProf.value = gProfiles.some(profile => profile.name === previous) ? previous : '';
+      onBulkProfileChange();
+    }
 
     const edProf = document.getElementById('ed-vid-profile');
-    if (edProf) edProf.innerHTML = `<option value="">-- Mặc định (Tự chọn) --</option>` + profOpts;
+    if (edProf) {
+      const previous = edProf.selectedOptions[0]?.cloneNode(true);
+      edProf.innerHTML = `<option value="">-- Mặc định (Tự chọn) --</option>` + profOpts;
+      if (previous?.value && !gProfiles.some(profile => profile.name === previous.value)) edProf.add(previous);
+      edProf.value = previous?.value || '';
+      onModalProfileChange();
+    }
 
     const filterProf = document.getElementById('filter-channel-profile');
     if (filterProf) filterProf.innerHTML = `<option value="">-- Tất cả Profile --</option>` + profOpts;
@@ -1044,46 +1055,31 @@ async function checkChannelLogin(channelId) {
   await profileCheckLogin(ch.profile_name);
 }
 
-async function onBulkProfileChange() {
-  const profName = document.getElementById('bulk-profile').value;
-  const chSel = document.getElementById('bulk-channel');
-  if (!profName) {
-    chSel.innerHTML = `<option value="">-- Giữ nguyên kênh --</option>` +
-      gChannels.map(c => `<option value="${c.id}">${escapeHtml(c.name)} (${escapeHtml(c.group_name)})</option>`).join('');
-    return;
+function fillTargetChannels(profileId, channelId, defaultLabel) {
+  const profile = document.getElementById(profileId)?.value || '';
+  const select = document.getElementById(channelId);
+  if (!select) return;
+  const previous = select.value;
+  const channels = profile ? gChannels.filter(channel => channel.profile_name === profile) : gChannels;
+  const label = profile
+    ? (channels.length ? '-- Chọn kênh của profile này --' : 'Profile này chưa có kênh YouTube')
+    : defaultLabel;
+  select.replaceChildren(new Option(label, ''));
+  for (const channel of channels) {
+    const detail = profile ? channel.handle : (channel.group_names || [channel.group_name]).filter(Boolean).join(', ');
+    const name = detail ? `${channel.name} (${detail})` : channel.name;
+    select.add(new Option(channel.channel_id ? name : name + ' ⚠️ thiếu Channel ID', String(channel.id)));
   }
-  try {
-    const subChannels = await apiFetch(`/api/profiles/${encodeURIComponent(profName)}/channels`);
-    if (subChannels.length > 0) {
-      chSel.innerHTML = `<option value="">-- Chọn kênh thuộc [${escapeHtml(profName)}] --</option>` +
-        subChannels.map(c => `<option value="${c.id}">📺 ${escapeHtml(c.name)} (${escapeHtml(c.handle || '')})</option>`).join('');
-    } else {
-      chSel.innerHTML = `<option value="">(Chưa có kênh nào gán cho ${escapeHtml(profName)})</option>`;
-    }
-  } catch (e) {
-    console.error("Lỗi onBulkProfileChange:", e);
-  }
+  if (channels.some(channel => String(channel.id) === previous)) select.value = previous;
+  select.disabled = Boolean(profile && !channels.length);
 }
 
-async function onModalProfileChange() {
-  const profName = document.getElementById('ed-vid-profile').value;
-  const chSel = document.getElementById('ed-vid-channel');
-  if (!profName) {
-    chSel.innerHTML = `<option value="">-- Theo nhóm mặc định --</option>` +
-      gChannels.map(c => `<option value="${c.id}">${escapeHtml(c.name)} (${escapeHtml((c.group_names || [c.group_name]).filter(Boolean).join(', '))}</option>`).join('');
-    return;
-  }
-  try {
-    const subChannels = await apiFetch(`/api/profiles/${encodeURIComponent(profName)}/channels`);
-    if (subChannels.length > 0) {
-      chSel.innerHTML = `<option value="">-- Chọn kênh của [${escapeHtml(profName)}] --</option>` +
-        subChannels.map(c => `<option value="${c.id}">📺 ${escapeHtml(c.name)} (${escapeHtml(c.handle || '')})</option>`).join('');
-    } else {
-      chSel.innerHTML = `<option value="">(Chưa có kênh nào gán cho ${escapeHtml(profName)})</option>`;
-    }
-  } catch (e) {
-    console.error("Lỗi onModalProfileChange:", e);
-  }
+function onBulkProfileChange() {
+  fillTargetChannels('bulk-profile', 'bulk-channel', '-- Giữ nguyên kênh --');
+}
+
+function onModalProfileChange() {
+  fillTargetChannels('ed-vid-profile', 'ed-vid-channel', '-- Theo nhóm mặc định --');
 }
 
 function _applyChannelProfileMode(found) {
@@ -1164,8 +1160,8 @@ async function loadChannels() {
   gChannels = await apiFetch('/api/channels');
   const allChOpts = gChannels.map(c => `<option value="${c.id}">${escapeHtml(c.name)} (${escapeHtml((c.group_names || [c.group_name]).filter(Boolean).join(', '))})${c.channel_id ? '' : ' ⚠️ thiếu Channel ID'}</option>`).join('');
   const chOpts = `<option value="">-- Chia đều theo Nhóm Kênh --</option>` + allChOpts;
-  const bulkCh = document.getElementById('bulk-channel');
-  if (bulkCh) bulkCh.innerHTML = `<option value="">-- Giữ nguyên kênh --</option>` + allChOpts;
+  onBulkProfileChange();
+  onModalProfileChange();
   const monCh = document.getElementById('mon-channel');
   if (monCh) monCh.innerHTML = chOpts;
 
@@ -2526,7 +2522,8 @@ async function openEditModal(id) {
     edProf.value = profileValue;
   }
 
-  await onModalProfileChange();
+  document.getElementById('ed-vid-channel').value = '';
+  onModalProfileChange();
   const groupSelect = document.getElementById('ed-vid-groups');
   if (groupSelect) {
     selectGroupValues(
@@ -2538,14 +2535,14 @@ async function openEditModal(id) {
     const chSel = document.getElementById('ed-vid-channel');
     if (chSel) {
       const idValue = String(item.target_channel_id);
-      if (!Array.from(chSel.options).some(option => option.value === idValue)) {
+      if (!edProf?.value && !Array.from(chSel.options).some(option => option.value === idValue)) {
         const missing = document.createElement('option');
         missing.value = idValue;
         missing.textContent = `⚠️ Kênh #${idValue} (không còn trong danh sách)`;
         missing.dataset.missing = 'true';
         chSel.appendChild(missing);
       }
-      chSel.value = idValue;
+      if (Array.from(chSel.options).some(option => option.value === idValue)) chSel.value = idValue;
     }
   }
 
@@ -3371,8 +3368,9 @@ function findChannelIdBlockers(ids, forceReupload) {
   return blockers;
 }
 
-async function startPipeline(doDownload, doRender, doUpload, overrideIds = null) {
+async function startPipeline(doDownload, doRender, doUpload, overrideIds = null, {direct = false} = {}) {
   if (gPipelineStartPending) return;
+  if (direct && (!doUpload || !Array.isArray(overrideIds) || !overrideIds.length)) return;
   gPipelineStartPending = true;
   try {
     let previewToken = '';
@@ -3392,6 +3390,10 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
       const published = gQueueItems.filter(v => ids.includes(v.id)
         && (v.status === 'Completed' || (v.published_url || '').trim()));
       if (published.length > 0) {
+        if (direct) {
+          alert('Lô có video đã đăng. Hãy bỏ chọn video đó trước khi đăng lô.');
+          return;
+        }
         alert(
           `${published.length} video đã đăng cần được cho phép đăng lại riêng từng dòng bằng nút 🔁. ` +
           `Các video đó sẽ bị bỏ qua trong lượt chạy này.`
@@ -3406,7 +3408,18 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
           body: JSON.stringify({ ids, do_download: doDownload, do_render: doRender, do_upload: doUpload }),
         });
         const operation = doRender ? 'Render và đăng' : 'Đăng file có sẵn';
-        if (!await showDistributionDialog(preview, operation, true)) return;
+        if (direct) {
+          const rows = Array.isArray(preview.items) ? preview.items : [];
+          const approvedIds = new Set(rows.map(row => row.id));
+          if (rows.length !== ids.length || !ids.every(id => approvedIds.has(id))) {
+            alert('Danh sách máy chủ trả về khác danh sách đã chọn. Hãy tải lại hàng đợi.');
+            return;
+          }
+          if (preview.blocked || rows.some(row => row.blocked) || !preview.preview_id || preview.ok === false) {
+            await showDistributionDialog(preview, operation, false);
+            return;
+          }
+        } else if (!await showDistributionDialog(preview, operation, true)) return;
         previewToken = preview.preview_id;
       } catch (e) {
         alert('Không xem được preview phân phối: ' + e.message);
@@ -3424,6 +3437,7 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
           do_upload: doUpload,
           force_reupload: false,
           preview_id: previewToken,
+          start_immediately: doUpload,
         }),
       });
       if (!res.ok) {
@@ -3435,6 +3449,8 @@ async function startPipeline(doDownload, doRender, doUpload, overrideIds = null)
       }
       if (res.skipped && res.skipped.length) {
         showToast(res.message || `Đã bỏ qua ${res.skipped.length} video đã đăng/đang upload dở.`, 'warning');
+      } else if (direct && !res.replayed) {
+        showToast(`Đã bắt đầu lô ${ids.length} video. Xem tiến độ ở hàng đợi.`, 'success');
       }
     } catch (e) {
       alert('Lỗi khởi chạy: ' + e.message);
@@ -3520,7 +3536,7 @@ function showDistributionDialog(preview, operation, allowStart = false) {
         <h2 id="upload-preview-title">Xem trước lô đăng YouTube</h2>
         <p>${escapeHtml(operation)} · ${items.length} video</p>
         <p>Bước cuối trước khi chạy. Kiểm tra file, kênh và chế độ của từng video bên dưới.</p>
-        <p>Upload bắt đầu sau xác nhận và chờ lượt chung tối thiểu 30 phút tính từ khi lượt trước kết thúc. Lịch bên dưới là giờ YouTube phát hành, không phải giờ tool tự bắt đầu lô.</p>
+        <p>Sau khi xác nhận, DHB tải video lên khi tệp sẵn sàng và lượt upload trống. Lịch bên dưới là giờ YouTube phát hành.</p>
         ${blocked ? `<p class="upload-preview-error">${blocked} video cần xử lý. Sửa các dòng bên dưới rồi xem trước lại.</p>` : ''}
         ${publicCount ? `<p class="upload-preview-warning">${publicCount} video đặt Công khai.</p>` : ''}
       </header>
@@ -3578,14 +3594,14 @@ async function reviewUploadSlot() {
       const confirmed = confirm(
         `Lượt upload của video #${slot.queue_id} cần phục hồi.\n\n` +
         'Hãy kiểm tra Studio và đóng tab của lượt upload cũ trước khi xác nhận. ' +
-        'Sau khi xác nhận, tool chờ 30 phút. Video cần đối soát vẫn giữ nguyên trạng thái.\n\n' +
+        'Sau khi xác nhận, lượt tự động chờ 30 phút. Video cần đối soát vẫn giữ nguyên trạng thái.\n\n' +
         'Bạn đã kiểm tra và phiên upload cũ đã kết thúc?'
       );
       if (!confirmed) return;
       await apiFetch('/api/pipeline/upload-slot/acknowledge', {
         method: 'POST', body: JSON.stringify({ recovery_id: slot.recovery_id, previous_session_closed: true }),
       });
-      showToast('Đã xác nhận phục hồi. Lượt tiếp theo chờ ít nhất 30 phút.');
+      showToast('Đã xác nhận phục hồi. Lượt tự động tiếp theo chờ 30 phút.');
       return;
     }
     if (slot.state === 'active') {
@@ -3593,8 +3609,8 @@ async function reviewUploadSlot() {
     } else if (slot.state === 'cooldown') {
       const seconds = slot.remaining_seconds;
       alert(seconds > 0
-        ? `Còn ${Math.floor(seconds / 60)} phút ${seconds % 60} giây trước lượt upload tiếp theo. Khoảng nghỉ dùng chung cho mọi profile. Sau khi khởi động lại, tool có thể áp dụng lại 30 phút để xác nhận an toàn.`
-        : 'Lượt upload đã đủ khoảng nghỉ.');
+        ? `Lượt tự động còn chờ ${Math.floor(seconds / 60)} phút ${seconds % 60} giây. Lượt bấm chạy có thể bắt đầu khi tệp sẵn sàng.`
+        : 'Lượt tự động đã đủ khoảng nghỉ.');
     } else {
       alert('Lượt upload đang trống.');
     }

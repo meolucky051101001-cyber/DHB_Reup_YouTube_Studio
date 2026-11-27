@@ -6,13 +6,15 @@ Tài liệu này hướng dẫn thao tác trên giao diện sáu màn của DHB 
 
 | Nhu cầu | Cách dùng | Bước bắt đầu công việc |
 |---|---|---|
-| Có video đã dựng, muốn gửi nguyên bản | Lô **file có sẵn** trong **Video & dự án** | Xem trước từng file/đích, sau đó xác nhận lô đăng. |
+| Đăng ngay các tệp trên máy | **Không render** trong **Video & dự án** | Tích các video rồi bấm **Đăng ngay (N)**, hoặc bấm **Đăng** tại một dòng để chỉ đăng video đó. |
 | Có liên kết hoặc nguồn cần tải và dựng | Lô **toàn trình: tải → render → đăng** | Chuẩn bị nguồn, metadata và preset; xem trước rồi xác nhận lô. |
 | Muốn tiếp tục phát hiện video mới từ nguồn | **Theo dõi nguồn** (Monitor) | Tạo và lưu luồng, xem trước chính sách/đích, rồi **Xác nhận và bật nguồn**. |
 
 Lô thủ công xử lý tập video đã đưa vào hàng đợi. Monitor chủ động quét nguồn theo chu kỳ và tạo video mới trong dự án `Monitor - <tên luồng>`. Hai cách chạy dùng chung cơ chế chống trùng và lượt upload, nhưng có nút dừng riêng.
 
-Trong **Video & dự án**, mở **Quy trình đăng tự động** để đi theo hướng dẫn. Chọn chế độ file có sẵn hoặc toàn trình, đọc ảnh chụp phạm vi tại lúc mở hướng dẫn, rồi chọn **Tiếp tục xem trước lô**. Nút này chuyển sang bản xem trước do máy chủ kiểm tra; chưa phải xác nhận gửi video. Chọn hướng Monitor sẽ đưa đến **Theo dõi nguồn** để tạo hoặc kiểm tra luồng, chưa bật luồng.
+**Đăng ngay** dùng kênh, chế độ hiển thị và lịch đã cấu hình cho từng video. Với **Không render**, DHB dùng bản render đã lưu nếu có, hoặc dùng tệp nguồn trên máy khi chưa có bản render. Nếu thiếu tệp đã chọn hoặc cấu hình bị chặn, DHB hiển thị lý do trước khi gửi lô. Chọn **Render rồi đăng** nếu cần dựng lại. Trong **Thao tác khác**, chọn **Xem trước & đăng** để kiểm tra từng dòng trước khi xác nhận.
+
+Trong **Video & dự án**, mở **Thao tác khác → Quy trình đăng tự động** để đi theo hướng dẫn. Chọn chế độ file có sẵn hoặc toàn trình, đọc ảnh chụp phạm vi tại lúc mở hướng dẫn, rồi chọn **Tiếp tục xem trước lô**. Nút này chuyển sang bản xem trước do máy chủ kiểm tra; chưa phải xác nhận gửi video. Chọn hướng Monitor sẽ đưa đến **Theo dõi nguồn** để tạo hoặc kiểm tra luồng, chưa bật luồng.
 
 ## 2. Chuẩn bị ở sáu màn
 
@@ -51,7 +53,7 @@ Không đổi backend chỉ để vượt một blocker mà backend mới cũng 
 1. Trong **Video & dự án**, chọn dự án rồi mở **Thêm video**. Đặt cấu hình nhập trước khi chọn tệp; tệp được nạp sau khi chọn. Liên kết/thư mục cần quét nguồn để tạo các dòng hàng đợi. Nạp thành công chưa chạy pipeline.
 2. Chọn video cần xử lý. Tập **đã chọn** gồm cả dòng bị bộ lọc ẩn; đọc số dòng ẩn. **Bỏ chọn dòng hiển thị** chỉ bỏ các dòng hiện tại; dùng **Bỏ toàn bộ lựa chọn** nếu muốn chọn lại từ đầu.
 3. Nếu không chọn thủ công, tác vụ lô có thể dùng các dòng khớp bộ lọc hiện tại sau xác nhận phạm vi. Đừng suy ra bộ lọc giới hạn một tập chọn đang ẩn. Hướng dẫn chụp **scope snapshot** để bạn đọc lại; bản xem trước máy chủ vẫn là bước xác định file/đích cuối cùng và có thể từ chối snapshot cũ.
-4. Dùng **Gán cấu hình**, **Sửa nhanh** hoặc **Chi tiết → Chỉnh sửa video** để sửa đúng đích và metadata. Trong Gán cấu hình, tùy chọn giả lập điện thoại luôn áp dụng theo checkbox hiện tại; bỏ tích đặt Desktop, kể cả khi bạn chỉ muốn đổi kênh.
+4. Tích các video rồi chọn **Chọn profile & kênh** để đặt kênh chung. Để đổi một dòng, bấm tên kênh trong bảng. Bấm tên video để xem chi tiết. **Thao tác khác** có **Sửa nhanh** và **Gán cấu hình hàng loạt** để chỉnh thêm thuộc tính.
 5. Chọn hiển thị Riêng tư, Không công khai, Công khai hoặc Lên lịch. Nếu chọn Lên lịch, nhập giờ tương lai đủ xa để kịp tải/render, upload, xác minh và chờ các lượt trước.
 
 Ba loại thời gian có ý nghĩa khác nhau:
@@ -59,7 +61,7 @@ Ba loại thời gian có ý nghĩa khác nhau:
 | Thời gian | Ý nghĩa |
 |---|---|
 | Lúc bấm xác nhận chạy | Tool bắt đầu xử lý lô và đợi lượt upload nếu cần. Không có bộ hẹn giờ tự bật lô thủ công vào `schedule_time`. |
-| Cooldown upload | Mỗi lần chỉ một video giữ lượt upload; tối thiểu **30 phút sau khi lượt trước kết thúc**, dùng chung cho mọi profile/kênh và cả Monitor. Thay số worker không tạo thêm lượt upload. |
+| Cooldown upload | Mỗi lần chỉ một video giữ lượt upload. Lô bấm chạy upload khi tệp sẵn sàng và lượt upload trống. Monitor và các lượt tự động chờ tối thiểu **30 phút sau khi lượt trước kết thúc**. |
 | Lịch phát hành | Giờ YouTube chuyển video sang trạng thái đã hẹn. Với API, video được tải lên ở trạng thái private kèm `publishAt`; việc đặt lịch không chờ đến giờ hẹn mới gửi file. |
 
 Ô ngày giờ hiện gửi giá trị địa phương không kèm múi giờ. Máy chạy DHB diễn giải giá trị đó theo múi giờ hệ điều hành; gợi ý cạnh ô nhập chỉ phản ánh múi giờ trình duyệt, không thực hiện chuyển đổi. Khi trình duyệt và máy DHB khác múi giờ, nhập giờ tương ứng trên máy DHB và đối chiếu lại giờ trong YouTube Studio. Không coi gợi ý của trình duyệt là cam kết lịch đã chuyển múi giờ.
@@ -68,11 +70,11 @@ Lệnh **Lên lịch giãn cách** lưu lịch phát hành cho các dòng; nó k
 
 ## 5. Xem trước và xác nhận lô
 
-1. Mở **Quy trình đăng tự động**, chọn file có sẵn hoặc toàn trình rồi **Tiếp tục xem trước lô**. Có thể dùng trực tiếp **Xem trước & đăng** hoặc **Chạy toàn trình** trong nhóm Xử lý để đến cùng luồng xem trước.
+1. Mở **Thao tác khác → Quy trình đăng tự động**, chọn file có sẵn hoặc toàn trình rồi **Tiếp tục xem trước lô**. Có thể dùng trực tiếp **Xem trước & đăng** hoặc **Chạy toàn trình** trong nhóm Xử lý để đến cùng luồng xem trước.
 2. Đọc từng dòng trong **Xem trước lô đăng YouTube**: ID hàng đợi, file sẽ gửi, kênh/profile/phương thức, hiển thị, lịch, metadata hiệu lực, cảnh báo và lý do bị chặn. Chế độ file có sẵn ưu tiên đường dẫn bản render đã lưu; chỉ dùng file nguồn khi chưa có đường dẫn bản render. Nếu đường dẫn đã lưu không còn file, xem trước sẽ chặn thay vì tự chuyển sang file nguồn. Luôn kiểm tra file được nêu.
 3. Nếu có blocker, đóng bản xem trước, sửa dữ liệu rồi xem trước lại. Tăng worker, sửa nhãn hoặc đổi bộ lọc không bỏ qua điều kiện máy chủ. Video Completed hoặc có URL đã đăng cần được cho phép đăng lại riêng từng dòng; NeedsReview phải đối soát trước.
 4. Chỉ xác nhận chạy khi toàn bộ phạm vi và cấu hình đúng. Sau xác nhận, tool kiểm tra lại snapshot; đổi kênh, file, bộ tùy chọn hoặc capability có thể làm bản xem trước hết hiệu lực và yêu cầu xem trước lại.
-5. Theo dõi từng bước tải/render/upload trong hàng đợi. Mở **Xử lý → Kiểm tra lượt đăng** khi cần biết đang có video giữ slot, đang cooldown hay cần phục hồi. Bấm chạy lần nữa không phải cách bỏ qua lượt chờ.
+5. Theo dõi từng bước tải/render/upload trong hàng đợi. Mở **Thao tác khác → Kiểm tra lượt đăng** khi cần biết đang có video giữ slot, đang cooldown hay cần phục hồi. Nếu lô đã chạy, theo dõi trạng thái hiện tại.
 
 ## 6. Bật nguồn theo dõi tự động
 
@@ -111,7 +113,7 @@ Nếu slot là `recovery_required`, kiểm tra phiên upload cũ trong Studio v�
 
 Khởi động DHB không tự chạy hàng đợi thủ công; cờ cũ tự chạy batch lúc mở tool bị tắt. Monitor đã lưu ở trạng thái dừng không tự bật vì bạn mở hướng dẫn hay tải lại trang. Monitor trước đó đã được bật và còn cờ muốn chạy có thể được supervisor khôi phục sau khi worker chết hoặc ứng dụng khởi động lại, theo policy hiện hành. Muốn ngừng tự động, dừng Monitor và chờ xác nhận dừng bền vững trước khi thoát.
 
-Sau restart, lượt upload đang dở có thể được giữ để đối soát và khoảng nghỉ có thể tính lại đủ 30 phút. Kiểm tra revision, worker, slot và NeedsReview trước khi nhận lô mới. Khi quay lại bản mã trước, sao lưu DB hiện tại và giữ lịch sử/evidence mới; không đè bằng DB cũ chỉ để đổi giao diện.
+Sau restart, lượt upload đang dở có thể được giữ để đối soát và khoảng nghỉ của lượt tự động có thể tính lại đủ 30 phút. Kiểm tra revision, worker, slot và NeedsReview trước khi nhận lô mới. Khi quay lại bản mã trước, sao lưu DB hiện tại và giữ lịch sử/evidence mới; không đè bằng DB cũ chỉ để đổi giao diện.
 
 ## 9. Lần vận hành đầu và tăng quy mô
 

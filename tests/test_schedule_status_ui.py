@@ -240,8 +240,9 @@ class ScheduleStatusUIBrowserTests(unittest.TestCase):
             dialog.wait_for(state="detached")
         self.fixture.responses["/api/scheduled-uploads/status"] = payload
         with self.page.expect_response("**/api/scheduled-uploads/status") as response:
+            self.fixture.open_more_actions()
             self.page.locator("#publish-workflow-open").click()
-        response.value.finished()
+        response.value.body()
         # Flush the rendering frame, also for unconfigured/malformed top levels.
         self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(resolve))")
         return self.page.locator("#publish-schedule-status")

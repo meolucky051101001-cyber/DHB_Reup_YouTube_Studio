@@ -736,7 +736,10 @@ def _recover_upload_slot(conn):
     row = conn.execute("SELECT * FROM upload_slot WHERE id = 1").fetchone()
     if row["state"] == "active":
         if row["attempt_id"] is None:
-            conn.execute("UPDATE upload_slot SET state = 'idle', owner = NULL WHERE id = 1")
+            conn.execute(
+                "UPDATE upload_slot SET state = CASE WHEN cooldown_until IS NULL THEN 'idle' ELSE 'cooldown' END, "
+                "owner = NULL WHERE id = 1"
+            )
         else:
             conn.execute("UPDATE upload_slot SET state = 'recovery_required' WHERE id = 1")
     elif row["state"] == "idle" and row["started_at"] is None:
@@ -814,7 +817,7 @@ def release_item_claim(item_id: int, token: str):
             pass
 
 
-def reserve_upload_slot(stop_event: threading.Event, queue_id=None):
+def reserve_upload_slot(stop_event: threading.Event, queue_id=None, *, wait_for_cooldown=True):
     """Return a durable ownership token. Elapsed time cannot expire an active owner."""
     while not stop_event.is_set():
         try:
@@ -828,12 +831,14 @@ def reserve_upload_slot(stop_event: threading.Event, queue_id=None):
                 if row["state"] != "active":
                     now = time.time()
                     remaining = _cooldown_remaining_locked(row["cooldown_until"], now)
-                    if remaining <= 0 and not stop_event.is_set():
+                    if (remaining <= 0 or not wait_for_cooldown) and not stop_event.is_set():
                         owner = uuid.uuid4().hex
+                        # Preserve an unfinished cooldown if this manual reservation is cancelled before upload.
+                        cooldown_until = row["cooldown_until"] if remaining > 0 else None
                         conn.execute(
                             "UPDATE upload_slot SET state = 'active', owner = ?, process_id = ?, queue_id = ?, "
-                            "attempt_id = NULL, started_at = ?, cooldown_until = NULL WHERE id = 1",
-                            (owner, os.getpid(), queue_id, now),
+                            "attempt_id = NULL, started_at = ?, cooldown_until = ? WHERE id = 1",
+                            (owner, os.getpid(), queue_id, now, cooldown_until),
                         )
                         return owner
         except UploadGapStateError:
@@ -1103,6 +1108,8 @@ class PipelineManager:
         force_reupload: bool = False,
         preview_token: str = "",
         on_finished: Optional[Callable[[], None]] = None,
+        *,
+        wait_for_cooldown: bool = True,
     ):
         item_ids = list(dict.fromkeys(item_ids))
         options = [do_download, do_render, do_upload]
@@ -1152,6 +1159,7 @@ class PipelineManager:
                 t = threading.Thread(
                     target=self._batch_worker_guarded,
                     args=(item_ids, do_download, do_render, do_upload, batch_token, force_reupload, on_finished),
+                    kwargs={"wait_for_cooldown": wait_for_cooldown},
                     daemon=True,
                 )
                 t.start()
@@ -1357,9 +1365,14 @@ class PipelineManager:
         batch_token: str = "",
         force_reupload: bool = False,
         on_finished: Optional[Callable[[], None]] = None,
+        *,
+        wait_for_cooldown: bool = True,
     ):
         try:
-            self._batch_worker(item_ids, do_download, do_render, do_upload, batch_token, force_reupload)
+            self._batch_worker(
+                item_ids, do_download, do_render, do_upload, batch_token, force_reupload,
+                wait_for_cooldown=wait_for_cooldown,
+            )
         except Exception as exc:
             try:
                 add_log("Pipeline", f"Tiến trình hàng đợi gặp lỗi: {exc}", "ERROR",
@@ -1394,6 +1407,8 @@ class PipelineManager:
         do_upload: bool,
         batch_token: str = "",
         force_reupload: bool = False,
+        *,
+        wait_for_cooldown: bool = True,
     ):
         settings = get_settings()
         max_workers = max(1, int(settings.get("max_concurrent_threads", 2) or 2))
@@ -1437,6 +1452,7 @@ class PipelineManager:
                         item_id, idx, do_download, do_render, do_upload,
                         _WorkerCapacity(sem, ready_sem, self._stop_event), batch_token, force_reupload,
                     ),
+                    kwargs={"wait_for_cooldown": wait_for_cooldown},
                     daemon=True,
                 )
                 worker_t.start()
@@ -1502,6 +1518,7 @@ class PipelineManager:
         stop_event: Optional[threading.Event] = None,
         upload_counter: Optional[Dict[str, int]] = None,
         owner: str = "batch",
+        wait_for_cooldown: bool = True,
     ):
         clear_log_context()
         set_log_context(run_id=_log_run_id(batch_token), queue_id=item_id, phase="queued")
@@ -1511,6 +1528,7 @@ class PipelineManager:
                 claim_token=batch_token, force_reupload=force_reupload,
                 stop_event=stop_event, upload_counter=upload_counter, owner=owner,
                 capacity=sem if isinstance(sem, _WorkerCapacity) else None,
+                wait_for_cooldown=wait_for_cooldown,
             )
         except Exception as exc:
             try:
@@ -1547,6 +1565,7 @@ class PipelineManager:
         upload_counter: Optional[Dict[str, int]] = None,
         owner: str = "batch",
         capacity: Optional[_WorkerCapacity] = None,
+        wait_for_cooldown: bool = True,
     ):
         conn = get_conn()
         row = conn.execute("SELECT * FROM video_queue WHERE id = ?", (item_id,)).fetchone()
@@ -1983,9 +2002,7 @@ class PipelineManager:
                     _update_row(status="Stopped", error_message="Đã dừng khi đang chờ giãn cách đăng.")
                     return
 
-                # P0-7: giãn cách bắt buộc >= 30 phút, tính từ mốc muộn hơn giữa
-                # lúc bắt đầu và kết thúc lượt upload trước. Fail closed nếu mốc không đọc được.
-                wait_seconds = read_upload_gap_remaining()
+                wait_seconds = read_upload_gap_remaining() if wait_for_cooldown else 0
                 if wait_seconds > 0:
                     wait_min = max(1, int((wait_seconds + 59) // 60))
                     _update_row(status=f"Chờ giãn cách đăng (~{wait_min} phút)...", upload_progress=1)
@@ -1999,7 +2016,7 @@ class PipelineManager:
                     )
 
                 _update_row(status="Chờ lượt upload...")
-                slot_owner = reserve_upload_slot(se, item_id)
+                slot_owner = reserve_upload_slot(se, item_id, wait_for_cooldown=wait_for_cooldown)
                 if not slot_owner:
                     _update_row(status="Stopped", error_message="Đã dừng khi đang chờ giãn cách đăng.")
                     return
